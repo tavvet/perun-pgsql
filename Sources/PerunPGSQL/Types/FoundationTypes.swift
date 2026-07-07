@@ -94,7 +94,20 @@ extension Decimal: PostgresDecodable {
         for i in 0 ..< digitCount {
             let digit = Int(try reader.readInt16())         // 0…9999
             let exponent = 4 * (weight - i)                 // 10000^(weight-i) = 10^(4·…)
-            value += Decimal(sign: .plus, exponent: exponent, significand: Decimal(digit))
+            guard digit >= 0, digit <= 9999 else {
+                throw postgresDecodeError("Decimal", oid: oid, format: .binary, bytes)
+            }
+            guard digit == 0 || (-128 ... 127).contains(exponent) else {
+                throw postgresDecodeError("Decimal", oid: oid, format: .binary, bytes)
+            }
+            let term = Decimal(sign: .plus, exponent: exponent, significand: Decimal(digit))
+            guard !term.isNaN else {
+                throw postgresDecodeError("Decimal", oid: oid, format: .binary, bytes)
+            }
+            value += term
+            guard !value.isNaN else {
+                throw postgresDecodeError("Decimal", oid: oid, format: .binary, bytes)
+            }
         }
         return sign == 0x4000 ? -value : value
     }

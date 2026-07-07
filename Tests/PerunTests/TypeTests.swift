@@ -137,6 +137,36 @@ final class TypeTests: XCTestCase {
         }
     }
 
+    func testNumericBinaryRejectsOutOfRangePositiveExponent() {
+        let bytes: [UInt8] = [
+            0x00, 0x01,             // ndigits
+            0x00, 0x20,             // weight = 32 -> exponent 128
+            0x00, 0x00,             // sign +
+            0x00, 0x00,             // dscale
+            0x00, 0x01,             // digit 1
+        ]
+        XCTAssertThrowsError(try Decimal.decode(bytes, oid: PostgresOID.numeric, format: .binary)) { error in
+            guard case PerunError.decodingFailed = error else {
+                return XCTFail("expected .decodingFailed, got \(error)")
+            }
+        }
+    }
+
+    func testNumericBinaryRejectsOutOfRangeNegativeExponent() {
+        let bytes: [UInt8] = [
+            0x00, 0x01,             // ndigits
+            0xFF, 0xDF,             // weight = -33 -> exponent -132
+            0x00, 0x00,             // sign +
+            0x00, 0x00,             // dscale
+            0x00, 0x01,             // digit 1
+        ]
+        XCTAssertThrowsError(try Decimal.decode(bytes, oid: PostgresOID.numeric, format: .binary)) { error in
+            guard case PerunError.decodingFailed = error else {
+                return XCTFail("expected .decodingFailed, got \(error)")
+            }
+        }
+    }
+
     // MARK: jsonb strips its binary version header
 
     func testJSONBBinaryHeader() throws {
