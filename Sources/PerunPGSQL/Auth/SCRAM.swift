@@ -17,6 +17,7 @@ struct SCRAMClient {
     private let clientNonce: String
     private var clientFirstBare = ""
     private var expectedServerSignature: [UInt8] = []
+    private(set) var hasVerifiedServerSignature = false
 
     /// - Parameter username: value for the SCRAM `n=` field. PostgreSQL derives
     ///   the real username from the startup packet and ignores this, so it
@@ -66,6 +67,7 @@ struct SCRAMClient {
         // Remember the server signature so we can authenticate the server too.
         let serverKey = HMACSHA256.authenticate(key: saltedPassword, message: Array("Server Key".utf8))
         expectedServerSignature = HMACSHA256.authenticate(key: serverKey, message: authMessage)
+        hasVerifiedServerSignature = false
 
         return "\(clientFinalWithoutProof),p=\(Base64.encode(clientProof))"
     }
@@ -73,7 +75,7 @@ struct SCRAMClient {
     /// Step 3: verify the server proved it also knows the password. This is what
     /// makes SCRAM mutually authenticating — a MITM without the password can't
     /// forge this signature.
-    func verifyServerFinal(_ serverFinal: String) throws {
+    mutating func verifyServerFinal(_ serverFinal: String) throws {
         let attributes = Self.parseAttributes(serverFinal)
         if let errorText = attributes["e"] {
             throw PerunError.authenticationFailed("server rejected SCRAM: \(errorText)")
@@ -86,6 +88,7 @@ struct SCRAMClient {
         guard signature == expectedServerSignature else {
             throw PerunError.authenticationFailed("server signature mismatch (wrong password or MITM)")
         }
+        hasVerifiedServerSignature = true
     }
 
     // MARK: - Helpers

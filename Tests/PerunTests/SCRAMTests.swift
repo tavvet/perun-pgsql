@@ -13,6 +13,7 @@ final class SCRAMTests: XCTestCase {
 
         let clientFirst = client.clientFirstMessage()
         XCTAssertEqual(clientFirst, "n,,n=user,r=rOprNGfwEbeRWgbNEkqO")
+        XCTAssertFalse(client.hasVerifiedServerSignature)
 
         let serverFirst = "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,"
             + "s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"
@@ -22,10 +23,12 @@ final class SCRAMTests: XCTestCase {
             clientFinal,
             "c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,"
                 + "p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ=")
+        XCTAssertFalse(client.hasVerifiedServerSignature)
 
         // Correct server signature is accepted…
         XCTAssertNoThrow(
             try client.verifyServerFinal("v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4="))
+        XCTAssertTrue(client.hasVerifiedServerSignature)
     }
 
     func testServerSignatureMismatchIsRejected() throws {
@@ -40,6 +43,7 @@ final class SCRAMTests: XCTestCase {
         // …a tampered one is rejected (guards against a MITM / wrong password).
         XCTAssertThrowsError(
             try client.verifyServerFinal("v=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAM="))
+        XCTAssertFalse(client.hasVerifiedServerSignature)
     }
 
     func testWrongClientNonceRejected() {

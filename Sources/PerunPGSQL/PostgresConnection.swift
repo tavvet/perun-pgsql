@@ -55,6 +55,51 @@ public struct ConnectionConfiguration: Sendable {
 /// `withBlockingIO`, keeping the cooperative pool unblocked.
 public actor PostgresConnection {
 
+    /// A scoped transaction running on one locked connection.
+    ///
+    /// Use the methods on this value inside `withTransaction`; they reuse the
+    /// transaction's wire lock instead of trying to acquire it again.
+    public struct Transaction: Sendable {
+        private let connection: PostgresConnection
+        private let contextID: Int
+
+        fileprivate init(connection: PostgresConnection, contextID: Int) {
+            self.connection = connection
+            self.contextID = contextID
+        }
+
+        @discardableResult
+        public func query(_ sql: String) async throws -> QueryResult {
+            try await connection.runTransactionSimpleQuery(sql, contextID: contextID)
+        }
+
+        @discardableResult
+        public func query(_ sql: String,
+                          _ parameters: [(any PostgresEncodable)?],
+                          resultFormat: PostgresFormat = .text) async throws -> QueryResult {
+            try await connection.runTransactionParameterizedQuery(sql, parameters,
+                                                                  resultFormat: resultFormat,
+                                                                  contextID: contextID)
+        }
+
+        public func prepare(_ sql: String) async throws -> PreparedStatement {
+            try await connection.runTransactionPrepare(sql, contextID: contextID)
+        }
+
+        @discardableResult
+        public func execute(_ statement: PreparedStatement,
+                            _ parameters: [(any PostgresEncodable)?] = [],
+                            resultFormat: PostgresFormat = .text) async throws -> QueryResult {
+            try await connection.runTransactionExecute(statement, parameters,
+                                                       resultFormat: resultFormat,
+                                                       contextID: contextID)
+        }
+
+        public func closePrepared(_ statement: PreparedStatement) async throws {
+            try await connection.runTransactionClosePrepared(statement, contextID: contextID)
+        }
+    }
+
     private let fd: Int32
     private let ioQueue: DispatchQueue
     /// Remembered so `cancelCurrentQuery` can open a fresh connection.
@@ -82,6 +127,9 @@ public actor PostgresConnection {
     /// gathered from `ParameterStatus` messages.
     public private(set) var parameters: [String: String] = [:]
 
+    /// Last transaction status reported by ReadyForQuery.
+    private(set) var transactionStatus: TransactionStatus = .idle
+
     /// Whether this connection is running over an encrypted TLS channel.
     public var isSecure: Bool { tls != nil }
 
@@ -96,6 +144,9 @@ public actor PostgresConnection {
 
     /// Monotonic counter for generating unique prepared-statement names.
     private var preparedStatementCounter = 0
+
+    private var transactionContextCounter = 0
+    private var activeTransactionContext: Int?
 
     private init(fd: Int32, ioQueue: DispatchQueue, host: String, port: UInt16, maxMessageSize: Int) {
         self.fd = fd
@@ -216,6 +267,71 @@ public actor PostgresConnection {
     /// Release a prepared statement's server-side resources.
     public func closePrepared(_ statement: PreparedStatement) async throws {
         await lock(); defer { unlock() }
+        try await runClosePrepared(statement)
+    }
+
+    /// Run `body` inside a SQL transaction on this connection.
+    ///
+    /// The wire lock is held for the whole transaction, so no other task can
+    /// interleave statements between `BEGIN` and `COMMIT` / `ROLLBACK`.
+    public func withTransaction<T: Sendable>(
+        _ body: @Sendable (Transaction) async throws -> T
+    ) async throws -> T {
+        await lock()
+        transactionContextCounter += 1
+        let contextID = transactionContextCounter
+        activeTransactionContext = contextID
+        defer {
+            activeTransactionContext = nil
+            unlock()
+        }
+
+        _ = try await runSimpleQuery("BEGIN")
+        do {
+            let result = try await body(Transaction(connection: self, contextID: contextID))
+            _ = try await runSimpleQuery("COMMIT")
+            return result
+        } catch {
+            _ = try? await runSimpleQuery("ROLLBACK")
+            throw error
+        }
+    }
+
+    private func validateTransactionContext(_ contextID: Int) throws {
+        guard activeTransactionContext == contextID else {
+            throw PerunError.protocolViolation("transaction context is no longer active")
+        }
+    }
+
+    private func runTransactionSimpleQuery(_ sql: String, contextID: Int) async throws -> QueryResult {
+        try validateTransactionContext(contextID)
+        return try await runSimpleQuery(sql)
+    }
+
+    private func runTransactionParameterizedQuery(_ sql: String,
+                                                  _ parameters: [(any PostgresEncodable)?],
+                                                  resultFormat: PostgresFormat,
+                                                  contextID: Int) async throws -> QueryResult {
+        try validateTransactionContext(contextID)
+        return try await runParameterizedQuery(sql, parameters, resultFormat: resultFormat)
+    }
+
+    private func runTransactionPrepare(_ sql: String, contextID: Int) async throws -> PreparedStatement {
+        try validateTransactionContext(contextID)
+        return try await runPrepare(sql)
+    }
+
+    private func runTransactionExecute(_ statement: PreparedStatement,
+                                       _ parameters: [(any PostgresEncodable)?],
+                                       resultFormat: PostgresFormat,
+                                       contextID: Int) async throws -> QueryResult {
+        try validateTransactionContext(contextID)
+        return try await runExecute(statement, parameters, resultFormat: resultFormat)
+    }
+
+    private func runTransactionClosePrepared(_ statement: PreparedStatement,
+                                             contextID: Int) async throws {
+        try validateTransactionContext(contextID)
         try await runClosePrepared(statement)
     }
 
@@ -350,7 +466,8 @@ public actor PostgresConnection {
                 continue
             case let .errorResponse(error):
                 pendingError = error
-            case .readyForQuery:
+            case let .readyForQuery(status):
+                transactionStatus = status
                 break loop
             default:
                 continue
@@ -459,7 +576,8 @@ public actor PostgresConnection {
                 // ReadyForQuery, and we must consume it to stay in sync.
                 pendingError = error
 
-            case .readyForQuery:
+            case let .readyForQuery(status):
+                transactionStatus = status
                 break loop
 
             default:
@@ -509,7 +627,8 @@ public actor PostgresConnection {
             case .noticeResponse:
                 continue
 
-            case .readyForQuery:
+            case let .readyForQuery(status):
+                transactionStatus = status
                 break loop
 
             default:
@@ -526,6 +645,9 @@ public actor PostgresConnection {
         case .ok:
             // Authentication finished. If we were mid-SCRAM the server
             // signature must already have been verified.
+            if let client = scram, !client.hasVerifiedServerSignature {
+                throw PerunError.authenticationFailed("SCRAM exchange finished before server signature verification")
+            }
             scram = nil
             return
 
@@ -569,10 +691,11 @@ public actor PostgresConnection {
             try await send(FrontendMessage.saslResponse(Array(clientFinal.utf8)))
 
         case let .saslFinal(data):
-            guard let client = scram else {
+            guard var client = scram else {
                 throw PerunError.protocolViolation("SASLFinal without an active SCRAM exchange")
             }
             try client.verifyServerFinal(String(decoding: data, as: UTF8.self))
+            scram = client
             // The trailing AuthenticationOk clears `scram`.
 
         case let .other(code):
@@ -640,6 +763,7 @@ public actor PostgresConnection {
     // MARK: - Raw I/O (bridged off the cooperative pool)
 
     private func send(_ bytes: [UInt8]) async throws {
+        guard !isClosed else { throw PerunError.connectionClosed }
         let fd = self.fd
         let tls = self.tls
         try await withBlockingIO(on: ioQueue) {
@@ -652,6 +776,7 @@ public actor PostgresConnection {
     }
 
     private func receive(maxLength: Int) async throws -> [UInt8] {
+        guard !isClosed else { throw PerunError.connectionClosed }
         let fd = self.fd
         let tls = self.tls
         return try await withBlockingIO(on: ioQueue) {
@@ -669,6 +794,7 @@ public actor PostgresConnection {
         notificationContinuation.finish()
         let fd = self.fd
         let tls = self.tls
+        self.tls = nil
         // Shut the socket down from here so any recv parked on ioQueue returns;
         // otherwise the teardown dispatched below would queue behind it forever.
         SystemSocket.shutdownBoth(fd: fd)

@@ -21,7 +21,7 @@ struct FieldDescription: Sendable {
 }
 
 /// Transaction status reported by every `ReadyForQuery` ('Z') message.
-enum TransactionStatus: Sendable {
+enum TransactionStatus: Sendable, Equatable {
     case idle                   // 'I' — not in a transaction
     case inTransaction          // 'T'
     case inFailedTransaction    // 'E'

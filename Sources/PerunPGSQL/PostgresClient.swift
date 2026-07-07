@@ -3,7 +3,9 @@
 /// `PostgresClient` lazily opens up to `maxConnections` connections and hands
 /// them out one at a time. Callers either grab one with `withConnection` or use
 /// the convenience `query` methods, which check a connection out, run, and
-/// return it automatically.
+/// return it automatically. Each `query` call is its own autocommit unit; use
+/// `withTransaction` when several statements must run atomically on one
+/// connection.
 ///
 /// ```swift
 /// let pool = PostgresClient(configuration: config, maxConnections: 8)
@@ -62,6 +64,16 @@ public actor PostgresClient {
         }
     }
 
+    /// Check out one connection, run `body` in a transaction, then return the
+    /// connection only after COMMIT or ROLLBACK has completed.
+    public nonisolated func withTransaction<T: Sendable>(
+        _ body: @Sendable (PostgresConnection.Transaction) async throws -> T
+    ) async throws -> T {
+        try await withConnection { connection in
+            try await connection.withTransaction(body)
+        }
+    }
+
     /// Close every connection and fail anyone still waiting. Idempotent.
     public func shutdown() async {
         guard !isShutDown else { return }
@@ -107,10 +119,14 @@ public actor PostgresClient {
         }
     }
 
-    private func release(_ connection: PostgresConnection) {
+    private func release(_ connection: PostgresConnection) async {
         if isShutDown {
             openCount -= 1
             Task { try? await connection.close() }
+            return
+        }
+        guard await connection.transactionStatus == .idle else {
+            await discardAndReplaceIfNeeded(connection)
             return
         }
         if !waiters.isEmpty {
@@ -125,18 +141,27 @@ public actor PostgresClient {
         // drained up to ReadyForQuery). Anything else may have desynced the wire,
         // so drop the connection and open a replacement if someone is waiting.
         if case PerunError.server = error {
-            release(connection)
+            await release(connection)
             return
         }
 
+        await discardAndReplaceIfNeeded(connection)
+    }
+
+    private func discardAndReplaceIfNeeded(_ connection: PostgresConnection) async {
         openCount -= 1
         try? await connection.close()
-
         guard !isShutDown, !waiters.isEmpty, openCount < maxConnections else { return }
         let waiter = waiters.removeFirst()
         openCount += 1
         do {
             let replacement = try await PostgresConnection.connect(configuration)
+            if isShutDown {
+                openCount -= 1
+                try? await replacement.close()
+                waiter.resume(throwing: PerunError.clientShutdown)
+                return
+            }
             waiter.resume(returning: replacement)
         } catch {
             openCount -= 1
