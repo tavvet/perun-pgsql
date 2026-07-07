@@ -26,9 +26,9 @@ let result = try await conn.query(
     "SELECT id, name, created_at FROM users WHERE id = $1", [42])
 
 for row in result.rows {
-    let id   = try row["id"]!.decode(Int.self)
-    let name = try row["name"]!.decode(String.self)
-    let when = try row["created_at"]!.decode(Date.self)
+    let id   = try row.decode("id", as: Int.self)
+    let name = try row.decode("name", as: String.self)
+    let when = try row.decode("created_at", as: Date.self)
     print(id, name, when)
 }
 
@@ -104,9 +104,9 @@ try await conn.execute(insert, [3, nil])          // nil → SQL NULL
 // Request binary result columns; decoded values are identical to text.
 let row = try await conn.query("SELECT now() AS t, 12.5::numeric AS n",
                                [], resultFormat: .binary).rows[0]
-let t: Date    = try row["t"]!.decode()
-let n: Decimal = try row["n"]!.decode()
-let maybe = try row["missing"]?.decodeIfPresent(String.self)   // nil on NULL
+let t: Date    = try row.decode("t")
+let n: Decimal = try row.decode("n")
+let maybe: String? = try row.decodeIfPresent("optional")   // nil on SQL NULL
 ```
 
 ### Connection pool

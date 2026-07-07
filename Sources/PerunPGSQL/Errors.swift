@@ -52,6 +52,8 @@ public enum PerunError: Error, CustomStringConvertible, Sendable {
     case authenticationFailed(String)
     /// A non-optional value was requested from a column that held SQL NULL.
     case unexpectedNull(column: String)
+    /// A row was accessed by a column name that was not present in the result.
+    case columnNotFound(String)
     /// A column's bytes could not be decoded into the requested Swift type.
     case decodingFailed(type: String, oid: Int32, format: String, reason: String)
     /// The TLS handshake failed (or the certificate did not verify).
@@ -82,6 +84,8 @@ public enum PerunError: Error, CustomStringConvertible, Sendable {
             return "authentication failed: \(detail)"
         case let .unexpectedNull(column):
             return "unexpected NULL decoding column \"\(column)\""
+        case let .columnNotFound(column):
+            return "column \"\(column)\" was not found in this row"
         case let .decodingFailed(type, oid, format, reason):
             return "could not decode \(type) from \(format) OID \(oid): \(reason)"
         case let .tlsHandshakeFailed(detail):

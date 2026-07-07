@@ -328,10 +328,12 @@ Main types:
 
 - index access: `row[0]`
 - optional name access: `row["id"]`
+- throwing name access: `try row.cell("id")`
+- throwing by-name decoding: `try row.decode("id", as: Int.self)`
+- nullable by-name decoding: `try row.decodeIfPresent("nickname", as: String.self)`
 
-Important review note: by-name access returns optional. User code like
-`row["id"]!.decode(Int.self)` can trap if a column is missing. A throwing
-by-name API would make schema mismatches catchable.
+Missing columns throw `PerunError.columnNotFound`; SQL NULL remains distinct and
+is handled by `decodeIfPresent`.
 
 ## Type System
 

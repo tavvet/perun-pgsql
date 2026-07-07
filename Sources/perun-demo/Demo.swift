@@ -81,17 +81,17 @@ struct Demo {
             for format in [PostgresFormat.text, .binary] {
                 let row = try await connection.query(typedSQL, [], resultFormat: format).rows[0]
                 let label = format == .binary ? "binary" : "text  "
-                let id = try row["id"]!.decode(UUID.self)
-                let ts = try row["ts"]!.decode(Date.self)
-                let amount = try row["amount"]!.decode(Decimal.self)
-                let blob = try row["blob"]!.decode(Data.self)
-                print("[\(label)] big=\(try row["big"]!.decode(Int64.self))"
-                    + " ratio=\(try row["ratio"]!.decode(Double.self))"
-                    + " active=\(try row["active"]!.decode(Bool.self))")
+                let id = try row.decode("id", as: UUID.self)
+                let ts = try row.decode("ts", as: Date.self)
+                let amount = try row.decode("amount", as: Decimal.self)
+                let blob = try row.decode("blob", as: Data.self)
+                print("[\(label)] big=\(try row.decode("big", as: Int64.self))"
+                    + " ratio=\(try row.decode("ratio", as: Double.self))"
+                    + " active=\(try row.decode("active", as: Bool.self))")
                 print("         id=\(id) amount=\(amount)"
                     + " blob=0x\(blob.map { String(format: "%02x", $0) }.joined())")
                 print("         ts.epoch=\(ts.timeIntervalSince1970)"
-                    + " d=\(try row["d"]!.decode(Date.self).timeIntervalSince1970)\n")
+                    + " d=\(try row.decode("d", as: Date.self).timeIntervalSince1970)\n")
             }
 
             // ── concurrency: many parallel queries on ONE connection ─────────

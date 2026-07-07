@@ -67,6 +67,27 @@ public struct PostgresRow: Sendable {
         }
         return self[index]
     }
+
+    /// Access a cell by column name, throwing if the column is not present.
+    public func cell(_ name: String) throws -> PostgresCell {
+        guard let cell = self[name] else {
+            throw PerunError.columnNotFound(name)
+        }
+        return cell
+    }
+
+    /// Decode a non-NULL column by name, throwing on missing columns, NULLs, or
+    /// type mismatches.
+    public func decode<T: PostgresDecodable>(_ name: String, as type: T.Type = T.self) throws -> T {
+        try cell(name).decode(type)
+    }
+
+    /// Decode a nullable column by name. Missing columns still throw; SQL NULL
+    /// returns nil.
+    public func decodeIfPresent<T: PostgresDecodable>(_ name: String,
+                                                      as type: T.Type = T.self) throws -> T? {
+        try cell(name).decodeIfPresent(type)
+    }
 }
 
 /// The outcome of running one SQL statement.
