@@ -76,6 +76,34 @@ final class TypeTests: XCTestCase {
         XCTAssertEqual(textDate.timeIntervalSince1970, 1_783_382_400, accuracy: 0.0001)
     }
 
+    func testTimestampTextAllowsLargeYears() throws {
+        let value = try Date.decode(Array("12345-01-01".utf8), oid: PostgresOID.timestamp, format: .text)
+        XCTAssertEqual(value.timeIntervalSince1970,
+                       Self.dateFromCivil(year: 12345, month: 1, day: 1).timeIntervalSince1970,
+                       accuracy: 0.0001)
+    }
+
+    func testTimestampTextHandlesBCEra() throws {
+        let dateOnly = try Date.decode(Array("0044-03-15 BC".utf8), oid: PostgresOID.timestamp, format: .text)
+        XCTAssertEqual(dateOnly.timeIntervalSince1970,
+                       Self.dateFromCivil(year: -43, month: 3, day: 15).timeIntervalSince1970,
+                       accuracy: 0.0001)
+
+        let timestamp = try Date.decode(Array("0044-03-15 12:30:00 BC".utf8),
+                                        oid: PostgresOID.timestamp,
+                                        format: .text)
+        XCTAssertEqual(timestamp.timeIntervalSince1970,
+                       Self.dateFromCivil(year: -43, month: 3, day: 15,
+                                          hour: 12, minute: 30).timeIntervalSince1970,
+                       accuracy: 0.0001)
+    }
+
+    func testTimestampTextRejectsTrailingJunk() {
+        XCTAssertThrowsError(try Date.decode(Array("2026-07-07 surprise".utf8),
+                                             oid: PostgresOID.timestamp,
+                                             format: .text))
+    }
+
     // MARK: numeric — binary base-10000 groups
 
     func testNumericBinary() throws {
@@ -95,11 +123,41 @@ final class TypeTests: XCTestCase {
                        Decimal(string: "1234.56"))
     }
 
+    func testNumericBinaryRejectsNegativeDigitCount() {
+        let bytes: [UInt8] = [
+            0xFF, 0xFF,             // ndigits = -1
+            0x00, 0x00,             // weight
+            0x00, 0x00,             // sign +
+            0x00, 0x00,             // dscale
+        ]
+        XCTAssertThrowsError(try Decimal.decode(bytes, oid: PostgresOID.numeric, format: .binary)) { error in
+            guard case PerunError.decodingFailed = error else {
+                return XCTFail("expected .decodingFailed, got \(error)")
+            }
+        }
+    }
+
     // MARK: jsonb strips its binary version header
 
     func testJSONBBinaryHeader() throws {
         let json = "{\"a\":1}"
         let bytes: [UInt8] = [0x01] + Array(json.utf8)
         XCTAssertEqual(try String.decode(bytes, oid: PostgresOID.jsonb, format: .binary), json)
+    }
+
+    private static func dateFromCivil(year: Int,
+                                      month: Int,
+                                      day: Int,
+                                      hour: Int = 0,
+                                      minute: Int = 0,
+                                      second: Int = 0) -> Date {
+        let y = month <= 2 ? year - 1 : year
+        let era = (y >= 0 ? y : y - 399) / 400
+        let yearOfEra = y - era * 400
+        let dayOfYear = (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1
+        let dayOfEra = yearOfEra * 365 + yearOfEra / 4 - yearOfEra / 100 + dayOfYear
+        let days = era * 146_097 + dayOfEra - 719_468
+        let epochSeconds = Double(days * 86_400 + hour * 3600 + minute * 60 + second)
+        return Date(timeIntervalSince1970: epochSeconds)
     }
 }

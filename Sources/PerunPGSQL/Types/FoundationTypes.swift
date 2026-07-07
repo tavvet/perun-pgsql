@@ -82,6 +82,9 @@ extension Decimal: PostgresDecodable {
         let sign = UInt16(bitPattern: try reader.readInt16())
         _ = try reader.readInt16()                          // dscale — display only
 
+        guard digitCount >= 0 else {
+            throw postgresDecodeError("Decimal", oid: oid, format: .binary, bytes)
+        }
         guard sign == 0x0000 || sign == 0x4000 else {
             // 0xC000 = NaN, 0xD000/0xF000 = ±infinity — not representable as Decimal.
             throw postgresDecodeError("Decimal", oid: oid, format: .binary, bytes)
@@ -121,8 +124,11 @@ func parsePostgresTimestamp(_ string: String) -> Date? {
         index += 1
         return true
     }
+    func isDigit(_ ascii: UInt8) -> Bool {
+        ascii >= 0x30 && ascii <= 0x39
+    }
 
-    guard let year = readInt(maxDigits: 4), expect(0x2d),          // '-'
+    guard var year = readInt(maxDigits: 9), expect(0x2d),          // '-'
           let month = readInt(maxDigits: 2), expect(0x2d),
           let day = readInt(maxDigits: 2) else { return nil }
 
@@ -131,7 +137,9 @@ func parsePostgresTimestamp(_ string: String) -> Date? {
     var offsetSeconds = 0
 
     // Optional time part, after a space or 'T'.
-    if index < scalars.count, scalars[index] == 0x20 || scalars[index] == 0x54 {
+    if index < scalars.count,
+       scalars[index] == 0x54
+        || (scalars[index] == 0x20 && index + 1 < scalars.count && isDigit(scalars[index + 1])) {
         index += 1
         guard let h = readInt(maxDigits: 2), expect(0x3a),          // ':'
               let m = readInt(maxDigits: 2), expect(0x3a),
@@ -159,6 +167,19 @@ func parsePostgresTimestamp(_ string: String) -> Date? {
             index += 1
         }
     }
+
+    if index < scalars.count {
+        guard expect(0x20) else { return nil }                     // ' '
+        if index + 1 < scalars.count, scalars[index] == 0x42, scalars[index + 1] == 0x43 {
+            year = 1 - year                                        // PostgreSQL has no year zero.
+            index += 2
+        } else if index + 1 < scalars.count, scalars[index] == 0x41, scalars[index + 1] == 0x44 {
+            index += 2
+        } else {
+            return nil
+        }
+    }
+    guard index == scalars.count else { return nil }
 
     let days = daysFromCivil(year: year, month: month, day: day)
     let epochSeconds = Double(days * 86_400 + hour * 3600 + minute * 60 + second)
