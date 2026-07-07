@@ -10,4 +10,7 @@ public struct PreparedStatement: Sendable {
     public let parameterTypeOIDs: [Int32]
     /// Result columns, learned when the statement was described at prepare time.
     public let columns: [ColumnMetadata]
+    /// The connection that created this handle. Server-side prepared statements
+    /// are scoped to one backend connection.
+    let connectionID: UInt64
 }

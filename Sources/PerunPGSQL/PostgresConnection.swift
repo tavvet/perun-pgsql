@@ -107,6 +107,9 @@ public actor PostgresConnection {
     private let port: UInt16
     /// Reject backend messages whose payload exceeds this many bytes (DoS guard).
     private let maxMessageSize: Int
+    /// Process-local identity used to keep prepared-statement handles scoped to
+    /// the backend connection that created them.
+    private let connectionID: UInt64
 
     /// The TLS channel, once negotiated. When non-nil, all I/O flows through it.
     private var tls: TLSConnection?
@@ -154,6 +157,7 @@ public actor PostgresConnection {
         self.host = host
         self.port = port
         self.maxMessageSize = maxMessageSize
+        self.connectionID = UInt64.random(in: UInt64.min ... UInt64.max)
         var continuation: AsyncStream<PostgresNotification>.Continuation!
         self.notifications = AsyncStream { continuation = $0 }
         self.notificationContinuation = continuation
@@ -439,7 +443,7 @@ public actor PostgresConnection {
 
     private func runPrepare(_ sql: String) async throws -> PreparedStatement {
         preparedStatementCounter += 1
-        let name = "perun_stmt_\(preparedStatementCounter)"
+        let name = "perun_stmt_\(String(connectionID, radix: 16))_\(preparedStatementCounter)"
 
         var request = try FrontendMessage.parse(statement: name, query: sql)
         request += FrontendMessage.describe(.statement, name: name)
@@ -479,12 +483,14 @@ public actor PostgresConnection {
         }
         return PreparedStatement(name: name,
                                  parameterTypeOIDs: parameterTypeOIDs,
-                                 columns: columns)
+                                 columns: columns,
+                                 connectionID: connectionID)
     }
 
     private func runExecute(_ statement: PreparedStatement,
                             _ parameters: [(any PostgresEncodable)?],
                             resultFormat: PostgresFormat) async throws -> QueryResult {
+        try validatePreparedStatement(statement)
         var request = try FrontendMessage.bind(portal: "", statement: statement.name,
                                                parameters: parameters, resultFormat: resultFormat)
         request += FrontendMessage.execute(portal: "")
@@ -501,10 +507,17 @@ public actor PostgresConnection {
     }
 
     private func runClosePrepared(_ statement: PreparedStatement) async throws {
+        try validatePreparedStatement(statement)
         var request = FrontendMessage.close(.statement, name: statement.name)
         request += FrontendMessage.sync()
         try await send(request)
         _ = try await collectResults()
+    }
+
+    private func validatePreparedStatement(_ statement: PreparedStatement) throws {
+        guard statement.connectionID == connectionID else {
+            throw PerunError.preparedStatementConnectionMismatch
+        }
     }
 
     // MARK: - Wire serialization lock (FIFO async mutex)

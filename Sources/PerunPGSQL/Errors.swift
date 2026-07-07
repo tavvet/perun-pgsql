@@ -64,6 +64,9 @@ public enum PerunError: Error, CustomStringConvertible, Sendable {
     case clientShutdown
     /// More parameters than the protocol's unsigned 16-bit count field allows (max 65535).
     case tooManyParameters(count: Int)
+    /// A prepared-statement handle was used on a different connection than the
+    /// one that created it.
+    case preparedStatementConnectionMismatch
 
     public var description: String {
         switch self {
@@ -91,6 +94,8 @@ public enum PerunError: Error, CustomStringConvertible, Sendable {
             return "the connection pool has been shut down"
         case let .tooManyParameters(count):
             return "too many parameters: \(count) (PostgreSQL allows at most 65535 per statement)"
+        case .preparedStatementConnectionMismatch:
+            return "prepared statement belongs to a different connection"
         }
     }
 }
