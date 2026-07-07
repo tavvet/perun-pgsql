@@ -106,7 +106,12 @@ public actor PostgresClient {
         if openCount < maxConnections {
             openCount += 1
             do {
-                return try await PostgresConnection.connect(configuration)
+                let connection = try await PostgresConnection.connect(configuration)
+                if isShutDown {
+                    try? await connection.close()
+                    throw PerunError.clientShutdown
+                }
+                return connection
             } catch {
                 openCount -= 1
                 throw error
