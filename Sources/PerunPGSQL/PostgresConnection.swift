@@ -1,0 +1,680 @@
+import Dispatch
+
+/// How the connection should use TLS, mirroring libpq's `sslmode`.
+public enum TLSMode: Sendable {
+    /// Never use TLS.
+    case disable
+    /// Use TLS if the server offers it, otherwise fall back to plaintext.
+    case prefer
+    /// Require TLS; the channel is encrypted but the certificate is not verified.
+    case require
+    /// Require TLS and verify the certificate chain and hostname.
+    case verifyFull
+}
+
+/// Everything needed to open a connection.
+public struct ConnectionConfiguration: Sendable {
+    public var host: String
+    public var port: UInt16
+    public var user: String
+    public var database: String
+    public var password: String?
+    /// How to negotiate TLS. Defaults to `.prefer` (like libpq).
+    public var tlsMode: TLSMode
+    /// Reject any backend message whose payload exceeds this many bytes. Bounds
+    /// memory against a malicious or buggy server that declares a huge length.
+    /// Defaults to 256 MiB.
+    public var maxMessageSize: Int
+    /// Extra startup parameters (e.g. `["application_name": "perun"]`).
+    public var runtimeParameters: [String: String]
+
+    public init(host: String = "localhost",
+                port: UInt16 = 5432,
+                user: String,
+                database: String,
+                password: String? = nil,
+                tlsMode: TLSMode = .prefer,
+                maxMessageSize: Int = 256 * 1024 * 1024,
+                runtimeParameters: [String: String] = [:]) {
+        self.host = host
+        self.port = port
+        self.user = user
+        self.database = database
+        self.password = password
+        self.tlsMode = tlsMode
+        self.maxMessageSize = maxMessageSize
+        self.runtimeParameters = runtimeParameters
+    }
+}
+
+/// A single connection to a PostgreSQL server.
+///
+/// The connection is an `actor`, so its socket buffer and protocol state are
+/// isolated — you can hold one from multiple tasks and calls are serialized.
+/// Blocking socket I/O is pushed onto a dedicated dispatch queue via
+/// `withBlockingIO`, keeping the cooperative pool unblocked.
+public actor PostgresConnection {
+
+    private let fd: Int32
+    private let ioQueue: DispatchQueue
+    /// Remembered so `cancelCurrentQuery` can open a fresh connection.
+    private let host: String
+    private let port: UInt16
+    /// Reject backend messages whose payload exceeds this many bytes (DoS guard).
+    private let maxMessageSize: Int
+
+    /// The TLS channel, once negotiated. When non-nil, all I/O flows through it.
+    private var tls: TLSConnection?
+
+    /// Stream of asynchronous LISTEN/NOTIFY notifications from the server.
+    public nonisolated let notifications: AsyncStream<PostgresNotification>
+    private let notificationContinuation: AsyncStream<PostgresNotification>.Continuation
+
+    /// Optional handler invoked for each NoticeResponse (warnings, etc.).
+    private var noticeHandler: (@Sendable (PostgresServerError) -> Void)?
+
+    /// Unconsumed bytes already read from the socket, plus a read cursor so we
+    /// don't pay O(n) to drop consumed bytes on every message.
+    private var readBuffer: [UInt8] = []
+    private var readOffset: Int = 0
+
+    /// Server runtime parameters (`server_version`, `client_encoding`, …),
+    /// gathered from `ParameterStatus` messages.
+    public private(set) var parameters: [String: String] = [:]
+
+    /// Whether this connection is running over an encrypted TLS channel.
+    public var isSecure: Bool { tls != nil }
+
+    /// Backend PID + secret key, needed later to issue query cancellation.
+    private var backendProcessID: Int32 = 0
+    private var backendSecretKey: Int32 = 0
+
+    private var isClosed = false
+
+    /// In-flight SCRAM exchange state, held between authentication messages.
+    private var scram: SCRAMClient?
+
+    /// Monotonic counter for generating unique prepared-statement names.
+    private var preparedStatementCounter = 0
+
+    private init(fd: Int32, ioQueue: DispatchQueue, host: String, port: UInt16, maxMessageSize: Int) {
+        self.fd = fd
+        self.ioQueue = ioQueue
+        self.host = host
+        self.port = port
+        self.maxMessageSize = maxMessageSize
+        var continuation: AsyncStream<PostgresNotification>.Continuation!
+        self.notifications = AsyncStream { continuation = $0 }
+        self.notificationContinuation = continuation
+    }
+
+    // MARK: - Connecting
+
+    /// Open a TCP connection, perform the startup handshake, and return once the
+    /// server reports it is ready for queries.
+    public static func connect(_ configuration: ConnectionConfiguration) async throws -> PostgresConnection {
+        let ioQueue = DispatchQueue(label: "perun.connection.io")
+        let fd = try await withBlockingIO(on: ioQueue) {
+            try SystemSocket.makeConnected(host: configuration.host, port: configuration.port)
+        }
+        let connection = PostgresConnection(fd: fd, ioQueue: ioQueue,
+                                            host: configuration.host, port: configuration.port,
+                                            maxMessageSize: configuration.maxMessageSize)
+        do {
+            if configuration.tlsMode != .disable {
+                try await connection.negotiateTLS(configuration)
+            }
+            try await connection.startup(configuration)
+        } catch {
+            await connection.forceClose()
+            throw error
+        }
+        return connection
+    }
+
+    /// Ask the server to upgrade to TLS before the startup handshake.
+    private func negotiateTLS(_ configuration: ConnectionConfiguration) async throws {
+        // Sent in cleartext — `tls` is still nil, so `send` uses the raw socket.
+        try await send(FrontendMessage.sslRequest())
+        let reply = try await receiveSSLResponseByte()
+        switch reply {
+        case UInt8(ascii: "S"):
+            let fd = self.fd
+            let host = configuration.host
+            let verifyFull = configuration.tlsMode == .verifyFull
+            let established = try await withBlockingIO(on: ioQueue) {
+                try TLSConnection.connect(fd: fd, hostname: host, verifyFull: verifyFull)
+            }
+            self.tls = established
+        case UInt8(ascii: "N"):
+            if configuration.tlsMode == .require || configuration.tlsMode == .verifyFull {
+                throw PerunError.tlsNotAvailable
+            }
+            // .prefer: carry on unencrypted.
+        default:
+            throw PerunError.protocolViolation("unexpected SSL negotiation reply: \(reply)")
+        }
+    }
+
+    /// Read exactly one byte for the SSLRequest reply, without touching the
+    /// message buffer (this byte precedes all framed messages).
+    private func receiveSSLResponseByte() async throws -> UInt8 {
+        let fd = self.fd
+        let bytes = try await withBlockingIO(on: ioQueue) {
+            try SystemSocket.receive(fd: fd, maxLength: 1)
+        }
+        guard let byte = bytes.first else { throw PerunError.connectionClosed }
+        return byte
+    }
+
+    // MARK: - Public API
+    //
+    // Every request acquires an internal async lock so its full request/response
+    // cycle runs atomically on the wire. The actor is reentrant at each `await`,
+    // so without this two overlapping calls from different tasks could interleave
+    // their messages and corrupt the protocol stream.
+
+    /// Run one Simple Query request. The string may contain multiple
+    /// statements; the result reflects the last statement that produced rows.
+    @discardableResult
+    public func query(_ sql: String) async throws -> QueryResult {
+        await lock(); defer { unlock() }
+        return try await runSimpleQuery(sql)
+    }
+
+    /// Run a parameterized query over the extended protocol. `$1…$n` in the SQL
+    /// are filled from `parameters`, safely — values are never spliced into the
+    /// SQL text, so this is immune to SQL injection.
+    ///
+    /// `resultFormat` selects how the server sends result columns back: `.text`
+    /// (default) or `.binary`. Decoded values (`row[...].decode(_:)`) are the
+    /// same either way.
+    @discardableResult
+    public func query(_ sql: String,
+                      _ parameters: [(any PostgresEncodable)?],
+                      resultFormat: PostgresFormat = .text) async throws -> QueryResult {
+        await lock(); defer { unlock() }
+        return try await runParameterizedQuery(sql, parameters, resultFormat: resultFormat)
+    }
+
+    /// Parse a statement once so it can be executed repeatedly with different
+    /// parameters. The server reports the parameter and result types up front.
+    public func prepare(_ sql: String) async throws -> PreparedStatement {
+        await lock(); defer { unlock() }
+        return try await runPrepare(sql)
+    }
+
+    /// Execute a prepared statement with the given parameters.
+    @discardableResult
+    public func execute(_ statement: PreparedStatement,
+                        _ parameters: [(any PostgresEncodable)?] = [],
+                        resultFormat: PostgresFormat = .text) async throws -> QueryResult {
+        await lock(); defer { unlock() }
+        return try await runExecute(statement, parameters, resultFormat: resultFormat)
+    }
+
+    /// Release a prepared statement's server-side resources.
+    public func closePrepared(_ statement: PreparedStatement) async throws {
+        await lock(); defer { unlock() }
+        try await runClosePrepared(statement)
+    }
+
+    // MARK: - Notices, LISTEN/NOTIFY, cancellation
+
+    /// Register a handler called for every `NoticeResponse` (warnings, and the
+    /// like). Replaces any previous handler.
+    public func onNotice(_ handler: @escaping @Sendable (PostgresServerError) -> Void) {
+        noticeHandler = handler
+    }
+
+    /// Subscribe to a channel (`LISTEN`). Notifications arrive on `notifications`;
+    /// drive delivery with `waitForNotifications()`.
+    public func listen(to channel: String) async throws {
+        try await query("LISTEN \(Self.quoteIdentifier(channel))")
+    }
+
+    /// Unsubscribe from a channel (`UNLISTEN`).
+    public func unlisten(from channel: String) async throws {
+        try await query("UNLISTEN \(Self.quoteIdentifier(channel))")
+    }
+
+    /// Dedicate this connection to reading notifications, yielding each to
+    /// `notifications`, until the task is cancelled or the connection closes.
+    /// Holds the wire lock for its whole duration, so run it on a connection you
+    /// reserve for listening.
+    public func waitForNotifications() async throws {
+        await lock(); defer { unlock() }
+        while true {
+            try Task.checkCancellation()
+            switch try await readMessage() {
+            case let .notificationResponse(processID, channel, payload):
+                notificationContinuation.yield(
+                    PostgresNotification(processID: processID, channel: channel, payload: payload))
+            case let .noticeResponse(notice):
+                noticeHandler?(notice)
+            case let .parameterStatus(name, value):
+                parameters[name] = value
+            case let .errorResponse(error):
+                throw PerunError.server(error)
+            default:
+                continue
+            }
+        }
+    }
+
+    /// Ask the server to cancel whatever query is currently running on this
+    /// connection. Best-effort: it opens a *separate* connection to deliver the
+    /// request (so it works while this one is blocked mid-query) and may race the
+    /// query finishing on its own.
+    public func cancelCurrentQuery() async throws {
+        let processID = backendProcessID
+        let secretKey = backendSecretKey
+        guard processID != 0 else { return }
+        let host = self.host
+        let port = self.port
+        // A dedicated queue: the main ioQueue may be parked in a blocking recv
+        // waiting for the very query we're trying to cancel.
+        let cancelQueue = DispatchQueue(label: "perun.cancel")
+        try await withBlockingIO(on: cancelQueue) {
+            let fd = try SystemSocket.makeConnected(host: host, port: port)
+            defer { SystemSocket.disconnect(fd: fd) }
+            try SystemSocket.sendAll(fd: fd,
+                                     FrontendMessage.cancelRequest(processID: processID, secretKey: secretKey))
+        }
+    }
+
+    /// Double-quote a SQL identifier, escaping embedded quotes.
+    private static func quoteIdentifier(_ identifier: String) -> String {
+        var quoted = "\""
+        for character in identifier {
+            quoted.append(character)
+            if character == "\"" { quoted.append("\"") }
+        }
+        quoted.append("\"")
+        return quoted
+    }
+
+    // MARK: - Request implementations (each assumes the lock is held)
+
+    private func runSimpleQuery(_ sql: String) async throws -> QueryResult {
+        try await send(FrontendMessage.query(sql))
+        return try await collectResults()
+    }
+
+    private func runParameterizedQuery(_ sql: String,
+                                       _ parameters: [(any PostgresEncodable)?],
+                                       resultFormat: PostgresFormat) async throws -> QueryResult {
+        // With no parameters and text results, the Simple Query protocol is
+        // lighter (a single round trip). Binary still needs the extended path.
+        guard !(parameters.isEmpty && resultFormat == .text) else {
+            return try await runSimpleQuery(sql)
+        }
+
+        var request = try FrontendMessage.parse(statement: "", query: sql)
+        request += try FrontendMessage.bind(portal: "", statement: "",
+                                            parameters: parameters, resultFormat: resultFormat)
+        request += FrontendMessage.describe(.portal, name: "")
+        request += FrontendMessage.execute(portal: "")
+        request += FrontendMessage.sync()
+        try await send(request)
+
+        return try await collectResults()
+    }
+
+    private func runPrepare(_ sql: String) async throws -> PreparedStatement {
+        preparedStatementCounter += 1
+        let name = "perun_stmt_\(preparedStatementCounter)"
+
+        var request = try FrontendMessage.parse(statement: name, query: sql)
+        request += FrontendMessage.describe(.statement, name: name)
+        request += FrontendMessage.sync()
+        try await send(request)
+
+        var parameterTypeOIDs: [Int32] = []
+        var columns: [ColumnMetadata] = []
+        var pendingError: PostgresServerError?
+
+        loop: while true {
+            switch try await readMessage() {
+            case let .parameterDescription(oids):
+                parameterTypeOIDs = oids
+            case let .rowDescription(fields):
+                columns = fields.map(ColumnMetadata.init)
+            case .noData:
+                columns = []
+            case let .parameterStatus(name, value):
+                parameters[name] = value
+            case let .noticeResponse(notice):
+                noticeHandler?(notice)
+            case .parseComplete:
+                continue
+            case let .errorResponse(error):
+                pendingError = error
+            case .readyForQuery:
+                break loop
+            default:
+                continue
+            }
+        }
+
+        if let pendingError {
+            throw PerunError.server(pendingError)
+        }
+        return PreparedStatement(name: name,
+                                 parameterTypeOIDs: parameterTypeOIDs,
+                                 columns: columns)
+    }
+
+    private func runExecute(_ statement: PreparedStatement,
+                            _ parameters: [(any PostgresEncodable)?],
+                            resultFormat: PostgresFormat) async throws -> QueryResult {
+        var request = try FrontendMessage.bind(portal: "", statement: statement.name,
+                                               parameters: parameters, resultFormat: resultFormat)
+        request += FrontendMessage.execute(portal: "")
+        request += FrontendMessage.sync()
+        try await send(request)
+
+        // Execute alone sends no RowDescription; reuse the columns from prepare.
+        // The prepared statement was described in text, so re-tag the columns as
+        // binary when that's what we asked Bind to return.
+        let columns = resultFormat == .binary
+            ? statement.columns.map { $0.withFormatCode(1) }
+            : statement.columns
+        return try await collectResults(initialColumns: columns)
+    }
+
+    private func runClosePrepared(_ statement: PreparedStatement) async throws {
+        var request = FrontendMessage.close(.statement, name: statement.name)
+        request += FrontendMessage.sync()
+        try await send(request)
+        _ = try await collectResults()
+    }
+
+    // MARK: - Wire serialization lock (FIFO async mutex)
+
+    private var lockHeld = false
+    private var lockWaiters: [CheckedContinuation<Void, Never>] = []
+
+    /// Take exclusive use of the wire; suspends (FIFO) if another request holds it.
+    private func lock() async {
+        if !lockHeld {
+            lockHeld = true
+            return
+        }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            lockWaiters.append(continuation)
+        }
+        // Resumed by `unlock()`, which hands ownership over without clearing the flag.
+    }
+
+    /// Release the wire, passing ownership to the next waiter if there is one.
+    private func unlock() {
+        if lockWaiters.isEmpty {
+            lockHeld = false
+        } else {
+            lockWaiters.removeFirst().resume()
+        }
+    }
+
+    /// Drive the read loop until `ReadyForQuery`, assembling a `QueryResult`.
+    /// Shared by the simple and extended query paths.
+    private func collectResults(initialColumns: [ColumnMetadata] = []) async throws -> QueryResult {
+        var columns = initialColumns
+        var rows: [PostgresRow] = []
+        var commandTag = ""
+        var pendingError: PostgresServerError?
+
+        loop: while true {
+            let message = try await readMessage()
+            switch message {
+            case let .rowDescription(fields):
+                columns = fields.map(ColumnMetadata.init)
+                rows.removeAll(keepingCapacity: true)
+
+            case let .dataRow(values):
+                rows.append(PostgresRow(values: values, columns: columns))
+
+            case let .commandComplete(tag):
+                commandTag = tag
+
+            case .emptyQueryResponse:
+                commandTag = ""
+
+            case let .parameterStatus(name, value):
+                parameters[name] = value
+
+            case let .noticeResponse(notice):
+                noticeHandler?(notice)
+
+            case let .notificationResponse(processID, channel, payload):
+                notificationContinuation.yield(
+                    PostgresNotification(processID: processID, channel: channel, payload: payload))
+
+            case .parseComplete, .bindComplete, .closeComplete,
+                 .noData, .parameterDescription, .portalSuspended:
+                continue                // acknowledgements we don't need to act on
+
+            case let .errorResponse(error):
+                // Remember it, but keep reading: the server still sends
+                // ReadyForQuery, and we must consume it to stay in sync.
+                pendingError = error
+
+            case .readyForQuery:
+                break loop
+
+            default:
+                continue
+            }
+        }
+
+        if let pendingError {
+            throw PerunError.server(pendingError)
+        }
+        return QueryResult(columns: columns, rows: rows, commandTag: commandTag)
+    }
+
+    /// Close the connection and release its socket. Also interrupts any in-flight
+    /// read — e.g. a `waitForNotifications` loop parked waiting for the next
+    /// notification — so a listening connection can always be shut down.
+    public func close() async throws {
+        forceClose()
+    }
+
+    // MARK: - Handshake
+
+    private func startup(_ configuration: ConnectionConfiguration) async throws {
+        let startupMessage = FrontendMessage.startup(
+            user: configuration.user,
+            database: configuration.database,
+            parameters: configuration.runtimeParameters
+        )
+        try await send(startupMessage)
+
+        loop: while true {
+            let message = try await readMessage()
+            switch message {
+            case let .authentication(request):
+                try await handleAuthentication(request, configuration: configuration)
+
+            case let .parameterStatus(name, value):
+                parameters[name] = value
+
+            case let .backendKeyData(processID, secretKey):
+                backendProcessID = processID
+                backendSecretKey = secretKey
+
+            case let .errorResponse(error):
+                throw PerunError.server(error)
+
+            case .noticeResponse:
+                continue
+
+            case .readyForQuery:
+                break loop
+
+            default:
+                continue
+            }
+        }
+    }
+
+    private func handleAuthentication(
+        _ request: AuthenticationRequest,
+        configuration: ConnectionConfiguration
+    ) async throws {
+        switch request {
+        case .ok:
+            // Authentication finished. If we were mid-SCRAM the server
+            // signature must already have been verified.
+            scram = nil
+            return
+
+        case .cleartextPassword:
+            guard let password = configuration.password else {
+                throw PerunError.authenticationFailed("server requires a password, none provided")
+            }
+            try await send(FrontendMessage.password(password))
+
+        case let .md5Password(salt):
+            guard let password = configuration.password else {
+                throw PerunError.authenticationFailed("server requires a password, none provided")
+            }
+            // md5( md5(password + username) + salt ), prefixed with "md5".
+            let inner = MD5.hexDigest(Array(password.utf8) + Array(configuration.user.utf8))
+            let outer = MD5.hexDigest(Array(inner.utf8) + salt)
+            try await send(FrontendMessage.password("md5" + outer))
+
+        case let .sasl(mechanisms):
+            guard mechanisms.contains(SCRAMClient.mechanism) else {
+                throw PerunError.unsupportedAuthentication(
+                    "server offered SASL mechanisms \(mechanisms), only \(SCRAMClient.mechanism) is supported")
+            }
+            guard let password = configuration.password else {
+                throw PerunError.authenticationFailed("server requires a password, none provided")
+            }
+            var client = SCRAMClient(password: password)
+            let clientFirst = client.clientFirstMessage()
+            scram = client
+            try await send(FrontendMessage.saslInitialResponse(
+                mechanism: SCRAMClient.mechanism,
+                initialResponse: Array(clientFirst.utf8)))
+
+        case let .saslContinue(data):
+            guard var client = scram else {
+                throw PerunError.protocolViolation("SASLContinue without an active SCRAM exchange")
+            }
+            let serverFirst = String(decoding: data, as: UTF8.self)
+            let clientFinal = try client.clientFinalMessage(serverFirst: serverFirst)
+            scram = client
+            try await send(FrontendMessage.saslResponse(Array(clientFinal.utf8)))
+
+        case let .saslFinal(data):
+            guard let client = scram else {
+                throw PerunError.protocolViolation("SASLFinal without an active SCRAM exchange")
+            }
+            try client.verifyServerFinal(String(decoding: data, as: UTF8.self))
+            // The trailing AuthenticationOk clears `scram`.
+
+        case let .other(code):
+            throw PerunError.unsupportedAuthentication("authentication code \(code)")
+        }
+    }
+
+    // MARK: - Message framing
+
+    /// Largest number of bytes requested from a single `recv`, so one declared
+    /// message length can never drive an unbounded up-front allocation.
+    static let readChunkSize = 65_536
+
+    /// Validate a backend message's length field and return its payload length.
+    /// The wire length includes its own 4 bytes; a value below 4 (including the
+    /// negative that 0xFFFFFFFF decodes to) or above `maxMessageSize` is rejected
+    /// before any buffer is sized to it.
+    static func payloadLength(forMessageLength length: Int, maxMessageSize: Int) throws -> Int {
+        guard length >= 4 else {
+            throw PerunError.protocolViolation("message length \(length) is smaller than its 4-byte header")
+        }
+        let payload = length - 4
+        guard payload <= maxMessageSize else {
+            throw PerunError.protocolViolation(
+                "message payload of \(payload) bytes exceeds the \(maxMessageSize)-byte limit")
+        }
+        return payload
+    }
+
+    /// Read one full backend message: a 1-byte tag, an Int32 length (which
+    /// includes itself), then the payload.
+    private func readMessage() async throws -> BackendMessage {
+        let header = try await readExactly(5)
+        var headerReader = ByteReader(header)
+        let tag = try headerReader.readUInt8()
+        let length = Int(try headerReader.readInt32())
+        let payloadLength = try Self.payloadLength(forMessageLength: length, maxMessageSize: maxMessageSize)
+        let payload = payloadLength > 0 ? try await readExactly(payloadLength) : []
+        return try BackendMessage.decode(tag: tag, payload: payload)
+    }
+
+    /// Return exactly `count` bytes, reading from the socket as needed.
+    private func readExactly(_ count: Int) async throws -> [UInt8] {
+        while readBuffer.count - readOffset < count {
+            let needed = count - (readBuffer.count - readOffset)
+            // Read ahead a little for efficiency, but never size a single recv to
+            // the whole remaining message — that is the OOM guard's other half.
+            let chunk = try await receive(maxLength: min(max(needed, 8192), Self.readChunkSize))
+            if chunk.isEmpty {
+                throw PerunError.connectionClosed
+            }
+            readBuffer.append(contentsOf: chunk)
+        }
+        let result = Array(readBuffer[readOffset ..< readOffset + count])
+        readOffset += count
+
+        // Reclaim consumed prefix once it grows large, keeping memory bounded.
+        if readOffset > 65_536 {
+            readBuffer.removeFirst(readOffset)
+            readOffset = 0
+        }
+        return result
+    }
+
+    // MARK: - Raw I/O (bridged off the cooperative pool)
+
+    private func send(_ bytes: [UInt8]) async throws {
+        let fd = self.fd
+        let tls = self.tls
+        try await withBlockingIO(on: ioQueue) {
+            if let tls {
+                try tls.send(bytes)
+            } else {
+                try SystemSocket.sendAll(fd: fd, bytes)
+            }
+        }
+    }
+
+    private func receive(maxLength: Int) async throws -> [UInt8] {
+        let fd = self.fd
+        let tls = self.tls
+        return try await withBlockingIO(on: ioQueue) {
+            if let tls {
+                return try tls.receive(maxLength: maxLength)
+            } else {
+                return try SystemSocket.receive(fd: fd, maxLength: maxLength)
+            }
+        }
+    }
+
+    private func forceClose() {
+        guard !isClosed else { return }
+        isClosed = true
+        notificationContinuation.finish()
+        let fd = self.fd
+        let tls = self.tls
+        // Shut the socket down from here so any recv parked on ioQueue returns;
+        // otherwise the teardown dispatched below would queue behind it forever.
+        SystemSocket.shutdownBoth(fd: fd)
+        ioQueue.async {
+            tls?.close()
+            SystemSocket.disconnect(fd: fd)
+        }
+    }
+}

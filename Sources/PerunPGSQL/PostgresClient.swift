@@ -1,0 +1,146 @@
+/// A pool of PostgreSQL connections.
+///
+/// `PostgresClient` lazily opens up to `maxConnections` connections and hands
+/// them out one at a time. Callers either grab one with `withConnection` or use
+/// the convenience `query` methods, which check a connection out, run, and
+/// return it automatically.
+///
+/// ```swift
+/// let pool = PostgresClient(configuration: config, maxConnections: 8)
+/// let rows = try await pool.query("SELECT * FROM users WHERE id = $1", [id]).rows
+/// // …fan out concurrently; the pool serialises access…
+/// try await pool.shutdown()
+/// ```
+public actor PostgresClient {
+    private let configuration: ConnectionConfiguration
+    private let maxConnections: Int
+
+    /// Idle, ready-to-use connections.
+    private var idle: [PostgresConnection] = []
+    /// How many connections currently exist (idle + checked out + connecting).
+    private var openCount = 0
+    /// Tasks parked waiting for a connection to free up.
+    private var waiters: [CheckedContinuation<PostgresConnection, Error>] = []
+    private var isShutDown = false
+
+    public init(configuration: ConnectionConfiguration, maxConnections: Int = 10) {
+        precondition(maxConnections > 0, "maxConnections must be positive")
+        self.configuration = configuration
+        self.maxConnections = maxConnections
+    }
+
+    /// Number of connections currently open (idle plus in use).
+    public var connectionCount: Int { openCount }
+
+    // MARK: - Running work on a pooled connection
+
+    /// Check out a connection, run `body`, and return the connection to the pool.
+    ///
+    /// On a server-side (SQL) error the connection is healthy and is reused; on a
+    /// transport/protocol error it is discarded and replaced.
+    public nonisolated func withConnection<T: Sendable>(
+        _ body: (PostgresConnection) async throws -> T
+    ) async throws -> T {
+        let connection = try await acquire()
+        do {
+            let result = try await body(connection)
+            await release(connection)
+            return result
+        } catch {
+            await releaseAfterError(connection, error: error)
+            throw error
+        }
+    }
+
+    /// Convenience: run a (optionally parameterized) query on a pooled connection.
+    @discardableResult
+    public nonisolated func query(_ sql: String,
+                                  _ parameters: [(any PostgresEncodable)?] = [],
+                                  resultFormat: PostgresFormat = .text) async throws -> QueryResult {
+        try await withConnection { connection in
+            try await connection.query(sql, parameters, resultFormat: resultFormat)
+        }
+    }
+
+    /// Close every connection and fail anyone still waiting. Idempotent.
+    public func shutdown() async {
+        guard !isShutDown else { return }
+        isShutDown = true
+
+        let toClose = idle
+        idle.removeAll()
+        for connection in toClose {
+            try? await connection.close()
+        }
+        openCount -= toClose.count
+
+        let parked = waiters
+        waiters.removeAll()
+        for waiter in parked {
+            waiter.resume(throwing: PerunError.clientShutdown)
+        }
+        // Connections still checked out are closed when they are released.
+    }
+
+    // MARK: - Pool internals
+
+    private func acquire() async throws -> PostgresConnection {
+        if isShutDown { throw PerunError.clientShutdown }
+
+        if let reused = idle.popLast() {
+            return reused
+        }
+
+        if openCount < maxConnections {
+            openCount += 1
+            do {
+                return try await PostgresConnection.connect(configuration)
+            } catch {
+                openCount -= 1
+                throw error
+            }
+        }
+
+        // At capacity — wait for a connection to come back.
+        return try await withCheckedThrowingContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    private func release(_ connection: PostgresConnection) {
+        if isShutDown {
+            openCount -= 1
+            Task { try? await connection.close() }
+            return
+        }
+        if !waiters.isEmpty {
+            waiters.removeFirst().resume(returning: connection)   // hand straight to a waiter
+        } else {
+            idle.append(connection)
+        }
+    }
+
+    private func releaseAfterError(_ connection: PostgresConnection, error: Error) async {
+        // A server error leaves the connection in a clean, reusable state (it was
+        // drained up to ReadyForQuery). Anything else may have desynced the wire,
+        // so drop the connection and open a replacement if someone is waiting.
+        if case PerunError.server = error {
+            release(connection)
+            return
+        }
+
+        openCount -= 1
+        try? await connection.close()
+
+        guard !isShutDown, !waiters.isEmpty, openCount < maxConnections else { return }
+        let waiter = waiters.removeFirst()
+        openCount += 1
+        do {
+            let replacement = try await PostgresConnection.connect(configuration)
+            waiter.resume(returning: replacement)
+        } catch {
+            openCount -= 1
+            waiter.resume(throwing: error)
+        }
+    }
+}
