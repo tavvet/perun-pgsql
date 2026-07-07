@@ -31,6 +31,10 @@ public struct ConnectionConfiguration: Sendable {
     /// memory against a malicious or buggy server that declares a huge length.
     /// Defaults to 256 MiB.
     public var maxMessageSize: Int
+    /// Maximum number of LISTEN/NOTIFY messages buffered when the consumer is
+    /// slower than the socket pump. Newer notifications replace older buffered
+    /// ones once this limit is reached. Defaults to 1024.
+    public var notificationBufferLimit: Int
     /// Extra startup parameters (e.g. `["application_name": "perun"]`).
     public var runtimeParameters: [String: String]
 
@@ -41,7 +45,9 @@ public struct ConnectionConfiguration: Sendable {
                 password: String? = nil,
                 tlsMode: TLSMode = .verifyFull,
                 maxMessageSize: Int = 256 * 1024 * 1024,
+                notificationBufferLimit: Int = 1024,
                 runtimeParameters: [String: String] = [:]) {
+        precondition(notificationBufferLimit > 0, "notificationBufferLimit must be positive")
         self.host = host
         self.port = port
         self.user = user
@@ -49,6 +55,7 @@ public struct ConnectionConfiguration: Sendable {
         self.password = password
         self.tlsMode = tlsMode
         self.maxMessageSize = maxMessageSize
+        self.notificationBufferLimit = notificationBufferLimit
         self.runtimeParameters = runtimeParameters
     }
 }
@@ -157,7 +164,12 @@ public actor PostgresConnection {
     private var transactionContextCounter = 0
     private var activeTransactionContext: Int?
 
-    private init(fd: Int32, ioQueue: DispatchQueue, host: String, port: UInt16, maxMessageSize: Int) {
+    private init(fd: Int32,
+                 ioQueue: DispatchQueue,
+                 host: String,
+                 port: UInt16,
+                 maxMessageSize: Int,
+                 notificationBufferLimit: Int) {
         self.fd = fd
         self.ioQueue = ioQueue
         self.host = host
@@ -165,7 +177,9 @@ public actor PostgresConnection {
         self.maxMessageSize = maxMessageSize
         self.connectionID = UInt64.random(in: UInt64.min ... UInt64.max)
         var continuation: AsyncStream<PostgresNotification>.Continuation!
-        self.notifications = AsyncStream { continuation = $0 }
+        self.notifications = AsyncStream(bufferingPolicy: .bufferingNewest(notificationBufferLimit)) {
+            continuation = $0
+        }
         self.notificationContinuation = continuation
     }
 
@@ -180,7 +194,8 @@ public actor PostgresConnection {
         }
         let connection = PostgresConnection(fd: fd, ioQueue: ioQueue,
                                             host: configuration.host, port: configuration.port,
-                                            maxMessageSize: configuration.maxMessageSize)
+                                            maxMessageSize: configuration.maxMessageSize,
+                                            notificationBufferLimit: configuration.notificationBufferLimit)
         do {
             if configuration.tlsMode != .disable {
                 try await connection.negotiateTLS(configuration)

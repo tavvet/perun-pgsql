@@ -544,9 +544,11 @@ LISTEN/NOTIFY:
 - `notifications` is an `AsyncStream<PostgresNotification>`.
 - `waitForNotifications()` holds the wire lock and pumps the socket until
   cancelled or closed.
+- The stream uses `.bufferingNewest(configuration.notificationBufferLimit)`;
+  the default limit is 1024 notifications.
 
-Important review note: the notification stream is currently unbounded. A capped
-buffering policy would protect memory if the consumer is slow or absent.
+If the consumer is slow or absent, older buffered notifications are dropped in
+favor of newer ones instead of growing memory without bound.
 
 ## Cancellation
 

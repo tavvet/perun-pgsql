@@ -134,6 +134,9 @@ for await note in conn.notifications {
 }
 ```
 
+`notifications` uses a bounded newest-first buffer (`notificationBufferLimit`,
+default `1024`) so an unconsumed notification stream cannot grow without bound.
+
 ### Cancellation
 
 ```swift
