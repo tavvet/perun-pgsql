@@ -16,7 +16,7 @@ import PerunPGSQL
 let config = ConnectionConfiguration(
     host: "localhost", port: 5432,
     user: "perun", database: "perun", password: "secret",
-    tlsMode: .prefer
+    tlsMode: .verifyFull
 )
 
 let conn = try await PostgresConnection.connect(config)
@@ -66,7 +66,7 @@ lines the ORM can rely on and reshape, not an opaque dependency.
 | **Authentication** | `trust`, cleartext, **MD5**, **SCRAM-SHA-256** — with SHA-256/HMAC/PBKDF2/MD5/Base64 written from scratch |
 | **Queries** | Simple Query, and the extended protocol: `Parse`/`Bind`/`Describe`/`Execute`/`Sync`, prepared statements, `$1` parameters |
 | **Types** | `Int*`, `Float`/`Double`, `Bool`, `String`, `Data`/`[UInt8]` (bytea), `UUID`, `Date` (timestamp/timestamptz/date), `Decimal` (numeric), JSON — in **both text and binary** formats |
-| **TLS** | `SSLRequest` negotiation + OpenSSL channel; `sslmode` = disable/prefer/require/verify-full |
+| **TLS** | `SSLRequest` negotiation + OpenSSL channel; modes = disable / allow plaintext fallback / encrypt without verification / verify full |
 | **Pool** | `PostgresClient` — lazy, bounded, `withConnection {}`, reuse/replace, graceful shutdown |
 | **Concurrency** | Per-connection FIFO async lock so overlapping queries can't interleave on the wire |
 | **Extras** | `NoticeResponse` handler, **LISTEN/NOTIFY** via `AsyncStream`, query **cancellation** (`CancelRequest`) |
@@ -85,7 +85,7 @@ lines the ORM can rely on and reshape, not an opaque dependency.
 ```swift
 let conn = try await PostgresConnection.connect(
     ConnectionConfiguration(host: "localhost", user: "me", database: "app",
-                            password: "secret", tlsMode: .require))
+                            password: "secret", tlsMode: .verifyFull))
 await conn.isSecure    // true when the channel is encrypted
 ```
 
@@ -193,6 +193,9 @@ swift run perun-demo   # full showcase against a live PostgreSQL
 
 The demo reads standard `PG*` environment variables
 (`PGHOST`/`PGPORT`/`PGUSER`/`PGDATABASE`/`PGPASSWORD`/`PGSSLMODE`).
+`PGSSLMODE` accepts `disable`, `prefer`, `require`, and `verify-full`; in Swift
+code the unsafe modes are named `.allowPlaintextFallback` and
+`.encryptWithoutVerification` so the risk is visible at the call site.
 
 To bring up a throwaway server:
 

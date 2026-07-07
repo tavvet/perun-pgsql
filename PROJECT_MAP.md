@@ -182,13 +182,18 @@ Failure path:
 Defined in `TLSMode`:
 
 - `.disable`: never use TLS.
-- `.prefer`: request TLS, fall back to plaintext if server says no.
-- `.require`: require TLS encryption, but do not verify certificate/hostname.
+- `.allowPlaintextFallback`: request TLS, fall back to plaintext if server says no.
+- `.encryptWithoutVerification`: require TLS encryption, but do not verify certificate/hostname.
 - `.verifyFull`: require TLS and verify chain/hostname.
 
 `TLSConnection.connect(fd:hostname:verifyFull:)` configures OpenSSL. SNI is set
 for all TLS connections; certificate verification and hostname verification are
 only enabled for `.verifyFull`.
+
+`ConnectionConfiguration` defaults to `.verifyFull`. The unsafe modes are named
+for the risk they carry; `PGSSLMODE=prefer` and `PGSSLMODE=require` are still
+accepted by the demo/integration helpers and mapped onto the explicit Swift
+cases.
 
 ### Authentication
 
@@ -725,4 +730,3 @@ For TLS/socket behavior:
 2. `Socket/POSIXSocket.swift`
 3. `Concurrency.swift`
 4. `PostgresConnection.send/receive/forceClose`
-

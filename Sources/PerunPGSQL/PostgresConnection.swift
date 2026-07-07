@@ -1,15 +1,21 @@
 import Dispatch
 
-/// How the connection should use TLS, mirroring libpq's `sslmode`.
-public enum TLSMode: Sendable {
+/// How the connection should use TLS.
+public enum TLSMode: Sendable, Equatable {
     /// Never use TLS.
     case disable
     /// Use TLS if the server offers it, otherwise fall back to plaintext.
-    case prefer
+    case allowPlaintextFallback
     /// Require TLS; the channel is encrypted but the certificate is not verified.
-    case require
+    case encryptWithoutVerification
     /// Require TLS and verify the certificate chain and hostname.
     case verifyFull
+
+    @available(*, deprecated, renamed: "allowPlaintextFallback")
+    public static var prefer: TLSMode { .allowPlaintextFallback }
+
+    @available(*, deprecated, renamed: "encryptWithoutVerification")
+    public static var require: TLSMode { .encryptWithoutVerification }
 }
 
 /// Everything needed to open a connection.
@@ -19,7 +25,7 @@ public struct ConnectionConfiguration: Sendable {
     public var user: String
     public var database: String
     public var password: String?
-    /// How to negotiate TLS. Defaults to `.prefer` (like libpq).
+    /// How to negotiate TLS. Defaults to `.verifyFull`.
     public var tlsMode: TLSMode
     /// Reject any backend message whose payload exceeds this many bytes. Bounds
     /// memory against a malicious or buggy server that declares a huge length.
@@ -33,7 +39,7 @@ public struct ConnectionConfiguration: Sendable {
                 user: String,
                 database: String,
                 password: String? = nil,
-                tlsMode: TLSMode = .prefer,
+                tlsMode: TLSMode = .verifyFull,
                 maxMessageSize: Int = 256 * 1024 * 1024,
                 runtimeParameters: [String: String] = [:]) {
         self.host = host
@@ -202,10 +208,10 @@ public actor PostgresConnection {
             }
             self.tls = established
         case UInt8(ascii: "N"):
-            if configuration.tlsMode == .require || configuration.tlsMode == .verifyFull {
+            if configuration.tlsMode == .encryptWithoutVerification || configuration.tlsMode == .verifyFull {
                 throw PerunError.tlsNotAvailable
             }
-            // .prefer: carry on unencrypted.
+            // .allowPlaintextFallback: carry on unencrypted.
         default:
             throw PerunError.protocolViolation("unexpected SSL negotiation reply: \(reply)")
         }

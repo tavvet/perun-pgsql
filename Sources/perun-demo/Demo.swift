@@ -15,9 +15,10 @@ struct Demo {
         let tlsMode: TLSMode
         switch environment["PGSSLMODE"] {
         case "disable": tlsMode = .disable
-        case "require": tlsMode = .require
+        case "prefer", "allow-plaintext-fallback": tlsMode = .allowPlaintextFallback
+        case "require", "encrypt-without-verification": tlsMode = .encryptWithoutVerification
         case "verify-full": tlsMode = .verifyFull
-        default: tlsMode = .prefer
+        default: tlsMode = .verifyFull
         }
         let configuration = ConnectionConfiguration(
             host: environment["PGHOST"] ?? "localhost",
