@@ -85,7 +85,7 @@ struct SCRAMClient {
         else {
             throw PerunError.protocolViolation("malformed SCRAM server-final: \(serverFinal)")
         }
-        guard signature == expectedServerSignature else {
+        guard Self.constantTimeEquals(signature, expectedServerSignature) else {
             throw PerunError.authenticationFailed("server signature mismatch (wrong password or MITM)")
         }
         hasVerifiedServerSignature = true
@@ -115,5 +115,15 @@ struct SCRAMClient {
             result[key] = value
         }
         return result
+    }
+
+    private static func constantTimeEquals(_ lhs: [UInt8], _ rhs: [UInt8]) -> Bool {
+        guard lhs.count == rhs.count else { return false }
+
+        var difference: UInt8 = 0
+        for index in lhs.indices {
+            difference |= lhs[index] ^ rhs[index]
+        }
+        return difference == 0
     }
 }

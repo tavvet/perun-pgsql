@@ -11,6 +11,7 @@ enum PBKDF2 {
 
         var derived = [UInt8]()
         derived.reserveCapacity(blockCount * hLen)
+        let prf = HMACSHA256.Context(key: password)
 
         for blockIndex in 1 ... blockCount {
             // U1 = PRF(password, salt || INT_32_BE(blockIndex))
@@ -20,11 +21,11 @@ enum PBKDF2 {
             salted.append(UInt8(truncatingIfNeeded: blockIndex >> 8))
             salted.append(UInt8(truncatingIfNeeded: blockIndex))
 
-            var u = HMACSHA256.authenticate(key: password, message: salted)
+            var u = prf.authenticate(message: salted)
             var t = u
             if iterations > 1 {
                 for _ in 2 ... iterations {
-                    u = HMACSHA256.authenticate(key: password, message: u)
+                    u = prf.authenticate(message: u)
                     for i in 0 ..< hLen { t[i] ^= u[i] }
                 }
             }

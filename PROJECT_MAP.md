@@ -216,10 +216,10 @@ primitives:
 - PBKDF2
 - Base64
 
-Important review note: the SCRAM client verifies the server final signature when
-`SASLFinal` is received, but the connection authentication state should also
-ensure `AuthenticationOk` cannot finish a SCRAM exchange before a valid
-`SASLFinal`.
+SCRAM server-final signatures are verified before authentication can complete.
+The signature comparison is constant-time for equal-length signatures. PBKDF2
+uses a reusable HMAC-SHA-256 context so the HMAC key schedule is not rebuilt on
+every iteration.
 
 ## Query Execution
 
