@@ -299,6 +299,45 @@ public actor PostgresConnection {
                                     resultFormat: resultFormat)
     }
 
+    /// Pipeline one prepared statement over many parameter sets as a single **atomic**
+    /// batch: all the `Bind`/`Execute` messages are sent without waiting for replies,
+    /// then the results are read in order. Because they share one trailing `Sync`, the
+    /// server runs them in a single implicit transaction — if any set fails the whole
+    /// batch rolls back and this throws. Results come back one per set, in order.
+    ///
+    /// The win is latency: `N` sets cost one round trip instead of `N`. Two limits
+    /// follow from sending everything before reading anything: a set cannot depend on
+    /// an earlier set's result (all parameters are known up front), and the batch
+    /// should have small per-command results (bulk `INSERT`/`UPDATE`) — a batch whose
+    /// combined replies exceed the socket buffers can deadlock.
+    @discardableResult
+    public func pipeline(_ statement: PreparedStatement,
+                         _ parameterSets: [[(any PostgresEncodable)?]],
+                         parameterFormat: PostgresFormat = .text,
+                         resultFormat: PostgresFormat = .text) async throws -> [QueryResult] {
+        try validatePreparedStatement(statement)
+        guard !parameterSets.isEmpty else { return [] }
+        try await lock(); defer { unlock() }
+        return try await runPipelinedExecute(statement, parameterSets,
+                                             parameterFormat: parameterFormat, resultFormat: resultFormat,
+                                             syncAfterEach: false)
+    }
+
+    /// Like `pipeline`, but each parameter set is its own autocommit unit (a `Sync`
+    /// after each), so a failure in one neither rolls back nor skips the others.
+    /// Returns a per-set `Result`, in order. Still throws for a wire-level failure,
+    /// which aborts the whole batch.
+    public func pipelineIndependently(_ statement: PreparedStatement,
+                                      _ parameterSets: [[(any PostgresEncodable)?]],
+                                      parameterFormat: PostgresFormat = .text,
+                                      resultFormat: PostgresFormat = .text) async throws -> [Result<QueryResult, Error>] {
+        try validatePreparedStatement(statement)
+        guard !parameterSets.isEmpty else { return [] }
+        try await lock(); defer { unlock() }
+        return try await runPipelinedExecuteIndependently(statement, parameterSets,
+                                                          parameterFormat: parameterFormat, resultFormat: resultFormat)
+    }
+
     /// Release a prepared statement's server-side resources.
     public func closePrepared(_ statement: PreparedStatement) async throws {
         try await lock(); defer { unlock() }
@@ -542,6 +581,114 @@ public actor PostgresConnection {
         try validatePreparedStatement(statement)
         try await send(FrontendMessage.closeAndSync(.statement, name: statement.name))
         _ = try await collectResults()
+    }
+
+    /// Atomic pipeline: send every `Bind`/`Execute` under one trailing `Sync`, then
+    /// read one result set per `CommandComplete` up to the single `ReadyForQuery`.
+    private func runPipelinedExecute(_ statement: PreparedStatement,
+                                     _ parameterSets: [[(any PostgresEncodable)?]],
+                                     parameterFormat: PostgresFormat,
+                                     resultFormat: PostgresFormat,
+                                     syncAfterEach: Bool) async throws -> [QueryResult] {
+        try await send(try FrontendMessage.pipelinedExecute(statement: statement.name,
+                                                            parameterSets: parameterSets,
+                                                            parameterFormat: parameterFormat,
+                                                            resultFormat: resultFormat,
+                                                            syncAfterEach: syncAfterEach))
+        return try await collectPipelinedResults(defaultColumns: preparedResultColumns(statement, resultFormat: resultFormat))
+    }
+
+    /// Independent pipeline: a `Sync` after each set, so results and errors are
+    /// per-set. Reuses the single-result reader once per set — each `ReadyForQuery`
+    /// bounds one set, and a server error there leaves the wire in sync for the next.
+    private func runPipelinedExecuteIndependently(_ statement: PreparedStatement,
+                                                  _ parameterSets: [[(any PostgresEncodable)?]],
+                                                  parameterFormat: PostgresFormat,
+                                                  resultFormat: PostgresFormat) async throws -> [Result<QueryResult, Error>] {
+        try await send(try FrontendMessage.pipelinedExecute(statement: statement.name,
+                                                            parameterSets: parameterSets,
+                                                            parameterFormat: parameterFormat,
+                                                            resultFormat: resultFormat,
+                                                            syncAfterEach: true))
+        let columns = preparedResultColumns(statement, resultFormat: resultFormat)
+        var results: [Result<QueryResult, Error>] = []
+        results.reserveCapacity(parameterSets.count)
+        for _ in parameterSets {
+            do {
+                results.append(.success(try await collectResults(initialColumns: columns)))
+            } catch let error as PerunError where !error.mayHaveDesynchronizedWire {
+                results.append(.failure(error))     // server/local error: wire still in sync, keep reading
+            }
+            // A wire-desync error (or anything else) propagates — we can't keep reading.
+        }
+        return results
+    }
+
+    /// A prepared statement is described in text; re-tag its columns as binary when
+    /// binary results were requested (its own `Execute` sends no RowDescription).
+    private func preparedResultColumns(_ statement: PreparedStatement, resultFormat: PostgresFormat) -> [ColumnMetadata] {
+        resultFormat == .binary ? statement.columns.map { $0.withFormatCode(1) } : statement.columns
+    }
+
+    /// Reader for a pipeline that ends in a single `Sync`: one `QueryResult` per
+    /// `CommandComplete`, all bounded by the final `ReadyForQuery`. The batch is one
+    /// implicit transaction, so any error rolled the whole thing back — we throw and
+    /// drop the partial results rather than return them.
+    private func collectPipelinedResults(defaultColumns: [ColumnMetadata]) async throws -> [QueryResult] {
+        var results: [QueryResult] = []
+        var columns = defaultColumns
+        var rowValues: [[[UInt8]?]] = []
+        var pendingError: PostgresServerError?
+
+        loop: while true {
+            switch try await readMessage() {
+            case let .rowDescription(fields):
+                columns = fields.map(ColumnMetadata.init)
+                rowValues.removeAll(keepingCapacity: true)
+
+            case let .dataRow(values):
+                rowValues.append(values)
+
+            case let .commandComplete(tag):
+                results.append(QueryResult(columns: columns, values: rowValues, commandTag: tag))
+                columns = defaultColumns
+                rowValues = []
+
+            case .emptyQueryResponse:
+                results.append(QueryResult(columns: defaultColumns, values: [], commandTag: ""))
+                columns = defaultColumns
+                rowValues = []
+
+            case let .parameterStatus(name, value):
+                parameters[name] = value
+
+            case let .noticeResponse(notice):
+                noticeHandler?(notice)
+
+            case let .notificationResponse(processID, channel, payload):
+                notificationContinuation.yield(
+                    PostgresNotification(processID: processID, channel: channel, payload: payload))
+
+            case .parseComplete, .bindComplete, .closeComplete,
+                 .noData, .parameterDescription, .portalSuspended:
+                continue
+
+            case let .errorResponse(error):
+                pendingError = error
+
+            case let .readyForQuery(status):
+                transactionStatus = status
+                break loop
+
+            default:
+                continue
+            }
+        }
+
+        if let pendingError {
+            throw PerunError.server(pendingError)
+        }
+        return results
     }
 
     private func validatePreparedStatement(_ statement: PreparedStatement) throws {

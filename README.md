@@ -64,7 +64,7 @@ lines the ORM can rely on and reshape, not an opaque dependency.
 | **Sockets** | Raw POSIX (`Darwin`/`Glibc`), blocking calls bridged to async/await off the cooperative pool |
 | **Wire protocol** | v3 framing, all frontend/backend messages, simple + extended query |
 | **Authentication** | `trust`, cleartext, **MD5**, **SCRAM-SHA-256** — with SHA-256/HMAC/PBKDF2/MD5/Base64 written from scratch |
-| **Queries** | Simple Query, and the extended protocol: `Parse`/`Bind`/`Describe`/`Execute`/`Sync`, prepared statements, `$1` parameters (text or binary) |
+| **Queries** | Simple Query, and the extended protocol: `Parse`/`Bind`/`Describe`/`Execute`/`Sync`, prepared statements, `$1` parameters (text or binary), pipelined bulk execution (atomic / independent) |
 | **Types** | `Int*`, `Float`/`Double`, `Bool`, `String`, `Data`/`[UInt8]` (bytea), `UUID`, `Date` (timestamp/timestamptz/date), `Decimal` (numeric), `PostgresJSON` (json/jsonb) — in **both text and binary** formats |
 | **Arrays** | One-dimensional array **parameters** (`int8[]`, `text[]`, `uuid[]`, …) via `PostgresArray` — text or binary |
 | **TLS** | `SSLRequest` negotiation + OpenSSL channel; modes = disable / allow plaintext fallback / encrypt without verification / verify full |
@@ -98,6 +98,29 @@ try await conn.execute(insert, [1, "one"])
 try await conn.execute(insert, [2, "two"])
 try await conn.execute(insert, [3, nil])          // nil → SQL NULL
 ```
+
+### Pipelining
+
+Run one prepared statement over many parameter sets in a single round trip instead of
+`N` — a large latency win for bulk writes. `pipeline` runs the batch atomically (one
+implicit transaction: all sets commit, or the batch rolls back and it throws):
+
+```swift
+try await conn.pipeline(insert, [[1, "one"], [2, "two"], [3, "three"]])   // all-or-nothing
+```
+
+`pipelineIndependently` gives each set its own autocommit unit — one failing neither
+rolls back nor skips the others — and returns a per-set `Result`:
+
+```swift
+for outcome in try await conn.pipelineIndependently(insert, rows) {
+    if case .failure(let error) = outcome { /* this set failed; the rest still ran */ }
+}
+```
+
+Sets can't depend on each other's results (all parameters are sent before any reply is
+read), and the batch should have small per-command results — pipelining is for bulk
+`INSERT`/`UPDATE`, not for fetching large result sets.
 
 ### Typed decoding (text or binary)
 
@@ -251,7 +274,10 @@ Not yet implemented (each on its own merits):
 
 - **Full SASLprep** (RFC 4013) for non-ASCII passwords — currently the identity
   mapping, which is correct for ASCII.
-- **Statement pipelining** — an optional throughput win over the extended protocol.
+- **Transparent pipelining** across independent tasks sharing one connection. The
+  explicit batch form (`pipeline` / `pipelineIndependently`) is implemented; letting
+  unrelated tasks interleave on a single connection additionally needs a decoupled
+  response reader and connection-pinning for transactions.
 
 ## License
 

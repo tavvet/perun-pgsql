@@ -321,6 +321,32 @@ counter. `execute` and `closePrepared` validate the handle's creating
 connection ID before sending it to the server, so prepared-statement handles are
 scoped to the backend connection that created them.
 
+### Pipelining
+
+Entry points on `PostgresConnection` (one prepared statement, many parameter sets):
+
+- `pipeline(_:_:parameterFormat:resultFormat:)` → `[QueryResult]`
+- `pipelineIndependently(_:_:parameterFormat:resultFormat:)` → `[Result<QueryResult, Error>]`
+
+Both send all the `Bind`/`Execute` messages before reading any reply — one round trip
+instead of `N`. The wire lock is held for the whole batch, so there is still one owner
+of the wire; pipelining is a mode *within* a single lock hold, not a relaxation of it.
+`FrontendMessage.pipelinedExecute` builds the batch; the `Sync` placement is the only
+difference between the modes:
+
+- **Atomic** (`pipeline`): one trailing `Sync`, so the server runs the batch as a
+  single implicit transaction. `collectPipelinedResults` reads one `QueryResult` per
+  `CommandComplete` up to the single `ReadyForQuery`; on any error it throws and drops
+  the partial results (the transaction rolled back).
+- **Independent** (`pipelineIndependently`): a `Sync` after each set, so each is its own
+  unit. The single-result reader runs once per set, wrapping each outcome in a
+  `Result`; a server error there leaves the wire in sync for the next set, while a
+  wire-desync error propagates and aborts the batch.
+
+Constraints, both from sending everything before reading: a set cannot depend on an
+earlier set's result (parameters are known up front), and combined replies must fit the
+socket buffers (bulk `INSERT`/`UPDATE`, not large result sets) or the batch can deadlock.
+
 ## Result Model
 
 Main types:
@@ -717,6 +743,12 @@ constraint name and leaves the connection usable (skipped unless `PERUN_PGSQL_IN
 
 Binary parameter encoding: byte-exact wire form for each encodable type, plus the
 `Bind` message layout when binary parameters are requested.
+
+### `PipelineTests`
+
+The pipelined-batch `Sync` placement at the wire level (atomic = one trailing `Sync`,
+independent = `Sync` per set), plus live semantics: atomic bulk insert, atomic rollback
+on error, and independent partial success (skipped unless `PERUN_PGSQL_INTEGRATION=1`).
 
 ### `ConfigurationTests`
 

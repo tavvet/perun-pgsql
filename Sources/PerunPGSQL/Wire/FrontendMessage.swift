@@ -211,6 +211,29 @@ enum FrontendMessage {
         return request.bytes
     }
 
+    /// A pipelined bulk of one already-parsed statement: `Bind`+`Execute` for each
+    /// parameter set, sent back-to-back. `syncAfterEach == false` places a single
+    /// trailing `Sync` (all sets run in one implicit transaction — atomic);
+    /// `syncAfterEach == true` places a `Sync` after each (each set its own unit —
+    /// independent). The `Sync` placement is the whole semantic difference.
+    static func pipelinedExecute(statement: String,
+                                 parameterSets: [[(any PostgresEncodable)?]],
+                                 parameterFormat: PostgresFormat,
+                                 resultFormat: PostgresFormat,
+                                 syncAfterEach: Bool) throws -> [UInt8] {
+        var capacity = statement.utf8.count + 16
+        for parameters in parameterSets { capacity += 32 + parameters.count * 16 }
+        var request = ByteWriter(reservingCapacity: capacity)
+        for parameters in parameterSets {
+            try appendBind(to: &request, portal: "", statement: statement, parameters: parameters,
+                           parameterFormat: parameterFormat, resultFormat: resultFormat)
+            appendExecute(to: &request, portal: "")
+            if syncAfterEach { appendSync(to: &request) }
+        }
+        if !syncAfterEach { appendSync(to: &request) }
+        return request.bytes
+    }
+
     static func closeAndSync(_ target: StatementOrPortal, name: String) -> [UInt8] {
         var request = ByteWriter(reservingCapacity: name.utf8.count + 16)
         appendClose(to: &request, target, name: name)
