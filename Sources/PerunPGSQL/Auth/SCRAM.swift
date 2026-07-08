@@ -8,8 +8,8 @@
 ///
 /// We use channel binding "n,," (the client does not offer channel binding);
 /// combined with `.verifyFull` TLS this is safe. SCRAM-SHA-256-PLUS channel
-/// binding is a possible future hardening. Passwords are used as raw UTF-8; full
-/// SASLprep (RFC 4013) normalization is a TODO and is the identity for ASCII.
+/// binding is a possible future hardening. Passwords are prepared with SASLprep
+/// (RFC 4013) before use — see `saslPrep`.
 struct SCRAMClient {
     static let mechanism = "SCRAM-SHA-256"
 
@@ -25,7 +25,7 @@ struct SCRAMClient {
     ///   defaults to empty; it exists mainly to reproduce RFC test vectors.
     init(username: String = "", password: String, clientNonce: String = SCRAMClient.makeNonce()) {
         self.username = username
-        self.password = Array(password.utf8)
+        self.password = Array(saslPrep(password).utf8)
         self.clientNonce = clientNonce
     }
 

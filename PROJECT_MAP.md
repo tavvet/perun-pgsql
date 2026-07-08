@@ -50,6 +50,7 @@ Sources/
       BackendMessage.swift
     Auth/
       SCRAM.swift
+      SASLprep.swift
     Crypto/
       Base64.swift
       Hex.swift
@@ -220,6 +221,14 @@ SCRAM server-final signatures are verified before authentication can complete.
 The signature comparison is constant-time for equal-length signatures. PBKDF2
 uses a reusable HMAC-SHA-256 context so the HMAC key schedule is not rebuilt on
 every iteration.
+
+Passwords are prepared with SASLprep (RFC 4013) in `Auth/SASLprep.swift` before the
+key derivation: map the RFC 3454 B.1/C.1.2 code points, apply Unicode NFKC (via
+Foundation), and reject prohibited output — falling back to the original string on any
+failure, exactly as PostgreSQL's `pg_saslprep` does so both sides derive the same key
+(pure ASCII is unchanged). The bidirectional and unassigned-code-point checks are
+skipped to match PostgreSQL. A live test cross-checks our result against the SCRAM
+verifier PostgreSQL stores in `pg_authid` after running its own `pg_saslprep`.
 
 ## Query Execution
 
@@ -755,6 +764,14 @@ Checks SCRAM-SHA-256 against RFC 7677-style vectors:
 - server signature verification;
 - signature mismatch rejection;
 - nonce-prefix rejection.
+
+### `SASLprepTests`
+
+SASLprep (RFC 4013) password preparation: ASCII left unchanged, RFC 4013 mapping and NFKC
+examples, non-ASCII spaces mapped to space, "mapped to nothing" removed, compatibility
+normalization, and prohibited-output fallback to the original. A live test recomputes the
+SCRAM verifier from a non-identity password and matches it against what PostgreSQL stores
+in `pg_authid`.
 
 ### `WireTests`
 

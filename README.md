@@ -298,15 +298,18 @@ docker run -d --name pg -e POSTGRES_HOST_AUTH_METHOD=trust \
 
 ## Status & roadmap
 
-All seven milestones are complete and verified against PostgreSQL 17. The public
-surface is deliberately general: it speaks the protocol and returns rows. Query
-building, models and migrations are concerns for code built *on top* of the driver,
-not for the driver itself.
+All seven milestones are complete and verified against PostgreSQL 17, including full
+SASLprep (RFC 4013) password preparation. The public surface is deliberately general:
+it speaks the protocol and returns rows. Query building, models and migrations are
+concerns for code built *on top* of the driver, not for the driver itself.
 
-Not yet implemented (each on its own merits):
+Possible extensions (the driver is complete for its scope — these are additive, not gaps):
 
-- **Full SASLprep** (RFC 4013) for non-ASCII passwords — currently the identity
-  mapping, which is correct for ASCII.
+- **Row streaming** for large results — an `AsyncSequence` of rows via portals, instead
+  of materializing the whole result set.
+- **COPY protocol** (`COPY … TO/FROM STDIN`) for bulk load and dump.
+- **More scalar types** — `interval`, `time`/`timetz`, `inet`/`cidr`, range and composite
+  types.
 
 ## License
 
