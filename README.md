@@ -206,25 +206,22 @@ docker run -d --name pg -e POSTGRES_HOST_AUTH_METHOD=trust \
   -e POSTGRES_USER=perun -e POSTGRES_DB=perun -p 5432:5432 postgres:17
 ```
 
-## Toward the ORM
+## Status & roadmap
 
-The ORM builds on these driver primitives. The next driver-side pieces that unlock it:
+All seven milestones are complete and verified against PostgreSQL 17. The public
+surface is deliberately general: it speaks the protocol and returns rows. Query
+building, models and migrations are concerns for code built *on top* of the driver,
+not for the driver itself.
 
-- **Row → model decoding** — materialize a `PostgresRow` into a Swift struct (a
-  `RowDecodable`/`Codable` bridge), so the ORM gets models, not cells.
-- **`RETURNING` and batch** ergonomics for inserts and updates.
-- **Binary parameter encoding** for the hot insert/update path.
+Not yet implemented (each on its own merits):
 
-Typed columns, prepared statements, the pool, transactions (`withTransaction`) and
-throwing by-name decoding (`row.decode("col", as:)`) are already in place to build on.
-
-## Status & limitations
-
-All seven milestones are complete and verified against PostgreSQL 17. Known
-edges left for later: full SASLprep for non-ASCII passwords (identity for ASCII),
-cancellation of tasks parked in the connection lock / pool waiters, and binary
-*parameter* encoding (parameters are currently sent as text, which is safe and
-lets the server infer types; results decode from either format).
+- **Binary parameter encoding** — parameters are currently sent as text (safe, and
+  the server infers types). Binary would trim conversions on the hot write path;
+  results already decode from either format.
+- **Full SASLprep** (RFC 4013) for non-ASCII passwords — currently the identity
+  mapping, which is correct for ASCII.
+- **Cancellation of tasks parked** in the connection lock / pool waiters.
+- **Statement pipelining** — an optional throughput win over the extended protocol.
 
 ## License
 
