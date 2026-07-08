@@ -544,11 +544,14 @@ public actor PostgresConnection {
 
     // MARK: - Request drivers and response readers
     //
-    // The `run*` drivers send a request and read its reply inline, so they run under
-    // exclusive access — the transaction and pipelined-batch paths. The `collect*` /
-    // `readPrepareResult` readers are context-neutral: they also serve as the read
-    // closures the background reader runs for the shared, pipelined `query` / `prepare` /
-    // `execute` paths, so they assume neither exclusive access nor the caller's task.
+    // The inline drivers (`runSimpleQuery`, `runParameterizedQuery`, `runPrepare`,
+    // `runExecute`, `runClosePrepared`) send a request and read its reply inline; only the
+    // transaction path uses them now, under exclusive access. The `runPipelined*` drivers
+    // instead hand their request to `runReadOp`, so batches pipeline under shared access
+    // like a plain query. The `collect*` / `readPrepareResult` readers are context-neutral:
+    // they run inline for the exclusive paths and as the background reader's read closures
+    // for the shared, pipelined ones, so they assume neither exclusive access nor the
+    // caller's task.
 
     private func runSimpleQuery(_ sql: String) async throws -> QueryResult {
         try await send(FrontendMessage.query(sql))
@@ -924,9 +927,10 @@ public actor PostgresConnection {
 
     // MARK: - Shared / exclusive wire access
     //
-    // Autocommit `query` calls take SHARED access: they pipeline through the background
-    // reader, so several can be in flight at once. Everything that reads inline —
-    // transactions, prepare, execute, pipelined batches, `waitForNotifications` — takes
+    // Single-request calls — `query`, `prepare`, `execute`, `closePrepared` and pipelined
+    // batches (a batch is one contiguous request) — take SHARED access: they pipeline
+    // through the background reader, so several can be in flight at once. The multi-request
+    // and long-lived inline readers — transactions and `waitForNotifications` — take
     // EXCLUSIVE access (`lock`), which drains the in-flight shared queries and blocks new
     // ones, so it owns the wire while the reader sits idle. A readers-writer lock with
     // writer priority; both waiter kinds are cancellation-aware.
