@@ -102,6 +102,18 @@ private func parseTextArray(_ bytes: [UInt8],
     }
 
     skipSpaces()
+    // Optional dimension decoration, emitted when a lower bound isn't 1: `[2:4]=` (or
+    // `[1:2][1:3]=` for higher dimensions). We take the shape from the braces, so skip
+    // past the bounds to the `=`.
+    if index < bytes.count, bytes[index] == 0x5b {                  // '['
+        while index < bytes.count, bytes[index] == 0x5b {           // one [lower:upper] per dimension
+            while index < bytes.count, bytes[index] != 0x5d { index += 1 }
+            guard index < bytes.count else { throw fail() }
+            index += 1                                              // ']'
+        }
+        guard index < bytes.count, bytes[index] == 0x3d else { throw fail() }   // '='
+        index += 1
+    }
     let root = try parseLevel()
 
     func dimensions(_ nodes: [Node]) -> [Int] {

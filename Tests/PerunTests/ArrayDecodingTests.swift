@@ -28,6 +28,14 @@ final class ArrayDecodingTests: XCTestCase {
         XCTAssertEqual(matrix, [[1, 2, 3], [4, 5, 6]])
     }
 
+    func testTextArrayWithNonDefaultLowerBounds() throws {
+        // PostgreSQL prints an explicit `[lower:upper]=` decoration when a lower bound isn't 1.
+        let ones: [Int] = try textCell("[2:4]={7,7,7}", oid: 1007).decodeArray(of: Int.self)
+        XCTAssertEqual(ones, [7, 7, 7])
+        let matrix: [[Int]] = try textCell("[1:2][1:3]={{1,2,3},{4,5,6}}", oid: 1007).decodeArray(of: Int.self)
+        XCTAssertEqual(matrix, [[1, 2, 3], [4, 5, 6]])
+    }
+
     func testDimensionalityMismatchThrows() throws {
         XCTAssertThrowsError(try textCell("{{1,2},{3,4}}", oid: 1007).decodeArray(of: Int.self) as [Int])     // 2-D as 1-D
         XCTAssertThrowsError(try textCell("{{{1}}}", oid: 1007).decodeArray(of: Int.self) as [[Int]])         // 3-D as 2-D
@@ -64,6 +72,11 @@ final class ArrayDecodingTests: XCTestCase {
 
         let matrix: [[Int]] = try await connection.query("SELECT ARRAY[[1,2],[3,4]] AS a").rows[0].decodeArray("a", of: Int.self)
         XCTAssertEqual(matrix, [[1, 2], [3, 4]])
+
+        // A non-1 lower bound: array_fill prints `[2:4]={7,7,7}`.
+        let filled: [Int] = try await connection.query("SELECT array_fill(7, ARRAY[3], ARRAY[2]) AS a")
+            .rows[0].decodeArray("a", of: Int.self)
+        XCTAssertEqual(filled, [7, 7, 7])
 
         // Binary result columns decode the same.
         let binaryInts: [Int] = try await connection.query("SELECT ARRAY[5,6,7]::int8[] AS a", [], resultFormat: .binary)

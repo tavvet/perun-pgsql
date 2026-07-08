@@ -453,11 +453,12 @@ Parameters are sent through `PostgresEncodable`.
   has a binary form.
 - Array *columns* decode through `decodeArray` on cells and rows (arrays can't use the
   `PostgresDecodable` protocol without clashing with the `[UInt8]` bytea decoder). A
-  parser handles both wire formats — recursive descent for the `{…}` text form, header +
-  row-major elements for binary — producing flat elements plus a dimension list, which the
-  typed overloads reshape into `[T]` / `[T?]` (1-D) or `[[T]]` / `[[T?]]` (2-D). Higher
-  dimensions throw. Text elements get their type OID from the array-OID reverse map;
-  binary carries it in the header.
+  parser handles both wire formats — recursive descent for the `{…}` text form (including
+  the `[lower:upper]=` dimension decoration PostgreSQL prints when a lower bound isn't 1),
+  header + row-major elements for binary — producing flat elements plus a dimension list,
+  which the typed overloads reshape into `[T]` / `[T?]` (1-D) or `[[T]]` / `[[T?]]` (2-D).
+  Higher dimensions throw. Text elements get their type OID from the array-OID reverse map;
+  binary carries it in the header. (Swift arrays are 0-based, so the lower bound is dropped.)
 
 Implementation notes:
 
