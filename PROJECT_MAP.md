@@ -363,7 +363,8 @@ Parameters are sent through `PostgresEncodable`.
 - With `parameterFormat: .binary`, each value that implements `postgresBinary()`
   is sent in binary and `Parse` declares its `postgresTypeOID`; values without a
   binary form fall back to text (per-parameter format codes). Binary encoders are
-  provided for the integer, floating-point, `Bool` and `String` types.
+  provided for the integer, floating-point, `Bool`, `String`, `UUID` and `Date`
+  (timestamptz) types.
 
 Implementation notes:
 
@@ -675,6 +676,19 @@ Checks typed decoding:
 Checks `PerunError.mayHaveDesynchronizedWire`: wire-desync errors flag the pooled
 connection for discard, local/server errors keep it. Covers every `PerunError` case.
 
+### `EncodingTests`
+
+Binary parameter encoding: byte-exact wire form for each encodable type, plus the
+`Bind` message layout when binary parameters are requested.
+
+### `ConfigurationTests`
+
+`ConnectionConfiguration` defaults (verify-full TLS, bounded notification buffer, …).
+
+### `ResultTests`
+
+`PostgresRow` access: by-name lookup, throwing `cell`/`decode`, `columnNotFound`.
+
 ### Integration tests (live server)
 
 Skipped unless `PERUN_PGSQL_INTEGRATION=1`; they require a live PostgreSQL and `PG*`
@@ -685,6 +699,8 @@ environment variables.
 - `TransactionIntegrationTests`: commit/rollback; the pool discards open-transaction
   connections; shutdown does not leak a concurrently released connection; a healthy
   connection is reused after a local (non-wire) error.
+- `BinaryParameterIntegrationTests`: round-trip of binary parameters (integers, floats,
+  bool, text, UUID, timestamptz), NULL parameters and binary results.
 
 ## Local Verification
 

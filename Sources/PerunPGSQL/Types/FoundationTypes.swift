@@ -1,9 +1,9 @@
 import Foundation
 
-// Decoders for common Foundation value types. This is the only part of the
-// driver that leans on Foundation; the wire / crypto / socket core stays free of
-// it. These are the natural Swift representations for uuid, bytea, the temporal
-// types and numeric.
+// Codecs for common Foundation value types: decoders for all of them, plus
+// parameter encoders for UUID and Date. This is the only part of the driver that
+// leans on Foundation; the wire / crypto / socket core stays free of it. These are
+// the natural Swift representations for uuid, bytea, the temporal types and numeric.
 
 extension Data: PostgresDecodable {
     public static func decode(_ bytes: [UInt8], oid: Int32, format: PostgresFormat) throws -> Data {

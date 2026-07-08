@@ -110,7 +110,8 @@ let maybe: String? = try row.decodeIfPresent("optional")   // nil on SQL NULL
 ```
 
 Parameters can likewise be sent in binary with `parameterFormat: .binary` (integer,
-floating-point, bool and string values; any other type falls back to text).
+floating-point, bool, string, `UUID` and `Date`/timestamptz values; any other type
+falls back to text).
 
 ### Connection pool
 
