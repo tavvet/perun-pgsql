@@ -560,7 +560,7 @@ public actor PostgresConnection {
     /// Shared by the simple and extended query paths.
     private func collectResults(initialColumns: [ColumnMetadata] = []) async throws -> QueryResult {
         var columns = initialColumns
-        var rows: [PostgresRow] = []
+        var rowValues: [[[UInt8]?]] = []
         var commandTag = ""
         var pendingError: PostgresServerError?
 
@@ -569,10 +569,10 @@ public actor PostgresConnection {
             switch message {
             case let .rowDescription(fields):
                 columns = fields.map(ColumnMetadata.init)
-                rows.removeAll(keepingCapacity: true)
+                rowValues.removeAll(keepingCapacity: true)
 
             case let .dataRow(values):
-                rows.append(PostgresRow(values: values, columns: columns))
+                rowValues.append(values)
 
             case let .commandComplete(tag):
                 commandTag = tag
@@ -611,7 +611,7 @@ public actor PostgresConnection {
         if let pendingError {
             throw PerunError.server(pendingError)
         }
-        return QueryResult(columns: columns, rows: rows, commandTag: commandTag)
+        return QueryResult(columns: columns, values: rowValues, commandTag: commandTag)
     }
 
     /// Close the connection and release its socket. Also interrupts any in-flight

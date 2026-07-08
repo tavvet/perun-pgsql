@@ -54,6 +54,19 @@ public struct PostgresRow: Sendable {
     /// Raw column values in column order; `nil` = SQL NULL.
     public let values: [[UInt8]?]
     public let columns: [ColumnMetadata]
+    private let columnIndexByName: [String: Int]
+
+    init(values: [[UInt8]?], columns: [ColumnMetadata]) {
+        self.init(values: values,
+                  columns: columns,
+                  columnIndexByName: Self.makeColumnIndexByName(columns))
+    }
+
+    init(values: [[UInt8]?], columns: [ColumnMetadata], columnIndexByName: [String: Int]) {
+        self.values = values
+        self.columns = columns
+        self.columnIndexByName = columnIndexByName
+    }
 
     /// Access a cell by column index.
     public subscript(index: Int) -> PostgresCell {
@@ -62,7 +75,7 @@ public struct PostgresRow: Sendable {
 
     /// Access a cell by column name (first match). Returns nil if no such column.
     public subscript(name: String) -> PostgresCell? {
-        guard let index = columns.firstIndex(where: { $0.name == name }) else {
+        guard let index = columnIndexByName[name] else {
             return nil
         }
         return self[index]
@@ -88,6 +101,15 @@ public struct PostgresRow: Sendable {
                                                       as type: T.Type = T.self) throws -> T? {
         try cell(name).decodeIfPresent(type)
     }
+
+    static func makeColumnIndexByName(_ columns: [ColumnMetadata]) -> [String: Int] {
+        var indexByName: [String: Int] = [:]
+        indexByName.reserveCapacity(columns.count)
+        for (index, column) in columns.enumerated() where indexByName[column.name] == nil {
+            indexByName[column.name] = index
+        }
+        return indexByName
+    }
 }
 
 /// The outcome of running one SQL statement.
@@ -96,6 +118,21 @@ public struct QueryResult: Sendable {
     public let rows: [PostgresRow]
     /// The `CommandComplete` tag, e.g. `"SELECT 3"`, `"INSERT 0 1"`, `"UPDATE 2"`.
     public let commandTag: String
+
+    init(columns: [ColumnMetadata], values: [[[UInt8]?]], commandTag: String) {
+        let columnIndexByName = PostgresRow.makeColumnIndexByName(columns)
+        self.init(columns: columns,
+                  rows: values.map {
+                      PostgresRow(values: $0, columns: columns, columnIndexByName: columnIndexByName)
+                  },
+                  commandTag: commandTag)
+    }
+
+    init(columns: [ColumnMetadata], rows: [PostgresRow], commandTag: String) {
+        self.columns = columns
+        self.rows = rows
+        self.commandTag = commandTag
+    }
 
     public var rowCount: Int { rows.count }
 }

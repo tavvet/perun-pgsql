@@ -26,6 +26,16 @@ final class ResultTests: XCTestCase {
         XCTAssertEqual(try row.decode("answer", as: Int.self), 42)
     }
 
+    func testRowCellByNameUsesFirstDuplicateColumn() throws {
+        let row = makeRow(values: [Array("1".utf8), Array("2".utf8)],
+                          columns: [
+                              ColumnMetadata(name: "id", dataTypeOID: PostgresOID.int4, formatCode: 0),
+                              ColumnMetadata(name: "id", dataTypeOID: PostgresOID.int4, formatCode: 0),
+                          ])
+
+        XCTAssertEqual(try row.decode("id", as: Int.self), 1)
+    }
+
     func testRowDecodeIfPresentByNameKeepsMissingAndNullDistinct() throws {
         let row = makeRow(values: [nil],
                           columns: [ColumnMetadata(name: "maybe",

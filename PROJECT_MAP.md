@@ -333,7 +333,8 @@ Main types:
 - nullable by-name decoding: `try row.decodeIfPresent("nickname", as: String.self)`
 
 Missing columns throw `PerunError.columnNotFound`; SQL NULL remains distinct and
-is handled by `decodeIfPresent`.
+is handled by `decodeIfPresent`. Name lookup uses a column-name index shared by
+all rows in a `QueryResult`; duplicate column names keep first-match behavior.
 
 ## Type System
 
