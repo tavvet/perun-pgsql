@@ -691,18 +691,6 @@ The demo reads:
 - `PGPASSWORD`
 - `PGSSLMODE`
 
-## Review/Triage Pointers
-
-`REVIEW.md` is a temporary working document from an adversarial review. It is
-useful as a triage queue, but this project map should remain a stable technical
-navigation document.
-
-Already reflected in current code:
-
-- HIGH findings from `REVIEW.md` have been addressed.
-- MEDIUM findings from `REVIEW.md` have been addressed.
-- LOW findings from `REVIEW.md` have been addressed.
-
 ## Where To Start When Changing Things
 
 For protocol changes:
