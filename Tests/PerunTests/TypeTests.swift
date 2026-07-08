@@ -19,6 +19,17 @@ final class TypeTests: XCTestCase {
         XCTAssertEqual(try Int16.decode([0x01, 0x02], oid: PostgresOID.int2, format: .binary), 258)
     }
 
+    func testDecodeErrorDoesNotExposeRawBytesByDefault() {
+        XCTAssertThrowsError(try Int.decode(Array("secret-token".utf8),
+                                            oid: PostgresOID.int4,
+                                            format: .text)) { error in
+            let description = String(describing: error)
+            XCTAssertTrue(description.contains("12 bytes"))
+            XCTAssertFalse(description.contains("secret-token"))
+            XCTAssertFalse(description.contains("7365637265742d746f6b656e"))
+        }
+    }
+
     // MARK: Floating point
 
     func testDoubleBinaryRoundTrip() throws {

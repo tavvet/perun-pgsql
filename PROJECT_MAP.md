@@ -368,7 +368,9 @@ Important review notes:
   counts and out-of-range values.
 - Text timestamp parsing is intentionally small and does not fully cover all
   PostgreSQL date/time forms.
-- Decode errors currently include a hex preview of raw bytes.
+- Decode errors report byte length but do not include raw byte previews by
+  default. A compile-time `PERUN_ENABLE_DECODE_ERROR_BYTE_PREVIEW` flag can
+  enable the preview while debugging.
 
 ## Wire Layer
 

@@ -73,13 +73,21 @@ enum WireBinary {
 }
 
 func postgresDecodeError(_ type: String, oid: Int32, format: PostgresFormat, _ bytes: [UInt8]) -> PerunError {
-    let preview = bytes.count <= 16
-        ? hexEncode(bytes)
-        : hexEncode(Array(bytes.prefix(16))) + "…"
     return .decodingFailed(type: type,
                            oid: oid,
                            format: format == .binary ? "binary" : "text",
-                           reason: "\(bytes.count) bytes [\(preview)]")
+                           reason: postgresDecodeErrorReason(bytes))
+}
+
+private func postgresDecodeErrorReason(_ bytes: [UInt8]) -> String {
+#if PERUN_ENABLE_DECODE_ERROR_BYTE_PREVIEW
+    let preview = bytes.count <= 16
+        ? hexEncode(bytes)
+        : hexEncode(Array(bytes.prefix(16))) + "…"
+    return "\(bytes.count) bytes [\(preview)]"
+#else
+    return "\(bytes.count) bytes"
+#endif
 }
 
 func utf8String(_ bytes: [UInt8]) -> String {
