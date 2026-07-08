@@ -115,12 +115,13 @@ enum FrontendMessage {
 
     /// `Bind`: bind parameter values to a statement, creating a portal.
     ///
-    /// Parameters are always sent in **text** format (the parameter format-code
-    /// count is zero). Result columns are requested in `resultFormat` — text
-    /// (default) or binary. Binary parameter encoding is not implemented yet.
+    /// Parameters are sent in **text** by default, or in **binary** when
+    /// `parameterFormat` is `.binary` (per-parameter — a value with no binary form
+    /// falls back to text). Result columns are requested in `resultFormat`.
     static func bind(portal: String,
                      statement: String,
                      parameters: [(any PostgresEncodable)?],
+                     parameterFormat: PostgresFormat = .text,
                      resultFormat: PostgresFormat = .text) throws -> [UInt8] {
         // The parameter-count field is an unsigned 16-bit integer; PostgreSQL
         // allows up to 65535 bind parameters. Encoding a larger count with the
@@ -133,6 +134,7 @@ enum FrontendMessage {
                        portal: portal,
                        statement: statement,
                        parameters: parameters,
+                       parameterFormat: parameterFormat,
                        resultFormat: resultFormat)
         return frame(tag: "B", body: body.bytes)
     }
@@ -168,12 +170,17 @@ enum FrontendMessage {
 
     static func parameterizedQuery(query: String,
                                    parameters: [(any PostgresEncodable)?],
+                                   parameterFormat: PostgresFormat = .text,
                                    resultFormat: PostgresFormat) throws -> [UInt8] {
         var request = ByteWriter(reservingCapacity: estimatedExtendedQueryCapacity(query: query,
                                                                                   statement: "",
                                                                                   parameters: parameters))
-        try appendParse(to: &request, statement: "", query: query)
-        try appendBind(to: &request, portal: "", statement: "", parameters: parameters, resultFormat: resultFormat)
+        // Binary parameters need declared type OIDs so the server reads the bytes
+        // in the right layout; text lets the server infer.
+        let typeOIDs: [Int32] = parameterFormat == .binary ? parameters.map { $0?.postgresTypeOID ?? 0 } : []
+        try appendParse(to: &request, statement: "", query: query, parameterTypeOIDs: typeOIDs)
+        try appendBind(to: &request, portal: "", statement: "", parameters: parameters,
+                       parameterFormat: parameterFormat, resultFormat: resultFormat)
         appendDescribe(to: &request, .portal, name: "")
         appendExecute(to: &request, portal: "")
         appendSync(to: &request)
@@ -192,11 +199,13 @@ enum FrontendMessage {
 
     static func execute(statement: String,
                         parameters: [(any PostgresEncodable)?],
+                        parameterFormat: PostgresFormat = .text,
                         resultFormat: PostgresFormat) throws -> [UInt8] {
         var request = ByteWriter(reservingCapacity: estimatedExtendedQueryCapacity(query: "",
                                                                                   statement: statement,
                                                                                   parameters: parameters))
-        try appendBind(to: &request, portal: "", statement: statement, parameters: parameters, resultFormat: resultFormat)
+        try appendBind(to: &request, portal: "", statement: statement, parameters: parameters,
+                       parameterFormat: parameterFormat, resultFormat: resultFormat)
         appendExecute(to: &request, portal: "")
         appendSync(to: &request)
         return request.bytes
@@ -249,6 +258,7 @@ enum FrontendMessage {
                                    portal: String,
                                    statement: String,
                                    parameters: [(any PostgresEncodable)?],
+                                   parameterFormat: PostgresFormat,
                                    resultFormat: PostgresFormat) throws {
         guard parameters.count <= 65535 else {
             throw PerunError.tooManyParameters(count: parameters.count)
@@ -258,6 +268,7 @@ enum FrontendMessage {
                            portal: portal,
                            statement: statement,
                            parameters: parameters,
+                           parameterFormat: parameterFormat,
                            resultFormat: resultFormat)
         }
     }
@@ -266,27 +277,58 @@ enum FrontendMessage {
                                        portal: String,
                                        statement: String,
                                        parameters: [(any PostgresEncodable)?],
+                                       parameterFormat: PostgresFormat,
                                        resultFormat: PostgresFormat) {
         writer.writeCString(portal)
         writer.writeCString(statement)
-        writer.writeInt16(0)                                             // parameter format codes: all text
-        writer.writeInt16(Int16(bitPattern: UInt16(parameters.count)))   // parameter values
-        for parameter in parameters {
-            if let text = parameter?.postgresText {
-                writer.writeInt32(Int32(text.utf8.count))
-                writer.writeString(text)
-            } else {
-                writer.writeInt32(-1)                 // SQL NULL
+
+        if parameterFormat == .text {
+            // Fast path: all parameters text; no per-parameter encoding array.
+            writer.writeInt16(0)                                             // parameter format codes: all text
+            writer.writeInt16(Int16(bitPattern: UInt16(parameters.count)))   // parameter values
+            for parameter in parameters {
+                if let text = parameter?.postgresText {
+                    writer.writeInt32(Int32(text.utf8.count))
+                    writer.writeString(text)
+                } else {
+                    writer.writeInt32(-1)                 // SQL NULL
+                }
+            }
+        } else {
+            // Binary: the per-parameter format codes precede the values, so resolve
+            // each parameter's wire form once up front.
+            let resolved = parameters.map(resolveBinaryParameter)
+            writer.writeInt16(Int16(bitPattern: UInt16(resolved.count)))      // one format code per parameter
+            for parameter in resolved { writer.writeInt16(parameter.format) }
+            writer.writeInt16(Int16(bitPattern: UInt16(resolved.count)))      // parameter values
+            for parameter in resolved {
+                if let bytes = parameter.bytes {
+                    writer.writeInt32(Int32(bytes.count))
+                    writer.writeBytes(bytes)
+                } else {
+                    writer.writeInt32(-1)                 // SQL NULL
+                }
             }
         }
-        // Result format codes: one code applied to all columns. Zero codes would
-        // also mean "all text"; we send an explicit single code either way.
+
+        // Result format codes: one code applied to all columns.
         if resultFormat == .binary {
             writer.writeInt16(1)
             writer.writeInt16(1)                      // 1 = binary, for every column
         } else {
             writer.writeInt16(0)                      // all text
         }
+    }
+
+    /// Resolve one parameter's binary-mode wire form: binary when the value
+    /// provides it, text otherwise, `nil` bytes for SQL NULL.
+    private static func resolveBinaryParameter(
+        _ parameter: (any PostgresEncodable)?
+    ) -> (format: Int16, bytes: [UInt8]?) {
+        guard let parameter else { return (0, nil) }                 // SQL NULL
+        if let binary = parameter.postgresBinary() { return (1, binary) }
+        if let text = parameter.postgresText { return (0, Array(text.utf8)) }
+        return (0, nil)                                              // NULL (no encoding)
     }
 
     private static func appendDescribe(to writer: inout ByteWriter, _ target: StatementOrPortal, name: String) {

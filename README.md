@@ -64,7 +64,7 @@ lines the ORM can rely on and reshape, not an opaque dependency.
 | **Sockets** | Raw POSIX (`Darwin`/`Glibc`), blocking calls bridged to async/await off the cooperative pool |
 | **Wire protocol** | v3 framing, all frontend/backend messages, simple + extended query |
 | **Authentication** | `trust`, cleartext, **MD5**, **SCRAM-SHA-256** — with SHA-256/HMAC/PBKDF2/MD5/Base64 written from scratch |
-| **Queries** | Simple Query, and the extended protocol: `Parse`/`Bind`/`Describe`/`Execute`/`Sync`, prepared statements, `$1` parameters |
+| **Queries** | Simple Query, and the extended protocol: `Parse`/`Bind`/`Describe`/`Execute`/`Sync`, prepared statements, `$1` parameters (text or binary) |
 | **Types** | `Int*`, `Float`/`Double`, `Bool`, `String`, `Data`/`[UInt8]` (bytea), `UUID`, `Date` (timestamp/timestamptz/date), `Decimal` (numeric), JSON — in **both text and binary** formats |
 | **TLS** | `SSLRequest` negotiation + OpenSSL channel; modes = disable / allow plaintext fallback / encrypt without verification / verify full |
 | **Pool** | `PostgresClient` — lazy, bounded, `withConnection {}`, reuse/replace, graceful shutdown |
@@ -108,6 +108,9 @@ let t: Date    = try row.decode("t")
 let n: Decimal = try row.decode("n")
 let maybe: String? = try row.decodeIfPresent("optional")   // nil on SQL NULL
 ```
+
+Parameters can likewise be sent in binary with `parameterFormat: .binary` (integer,
+floating-point, bool and string values; any other type falls back to text).
 
 ### Connection pool
 
@@ -215,9 +218,6 @@ not for the driver itself.
 
 Not yet implemented (each on its own merits):
 
-- **Binary parameter encoding** — parameters are currently sent as text (safe, and
-  the server infers types). Binary would trim conversions on the hot write path;
-  results already decode from either format.
 - **Full SASLprep** (RFC 4013) for non-ASCII passwords — currently the identity
   mapping, which is correct for ASCII.
 - **Cancellation of tasks parked** in the connection lock / pool waiters.

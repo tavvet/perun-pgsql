@@ -89,8 +89,10 @@ public actor PostgresConnection {
         @discardableResult
         public func query(_ sql: String,
                           _ parameters: [(any PostgresEncodable)?],
+                          parameterFormat: PostgresFormat = .text,
                           resultFormat: PostgresFormat = .text) async throws -> QueryResult {
             try await connection.runTransactionParameterizedQuery(sql, parameters,
+                                                                  parameterFormat: parameterFormat,
                                                                   resultFormat: resultFormat,
                                                                   contextID: contextID)
         }
@@ -102,8 +104,10 @@ public actor PostgresConnection {
         @discardableResult
         public func execute(_ statement: PreparedStatement,
                             _ parameters: [(any PostgresEncodable)?] = [],
+                            parameterFormat: PostgresFormat = .text,
                             resultFormat: PostgresFormat = .text) async throws -> QueryResult {
             try await connection.runTransactionExecute(statement, parameters,
+                                                       parameterFormat: parameterFormat,
                                                        resultFormat: resultFormat,
                                                        contextID: contextID)
         }
@@ -262,15 +266,18 @@ public actor PostgresConnection {
     /// are filled from `parameters`, safely — values are never spliced into the
     /// SQL text, so this is immune to SQL injection.
     ///
-    /// `resultFormat` selects how the server sends result columns back: `.text`
-    /// (default) or `.binary`. Decoded values (`row[...].decode(_:)`) are the
-    /// same either way.
+    /// `parameterFormat` selects how parameters are sent (`.text` default, or
+    /// `.binary`); `resultFormat` selects how result columns come back. Decoded
+    /// values (`row[...].decode(_:)`) are the same either way.
     @discardableResult
     public func query(_ sql: String,
                       _ parameters: [(any PostgresEncodable)?],
+                      parameterFormat: PostgresFormat = .text,
                       resultFormat: PostgresFormat = .text) async throws -> QueryResult {
         await lock(); defer { unlock() }
-        return try await runParameterizedQuery(sql, parameters, resultFormat: resultFormat)
+        return try await runParameterizedQuery(sql, parameters,
+                                               parameterFormat: parameterFormat,
+                                               resultFormat: resultFormat)
     }
 
     /// Parse a statement once so it can be executed repeatedly with different
@@ -284,9 +291,12 @@ public actor PostgresConnection {
     @discardableResult
     public func execute(_ statement: PreparedStatement,
                         _ parameters: [(any PostgresEncodable)?] = [],
+                        parameterFormat: PostgresFormat = .text,
                         resultFormat: PostgresFormat = .text) async throws -> QueryResult {
         await lock(); defer { unlock() }
-        return try await runExecute(statement, parameters, resultFormat: resultFormat)
+        return try await runExecute(statement, parameters,
+                                    parameterFormat: parameterFormat,
+                                    resultFormat: resultFormat)
     }
 
     /// Release a prepared statement's server-side resources.
@@ -335,10 +345,13 @@ public actor PostgresConnection {
 
     private func runTransactionParameterizedQuery(_ sql: String,
                                                   _ parameters: [(any PostgresEncodable)?],
+                                                  parameterFormat: PostgresFormat,
                                                   resultFormat: PostgresFormat,
                                                   contextID: Int) async throws -> QueryResult {
         try validateTransactionContext(contextID)
-        return try await runParameterizedQuery(sql, parameters, resultFormat: resultFormat)
+        return try await runParameterizedQuery(sql, parameters,
+                                               parameterFormat: parameterFormat,
+                                               resultFormat: resultFormat)
     }
 
     private func runTransactionPrepare(_ sql: String, contextID: Int) async throws -> PreparedStatement {
@@ -348,10 +361,13 @@ public actor PostgresConnection {
 
     private func runTransactionExecute(_ statement: PreparedStatement,
                                        _ parameters: [(any PostgresEncodable)?],
+                                       parameterFormat: PostgresFormat,
                                        resultFormat: PostgresFormat,
                                        contextID: Int) async throws -> QueryResult {
         try validateTransactionContext(contextID)
-        return try await runExecute(statement, parameters, resultFormat: resultFormat)
+        return try await runExecute(statement, parameters,
+                                    parameterFormat: parameterFormat,
+                                    resultFormat: resultFormat)
     }
 
     private func runTransactionClosePrepared(_ statement: PreparedStatement,
@@ -444,6 +460,7 @@ public actor PostgresConnection {
 
     private func runParameterizedQuery(_ sql: String,
                                        _ parameters: [(any PostgresEncodable)?],
+                                       parameterFormat: PostgresFormat,
                                        resultFormat: PostgresFormat) async throws -> QueryResult {
         // With no parameters and text results, the Simple Query protocol is
         // lighter (a single round trip). Binary still needs the extended path.
@@ -453,6 +470,7 @@ public actor PostgresConnection {
 
         try await send(try FrontendMessage.parameterizedQuery(query: sql,
                                                               parameters: parameters,
+                                                              parameterFormat: parameterFormat,
                                                               resultFormat: resultFormat))
 
         return try await collectResults()
@@ -503,10 +521,12 @@ public actor PostgresConnection {
 
     private func runExecute(_ statement: PreparedStatement,
                             _ parameters: [(any PostgresEncodable)?],
+                            parameterFormat: PostgresFormat,
                             resultFormat: PostgresFormat) async throws -> QueryResult {
         try validatePreparedStatement(statement)
         try await send(try FrontendMessage.execute(statement: statement.name,
                                                    parameters: parameters,
+                                                   parameterFormat: parameterFormat,
                                                    resultFormat: resultFormat))
 
         // Execute alone sends no RowDescription; reuse the columns from prepare.

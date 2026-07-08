@@ -60,9 +60,12 @@ public actor PostgresClient {
     @discardableResult
     public nonisolated func query(_ sql: String,
                                   _ parameters: [(any PostgresEncodable)?] = [],
+                                  parameterFormat: PostgresFormat = .text,
                                   resultFormat: PostgresFormat = .text) async throws -> QueryResult {
         try await withConnection { connection in
-            try await connection.query(sql, parameters, resultFormat: resultFormat)
+            try await connection.query(sql, parameters,
+                                       parameterFormat: parameterFormat,
+                                       resultFormat: resultFormat)
         }
     }
 

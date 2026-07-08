@@ -356,13 +356,14 @@ Supported built-in type families:
 - date/timestamp/timestamptz as `Date`;
 - numeric as `Decimal`.
 
-Text parameters are sent through `PostgresEncodable`.
+Parameters are sent through `PostgresEncodable`.
 
-Current parameter encoding:
-
-- parameters are sent in text format;
-- `postgresTypeOID` exists as a hint surface, but unnamed parse currently lets
-  PostgreSQL infer types by default.
+- By default they are sent in **text** format; unnamed `Parse` lets PostgreSQL
+  infer the types.
+- With `parameterFormat: .binary`, each value that implements `postgresBinary()`
+  is sent in binary and `Parse` declares its `postgresTypeOID`; values without a
+  binary form fall back to text (per-parameter format codes). Binary encoders are
+  provided for the integer, floating-point, `Bool` and `String` types.
 
 Implementation notes:
 
