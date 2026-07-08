@@ -542,6 +542,8 @@ Error behavior:
 - Server (SQL) errors, decode/local errors and errors from the caller's closure
   leave the wire synchronized, so the connection is reused (release() still
   discards it if it came back inside a transaction).
+- The split is `PerunError.mayHaveDesynchronizedWire`, an exhaustive switch over
+  every error case (so a new case forces a decision).
 
 Transaction hygiene:
 
@@ -666,6 +668,11 @@ Checks typed decoding:
 - timestamps/dates;
 - numeric;
 - jsonb binary header.
+
+### `ErrorClassificationTests`
+
+Checks `PerunError.mayHaveDesynchronizedWire`: wire-desync errors flag the pooled
+connection for discard, local/server errors keep it. Covers every `PerunError` case.
 
 ### Integration tests (live server)
 

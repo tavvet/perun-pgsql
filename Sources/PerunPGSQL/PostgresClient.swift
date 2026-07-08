@@ -189,18 +189,3 @@ public actor PostgresClient {
         }
     }
 }
-
-private extension PerunError {
-    /// Whether this error may have left the connection's wire out of sync, so a
-    /// pooled connection that hit it must be discarded rather than reused.
-    var mayHaveDesynchronizedWire: Bool {
-        switch self {
-        case .connectionClosed, .protocolViolation, .tlsHandshakeFailed, .tlsIO,
-             .tlsNotAvailable, .authenticationFailed, .unsupportedAuthentication:
-            return true
-        case .server, .unexpectedNull, .columnNotFound, .decodingFailed, .tooManyParameters,
-             .clientShutdown, .preparedStatementConnectionMismatch:
-            return false
-        }
-    }
-}
