@@ -65,7 +65,7 @@ lines the ORM can rely on and reshape, not an opaque dependency.
 | **Wire protocol** | v3 framing, all frontend/backend messages, simple + extended query |
 | **Authentication** | `trust`, cleartext, **MD5**, **SCRAM-SHA-256** — with SHA-256/HMAC/PBKDF2/MD5/Base64 written from scratch |
 | **Queries** | Simple Query, and the extended protocol: `Parse`/`Bind`/`Describe`/`Execute`/`Sync`, prepared statements, `$1` parameters (text or binary) |
-| **Types** | `Int*`, `Float`/`Double`, `Bool`, `String`, `Data`/`[UInt8]` (bytea), `UUID`, `Date` (timestamp/timestamptz/date), `Decimal` (numeric), JSON — in **both text and binary** formats |
+| **Types** | `Int*`, `Float`/`Double`, `Bool`, `String`, `Data`/`[UInt8]` (bytea), `UUID`, `Date` (timestamp/timestamptz/date), `Decimal` (numeric), `PostgresJSON` (json/jsonb) — in **both text and binary** formats |
 | **TLS** | `SSLRequest` negotiation + OpenSSL channel; modes = disable / allow plaintext fallback / encrypt without verification / verify full |
 | **Pool** | `PostgresClient` — lazy, bounded, `withConnection {}`, reuse/replace, graceful shutdown |
 | **Concurrency** | Per-connection FIFO async lock so overlapping queries can't interleave on the wire |
@@ -110,8 +110,9 @@ let maybe: String? = try row.decodeIfPresent("optional")   // nil on SQL NULL
 ```
 
 Parameters can likewise be sent in binary with `parameterFormat: .binary` (integer,
-floating-point, bool, string, `UUID`, `Date`/timestamptz, `Data`/`[UInt8]` (bytea)
-and `Decimal`/numeric values; any other type falls back to text).
+floating-point, bool, string, `UUID`, `Date`/timestamptz, `Data`/`[UInt8]` (bytea),
+`Decimal`/numeric and `PostgresJSON` (json/jsonb) values; any other type falls back
+to text).
 
 ### Connection pool
 

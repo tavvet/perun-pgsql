@@ -352,7 +352,8 @@ Supported built-in type families:
 - booleans;
 - signed integers;
 - floats/doubles;
-- strings/text/json/jsonb;
+- strings/text;
+- json/jsonb as `String` or `PostgresJSON`;
 - bytea as `[UInt8]` and `Data`;
 - UUID;
 - date/timestamp/timestamptz as `Date`;
@@ -366,7 +367,8 @@ Parameters are sent through `PostgresEncodable`.
   is sent in binary and `Parse` declares its `postgresTypeOID`; values without a
   binary form fall back to text (per-parameter format codes). Binary encoders are
   provided for the integer, floating-point, `Bool`, `String`, `UUID`, `Date`
-  (timestamptz), `Data`/`[UInt8]` (bytea) and `Decimal` (numeric) types.
+  (timestamptz), `Data`/`[UInt8]` (bytea), `Decimal` (numeric) and `PostgresJSON`
+  (json/jsonb) types.
 
 Implementation notes:
 
@@ -702,7 +704,8 @@ environment variables.
   connections; shutdown does not leak a concurrently released connection; a healthy
   connection is reused after a local (non-wire) error.
 - `BinaryParameterIntegrationTests`: round-trip of binary parameters (integers, floats,
-  bool, text, UUID, timestamptz), NULL parameters and binary results.
+  bool, text, UUID, timestamptz, bytea, numeric, json/jsonb), NULL parameters and
+  binary results.
 
 ## Local Verification
 

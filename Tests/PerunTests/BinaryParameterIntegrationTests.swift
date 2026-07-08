@@ -85,6 +85,27 @@ final class BinaryParameterIntegrationTests: XCTestCase {
         await pool.shutdown()
     }
 
+    func testJSONParametersRoundTrip() async throws {
+        let configuration = try integrationConfiguration()
+        let pool = PostgresClient(configuration: configuration, maxConnections: 1)
+
+        let payload = #"{"name": "Perun", "tags": [1, 2, 3], "nested": {"ok": true}}"#
+
+        for format in [PostgresFormat.text, .binary] {
+            let row = try await pool.query(
+                "SELECT $1::json AS j, ($2::jsonb = $3::jsonb) AS jb_eq",
+                [PostgresJSON(payload, jsonb: false), PostgresJSON(payload), payload],
+                parameterFormat: format).rows[0]
+
+            // `json` is stored verbatim, so its text survives the round trip exactly.
+            XCTAssertEqual(try row.decode("j", as: PostgresJSON.self).text, payload, "json via \(format)")
+            // `jsonb` normalizes, so compare it server-side against the same document sent as text.
+            XCTAssertTrue(try row.decode("jb_eq", as: Bool.self), "jsonb via \(format)")
+        }
+
+        await pool.shutdown()
+    }
+
     private func integrationConfiguration() throws -> ConnectionConfiguration {
         let environment = ProcessInfo.processInfo.environment
         guard environment["PERUN_PGSQL_INTEGRATION"] == "1" else {

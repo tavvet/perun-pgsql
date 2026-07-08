@@ -114,6 +114,27 @@ final class EncodingTests: XCTestCase {
         XCTAssertEqual(bytes.postgresTypeOID, 17)
     }
 
+    func testJSONEncoding() throws {
+        let doc = #"{"a":1,"b":[true,null]}"#
+
+        let jsonb = PostgresJSON(doc)                                    // jsonb by default
+        XCTAssertEqual(jsonb.postgresTypeOID, 3802)
+        XCTAssertEqual(jsonb.postgresText, doc)
+        XCTAssertEqual(jsonb.postgresBinary(), [1] + Array(doc.utf8))    // version header + text
+
+        let json = PostgresJSON(doc, jsonb: false)                       // plain json
+        XCTAssertEqual(json.postgresTypeOID, 114)
+        XCTAssertEqual(json.postgresBinary(), Array(doc.utf8))           // no header
+
+        // Round-trips through the decoder for every OID / format combination.
+        XCTAssertEqual(try PostgresJSON.decode(jsonb.postgresBinary()!, oid: PostgresOID.jsonb, format: .binary), jsonb)
+        XCTAssertEqual(try PostgresJSON.decode(Array(doc.utf8), oid: PostgresOID.jsonb, format: .text), jsonb)
+        XCTAssertEqual(try PostgresJSON.decode(Array(doc.utf8), oid: PostgresOID.json, format: .text), json)
+
+        // A jsonb binary value without the version header is rejected.
+        XCTAssertThrowsError(try PostgresJSON.decode(Array(doc.utf8), oid: PostgresOID.jsonb, format: .binary))
+    }
+
     func testDecimalBinaryEncoding() throws {
         XCTAssertEqual(Decimal(string: "0.5")!.postgresBinary(),
                        [0x00, 0x01,     // 1 base-10000 group
