@@ -115,17 +115,19 @@ enum SystemSocket {
     /// Read up to `maxLength` bytes. Returns an empty array on a clean EOF
     /// (peer closed the connection).
     static func receive(fd: Int32, maxLength: Int) throws -> [UInt8] {
-        var buffer = [UInt8](repeating: 0, count: maxLength)
-        let received: Int = buffer.withUnsafeMutableBytes { raw in
-            while true {
-                let n = recv(fd, raw.baseAddress, maxLength, 0)
-                if n < 0 && errno == EINTR { continue }
-                return n
-            }
+        var received = 0
+        let buffer = [UInt8](unsafeUninitializedCapacity: maxLength) { raw, initializedCount in
+            received = {
+                while true {
+                    let n = recv(fd, raw.baseAddress, maxLength, 0)
+                    if n < 0 && errno == EINTR { continue }
+                    return n
+                }
+            }()
+            initializedCount = received > 0 ? received : 0
         }
         if received < 0 { throw SocketError.receiveFailed(errno: errno) }
         if received == 0 { return [] }          // EOF
-        buffer.removeLast(maxLength - received)
         return buffer
     }
 

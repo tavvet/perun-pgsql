@@ -62,6 +62,12 @@ enum BackendMessage: Sendable {
     /// Decode one message body given its tag. `payload` excludes the tag and the
     /// 4 length bytes.
     static func decode(tag: UInt8, payload: [UInt8]) throws -> BackendMessage {
+        try decode(tag: tag, payload: payload[...])
+    }
+
+    /// Decode one message body given its tag. `payload` excludes the tag and the
+    /// 4 length bytes.
+    static func decode(tag: UInt8, payload: ArraySlice<UInt8>) throws -> BackendMessage {
         var reader = ByteReader(payload)
         switch tag {
         case UInt8(ascii: "R"):
@@ -124,7 +130,7 @@ enum BackendMessage: Sendable {
             return .notificationResponse(processID: pid, channel: channel, payload: body)
 
         default:
-            return .unknown(tag: tag, payload: payload)
+            return .unknown(tag: tag, payload: Array(payload))
         }
     }
 

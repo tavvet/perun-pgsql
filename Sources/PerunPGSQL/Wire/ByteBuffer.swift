@@ -51,15 +51,19 @@ struct ByteWriter {
 /// underflow, so a malformed/truncated server message surfaces as a clean error
 /// rather than a crash.
 struct ByteReader {
-    private let bytes: [UInt8]
+    private let bytes: ArraySlice<UInt8>
     private(set) var offset: Int
 
     init(_ bytes: [UInt8]) {
-        self.bytes = bytes
-        self.offset = 0
+        self.init(bytes[...])
     }
 
-    var remaining: Int { bytes.count - offset }
+    init(_ bytes: ArraySlice<UInt8>) {
+        self.bytes = bytes
+        self.offset = bytes.startIndex
+    }
+
+    var remaining: Int { bytes.endIndex - offset }
 
     private func requireRemaining(_ count: Int) throws {
         guard count >= 0, remaining >= count else {

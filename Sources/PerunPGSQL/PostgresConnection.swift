@@ -762,18 +762,22 @@ public actor PostgresConnection {
     /// Read one full backend message: a 1-byte tag, an Int32 length (which
     /// includes itself), then the payload.
     private func readMessage() async throws -> BackendMessage {
-        let header = try await readExactly(5)
+        let header = try await readSlice(5)
         var headerReader = ByteReader(header)
         let tag = try headerReader.readUInt8()
         let length = Int(try headerReader.readInt32())
         let payloadLength = try Self.payloadLength(forMessageLength: length, maxMessageSize: maxMessageSize)
-        let payload = payloadLength > 0 ? try await readExactly(payloadLength) : []
-        return try BackendMessage.decode(tag: tag, payload: payload)
+        let payload = payloadLength > 0 ? try await readSlice(payloadLength) : readBuffer[readOffset ..< readOffset]
+        let message = try BackendMessage.decode(tag: tag, payload: payload)
+        compactReadBufferIfNeeded()
+        return message
     }
 
-    /// Return exactly `count` bytes, reading from the socket as needed.
-    private func readExactly(_ count: Int) async throws -> [UInt8] {
+    /// Return exactly `count` bytes as a slice into `readBuffer`, reading from
+    /// the socket as needed.
+    private func readSlice(_ count: Int) async throws -> ArraySlice<UInt8> {
         while readBuffer.count - readOffset < count {
+            compactReadBufferIfNeeded()
             let needed = count - (readBuffer.count - readOffset)
             // Read ahead a little for efficiency, but never size a single recv to
             // the whole remaining message — that is the OOM guard's other half.
@@ -783,15 +787,18 @@ public actor PostgresConnection {
             }
             readBuffer.append(contentsOf: chunk)
         }
-        let result = Array(readBuffer[readOffset ..< readOffset + count])
-        readOffset += count
 
+        let result = readBuffer[readOffset ..< readOffset + count]
+        readOffset += count
+        return result
+    }
+
+    private func compactReadBufferIfNeeded() {
         // Reclaim consumed prefix once it grows large, keeping memory bounded.
         if readOffset > 65_536 {
             readBuffer.removeFirst(readOffset)
             readOffset = 0
         }
-        return result
     }
 
     // MARK: - Raw I/O (bridged off the cooperative pool)

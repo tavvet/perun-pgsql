@@ -464,11 +464,13 @@ Message length validation:
 - payload must be at most `ConnectionConfiguration.maxMessageSize`;
 - default max payload is 256 MiB.
 
-`readExactly(_:)` keeps a read-ahead buffer with an offset cursor. It requests at
-most `readChunkSize` bytes per socket/TLS receive call, currently 65,536 bytes.
+`readSlice(_:)` keeps a read-ahead buffer with an offset cursor. It requests at
+most `readChunkSize` bytes per socket/TLS receive call, currently 65,536 bytes,
+and decodes backend message payloads through `ArraySlice` views into that
+buffer.
 
-Important performance note: payload slices are copied out of `readBuffer`.
-Socket/TLS receive currently allocate zero-filled arrays before reading.
+Socket/TLS receive uses uninitialized buffers and sets the initialized count
+from the actual `recv`/`SSL_read` return value.
 
 ## Socket And Blocking I/O
 

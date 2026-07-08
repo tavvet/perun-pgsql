@@ -83,12 +83,12 @@ final class TLSConnection: @unchecked Sendable {
     }
 
     func receive(maxLength: Int) throws -> [UInt8] {
-        var buffer = [UInt8](repeating: 0, count: maxLength)
-        let read = buffer.withUnsafeMutableBytes { raw in
-            SSL_read(ssl, raw.baseAddress, Int32(maxLength))
+        var read: Int32 = 0
+        let buffer = [UInt8](unsafeUninitializedCapacity: maxLength) { raw, initializedCount in
+            read = SSL_read(ssl, raw.baseAddress, Int32(maxLength))
+            initializedCount = read > 0 ? Int(read) : 0
         }
         if read > 0 {
-            buffer.removeLast(maxLength - Int(read))
             return buffer
         }
         if read == 0 { return [] }                                  // clean EOF
