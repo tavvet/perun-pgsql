@@ -44,13 +44,27 @@ final class SASLprepTests: XCTestCase {
         XCTAssertEqual(saslPrep(withControl), withControl)
     }
 
-    // MARK: - Live: our preparation matches PostgreSQL's stored SCRAM verifier
+    // MARK: - Our preparation matches PostgreSQL's SCRAM verifier
 
+    /// A frozen SCRAM verifier captured from a live PostgreSQL 17 `CREATE ROLE … PASSWORD`
+    /// (its own `pg_saslprep` + key derivation). Recomputing it from the raw password through
+    /// our SASLprep reproduces it byte for byte, so interop is pinned on every run — not only
+    /// when a live server is available. The salt is embedded in the string, so the
+    /// recomputation is deterministic.
+    func testMatchesFrozenPostgresVerifier() {
+        let rawPassword = "P\u{2168}ssw\u{00AD}\u{00A0}\u{FF4F}rd"
+        XCTAssertEqual(saslPrep(rawPassword), "PIXssw ord")   // Ⅸ→IX, ｏ→o, soft hyphen gone, NBSP→space
+        let stored = "SCRAM-SHA-256$4096:JEKP3sFswsMo22N+27CaIw==" +
+            "$suEq1bJHFXD0yZkLj9jENaGbRRrwezvVQxboQ5Alrrw=:nV5eS5N5KQi9y5NZJtnh1eGcH5dS7ncq9E3s+WbBzpA="
+        assertOurVerifier(matches: stored, preparing: rawPassword)
+    }
+
+    /// The same check against a verifier PostgreSQL generates on the spot, which also exercises
+    /// the whole CREATE ROLE → read path and catches any PostgreSQL-version normalization drift.
     func testMatchesPostgresStoredVerifier() async throws {
         let connection = try await PostgresConnection.connect(integrationConfiguration())
 
-        // A password whose SASLprep is not the identity: Ⅸ → "IX", soft hyphen removed.
-        let rawPassword = "p\u{2168}ssw\u{00AD}rd"
+        let rawPassword = "P\u{2168}ssw\u{00AD}\u{00A0}\u{FF4F}rd"
         _ = try await connection.query("SET client_encoding = 'UTF8'")
         _ = try await connection.query("SET password_encryption = 'scram-sha-256'")
         _ = try await connection.query("DROP ROLE IF EXISTS perun_saslprep_test")
@@ -61,33 +75,33 @@ final class SASLprepTests: XCTestCase {
         _ = try await connection.query("DROP ROLE perun_saslprep_test")
         try await connection.close()
 
-        // rolpassword: SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey> (salt/keys base64).
+        assertOurVerifier(matches: stored, preparing: rawPassword)
+    }
+
+    // MARK: - Helpers
+
+    /// Parse a stored `SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>` verifier and
+    /// assert that deriving from `rawPassword` through our SASLprep + crypto reproduces its keys.
+    private func assertOurVerifier(matches stored: String, preparing rawPassword: String,
+                                   file: StaticString = #filePath, line: UInt = #line) {
         let sections = stored.split(separator: "$")
-        XCTAssertEqual(sections.count, 3, "unexpected verifier format: \(stored)")
-        let iterationsAndSalt = sections[1].split(separator: ":")
-        let keys = sections[2].split(separator: ":")
-        guard sections[0] == "SCRAM-SHA-256",
+        let iterationsAndSalt = sections.count == 3 ? sections[1].split(separator: ":") : []
+        let keys = sections.count == 3 ? sections[2].split(separator: ":") : []
+        guard sections.count == 3, sections[0] == "SCRAM-SHA-256",
               iterationsAndSalt.count == 2, keys.count == 2,
               let iterations = Int(iterationsAndSalt[0]),
               let salt = Base64.decode(String(iterationsAndSalt[1])) else {
-            return XCTFail("could not parse stored verifier: \(stored)")
+            return XCTFail("could not parse stored verifier: \(stored)", file: file, line: line)
         }
-        let pgStoredKey = String(keys[0])
-        let pgServerKey = String(keys[1])
-
-        // Recompute the verifier from the raw password through our SASLprep + crypto. If our
-        // preparation matches PostgreSQL's pg_saslprep, both keys match byte for byte.
+        // Recompute: if our SASLprep matches PostgreSQL's pg_saslprep, both keys match byte for byte.
         let prepared = Array(saslPrep(rawPassword).utf8)
         let salted = PBKDF2.deriveKey(password: prepared, salt: salt, iterations: iterations, keyLength: 32)
         let clientKey = HMACSHA256.authenticate(key: salted, message: Array("Client Key".utf8))
         let ourStoredKey = Base64.encode(SHA256.hash(clientKey))
         let ourServerKey = Base64.encode(HMACSHA256.authenticate(key: salted, message: Array("Server Key".utf8)))
-
-        XCTAssertEqual(ourStoredKey, pgStoredKey)
-        XCTAssertEqual(ourServerKey, pgServerKey)
+        XCTAssertEqual(ourStoredKey, String(keys[0]), "StoredKey mismatch", file: file, line: line)
+        XCTAssertEqual(ourServerKey, String(keys[1]), "ServerKey mismatch", file: file, line: line)
     }
-
-    // MARK: - Helpers
 
     private func integrationConfiguration() throws -> ConnectionConfiguration {
         let environment = ProcessInfo.processInfo.environment

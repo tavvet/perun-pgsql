@@ -227,8 +227,9 @@ key derivation: map the RFC 3454 B.1/C.1.2 code points, apply Unicode NFKC (via
 Foundation), and reject prohibited output — falling back to the original string on any
 failure, exactly as PostgreSQL's `pg_saslprep` does so both sides derive the same key
 (pure ASCII is unchanged). The bidirectional and unassigned-code-point checks are
-skipped to match PostgreSQL. A live test cross-checks our result against the SCRAM
-verifier PostgreSQL stores in `pg_authid` after running its own `pg_saslprep`.
+skipped to match PostgreSQL. Tests cross-check our result against a real PostgreSQL SCRAM
+verifier both ways: offline against a frozen vector (pinned every run) and live against a
+fresh `pg_authid` row.
 
 ## Query Execution
 
@@ -769,9 +770,11 @@ Checks SCRAM-SHA-256 against RFC 7677-style vectors:
 
 SASLprep (RFC 4013) password preparation: ASCII left unchanged, RFC 4013 mapping and NFKC
 examples, non-ASCII spaces mapped to space, "mapped to nothing" removed, compatibility
-normalization, and prohibited-output fallback to the original. A live test recomputes the
-SCRAM verifier from a non-identity password and matches it against what PostgreSQL stores
-in `pg_authid`.
+normalization, and prohibited-output fallback to the original. Two interop checks recompute the
+SCRAM verifier from a non-identity password and match it against PostgreSQL's: one **offline**
+against a frozen verifier captured from a live server (so interop is pinned on every run, no
+server needed — the salt is embedded, so the recomputation is deterministic), and one **live**
+against a freshly generated `pg_authid` verifier.
 
 ### `WireTests`
 
