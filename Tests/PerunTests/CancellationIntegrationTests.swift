@@ -68,6 +68,30 @@ final class CancellationIntegrationTests: XCTestCase {
         try await connection.close()
     }
 
+    func testInFlightQueryCancellationStopsTheQuery() async throws {
+        let connection = try await PostgresConnection.connect(integrationConfiguration())
+
+        // A slow query that is the *sole* in-flight request, so CancelRequest is safe.
+        let query = Task { try await connection.query("SELECT pg_sleep(5)") }
+        try await Task.sleep(nanoseconds: 200_000_000)   // let it start running on the backend
+        let start = Date()
+        query.cancel()
+
+        do {
+            _ = try await query.value
+            XCTFail("a cancelled in-flight query should throw")
+        } catch is CancellationError {
+            // expected
+        }
+        // CancelRequest actually stopped it server-side — nowhere near pg_sleep(5).
+        XCTAssertLessThan(Date().timeIntervalSince(start), 2.0)
+
+        // The response drained cleanly, so the connection is still usable afterward.
+        let alive = try await connection.query("SELECT 1 AS n").rows[0].decode("n", as: Int.self)
+        XCTAssertEqual(alive, 1)
+        try await connection.close()
+    }
+
     // The hand-off (release / unlock) resumes a waiter asynchronously w.r.t.
     // cancellation, so a hand-off can win the race *after* a waiter is cancelled. A
     // waiter cancelled while parked must still fail — never run on the resource it was

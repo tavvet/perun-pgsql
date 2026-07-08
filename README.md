@@ -205,10 +205,16 @@ default `1024`) so an unconsumed notification stream cannot grow without bound.
 
 ### Cancellation
 
+Cancelling the task is enough — an in-flight query sends a `CancelRequest` to stop the
+server work, drains the response, and throws `CancellationError`:
+
 ```swift
 let work = Task { try await conn.query("SELECT slow_thing()") }
-try await conn.cancelCurrentQuery()                     // sent on a side connection
+work.cancel()                                           // stops the query, throws CancellationError
 ```
+
+`conn.cancelCurrentQuery()` sends the same `CancelRequest` explicitly (on a side
+connection) if you want to cancel without cancelling the task.
 
 ## Architecture
 
@@ -284,8 +290,8 @@ Not yet implemented (each on its own merits):
 
 - **Full SASLprep** (RFC 4013) for non-ASCII passwords — currently the identity
   mapping, which is correct for ASCII.
-- **Cancelling an in-flight query** (already sent, not just a parked waiter) — needs a
-  `CancelRequest` plus draining the response, rather than dropping a queued waiter.
+- **Multi-dimensional and decoded arrays** — `PostgresArray` sends 1-D arrays as
+  parameters; reading arrays back into `[T]` and nested arrays are not done.
 
 ## License
 

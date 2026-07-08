@@ -500,13 +500,17 @@ public actor PostgresConnection {
     /// request (so it works while this one is blocked mid-query) and may race the
     /// query finishing on its own.
     public func cancelCurrentQuery() async throws {
+        try await sendCancelRequest()
+    }
+
+    private func sendCancelRequest() async throws {
         let processID = backendProcessID
         let secretKey = backendSecretKey
         guard processID != 0 else { return }
         let host = self.host
         let port = self.port
-        // A dedicated queue: the main ioQueue may be parked in a blocking recv
-        // waiting for the very query we're trying to cancel.
+        // A dedicated queue and a *separate* socket: this connection may be parked in a
+        // blocking recv waiting for the very query we're trying to cancel.
         let cancelQueue = DispatchQueue(label: "perun.cancel")
         try await withBlockingIO(on: cancelQueue) {
             let fd = try SystemSocket.makeConnected(host: host, port: port)
@@ -756,15 +760,18 @@ public actor PostgresConnection {
 
     // MARK: - Background response reader
 
-    /// One outstanding request whose response the reader will deliver. `run` reads the
-    /// response with the operation's own reader, resumes the caller, and reports whether
-    /// the wire is still in sync; `fail` resumes the caller during teardown.
-    private struct PendingRead {
-        let run: () async -> Bool
-        let fail: (Error) -> Void
+    /// One outstanding request whose response the reader will deliver. A reference type,
+    /// so an in-flight cancellation can check it is still the sole request before asking
+    /// the server to cancel. `run` reads the response with the operation's own reader,
+    /// resumes the caller, and reports whether the wire is still in sync; `fail` resumes
+    /// the caller during teardown.
+    private final class PendingRead: @unchecked Sendable {
+        var run: () async -> Bool = { true }
+        var fail: (Error) -> Void = { _ in }
     }
 
     private var pendingReads: [PendingRead] = []
+    private var currentRead: PendingRead?               // the read the reader is running now (popped)
     private var readerWaiter: CheckedContinuation<Void, Never>?
     private var readerStarted = false
 
@@ -774,29 +781,51 @@ public actor PostgresConnection {
     private func runReadOp<T>(sending request: [UInt8],
                               read: @escaping @Sendable () async throws -> T) async throws -> T {
         guard !isClosed else { throw PerunError.connectionClosed }
+        try Task.checkCancellation()                     // cancelled before we send → don't send
         startReaderIfNeeded()
-        return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<T, Error>) in
-            let op = PendingRead(
-                run: {
-                    do {
-                        continuation.resume(returning: try await read())
-                        return true
-                    } catch {
-                        continuation.resume(throwing: error)
-                        if let perun = error as? PerunError, perun.mayHaveDesynchronizedWire { return false }
-                        return true                      // server/local error: wire still in sync
+        let op = PendingRead()
+        let outcome: Result<T, Error> = await withTaskCancellationHandler {
+            do {
+                return .success(try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<T, Error>) in
+                    op.run = {
+                        do {
+                            continuation.resume(returning: try await read())
+                            return true
+                        } catch {
+                            continuation.resume(throwing: error)
+                            if let perun = error as? PerunError, perun.mayHaveDesynchronizedWire { return false }
+                            return true                  // server/local error: wire still in sync
+                        }
                     }
-                },
-                fail: { continuation.resume(throwing: $0) }
-            )
-            pendingReads.append(op)
-            if isClosed {                                // close raced in after the guard
-                failAllPendingReads(PerunError.connectionClosed)
-                return
+                    op.fail = { continuation.resume(throwing: $0) }
+                    pendingReads.append(op)
+                    if isClosed {                        // close raced in after the guard
+                        failAllPendingReads(PerunError.connectionClosed)
+                        return
+                    }
+                    wakeReader()
+                    kickWrite(request)
+                })
+            } catch {
+                return .failure(error)
             }
-            wakeReader()
-            kickWrite(request)
+        } onCancel: {
+            Task { await self.cancelInFlightRead(op) }
         }
+        // The response drained through the reader. Honor cancellation over its outcome.
+        if Task.isCancelled { throw CancellationError() }
+        return try outcome.get()
+    }
+
+    /// A task awaiting an in-flight query was cancelled: if the server is running *this*
+    /// query right now (it is the read the reader is currently draining), ask it to
+    /// cancel. `CancelRequest` is per-backend — it cancels whatever is running — so we
+    /// only fire it when the running query is this one; a still-queued cancelled query
+    /// would cancel someone else's, so we let it finish instead. Either way the response
+    /// drains and `runReadOp` reports `CancellationError`.
+    private func cancelInFlightRead(_ op: PendingRead) async {
+        guard !isClosed, currentRead === op else { return }
+        try? await sendCancelRequest()
     }
 
     private func startReaderIfNeeded() {
@@ -821,7 +850,10 @@ public actor PostgresConnection {
                 continue
             }
             let op = pendingReads.removeFirst()
-            if await op.run() == false {
+            currentRead = op                             // the request the backend is running now
+            let inSync = await op.run()
+            currentRead = nil
+            if inSync == false {
                 forceClose()
                 break
             }

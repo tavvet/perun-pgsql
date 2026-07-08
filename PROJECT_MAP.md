@@ -261,8 +261,14 @@ they run (shared drained, new shared blocked), so the two read paths never conte
 socket. What pipelining buys is latency (fewer round trips), not server-side parallelism —
 one backend still runs the queries serially — and responses come back in order, so a slow
 query head-of-line-blocks the ones behind it on the same connection. The pool remains the
-mechanism for real concurrency. Still TODO: cancelling an *in-flight* (already-sent) query,
-which needs `CancelRequest` plus draining rather than just dropping a parked waiter.
+mechanism for real concurrency.
+
+Cancelling an **in-flight** query (already sent, so a parked waiter can't just be dropped)
+is handled too: on cancellation `runReadOp` fires a `CancelRequest` — but only when the
+server is running *this* query (`currentRead === op`), since `CancelRequest` is per-backend
+and would otherwise cancel whichever query is running; a still-queued cancelled query is
+let finish instead. Either way the response still drains through the reader (the wire stays
+in sync), and `runReadOp` converts the outcome to `CancellationError`.
 
 ### Simple Query
 
