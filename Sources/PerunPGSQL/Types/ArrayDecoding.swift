@@ -4,7 +4,9 @@
 // with the `[UInt8]` bytea decoder), so decoding is exposed as `decodeArray` on cells and
 // rows. Both wire formats carry the full (possibly multi-dimensional) shape; this parses
 // each into flat, row-major elements plus a dimension list, then the typed entry points
-// reshape and decode. One- and two-dimensional arrays are supported.
+// reshape and decode into `[T]`, `[[T]]`, `[[[T]]]` and deeper.
+
+import Foundation
 
 /// A parsed array: the element type OID, the length of each dimension, and every element's
 /// raw bytes in row-major order (`nil` for a NULL element).
@@ -160,88 +162,116 @@ func elementTypeOID(forArray oid: Int32) -> Int32 {
     }
 }
 
-// MARK: - Typed decoding on a cell
+// MARK: - Nested array reshaping
 
-public extension PostgresCell {
-    /// Decode a one-dimensional array into `[T]`. Throws on a NULL element (use the `[T?]`
-    /// overload) or a higher-dimensional array.
-    func decodeArray<T: PostgresDecodable>(of type: T.Type = T.self) throws -> [T] {
-        let (elements, oid, format) = try flatArray(maxDimensions: 1)
-        return try elements.map { try decodeElement($0, oid: oid, format: format) }
-    }
+/// A Swift type a parsed array reshapes into: a scalar leaf (`Int`, `String`, …), an
+/// optional leaf (`Int?`, where SQL NULL becomes `nil`), or a nested `Array` of another
+/// such type. This is what lets `decodeArray` return `[T]`, `[[T]]`, `[[[T]]]` and deeper,
+/// with the nesting depth checked against the array's dimensions.
+///
+/// `_decodeArrayLevel` is an implementation detail — call `decodeArray` on a cell or row.
+public protocol PostgresArrayDecodable {
+    /// The scalar element type at the bottom of the nesting (drives the `of:` hint).
+    associatedtype ArrayScalar: PostgresDecodable
+    static func _decodeArrayLevel(_ dimensions: ArraySlice<Int>, from elements: [[UInt8]?],
+                                  at index: inout Int, oid: Int32, format: PostgresFormat,
+                                  columnName: String) throws -> Self
+}
 
-    /// Decode a one-dimensional array into `[T?]`, mapping SQL NULL elements to `nil`.
-    func decodeArray<T: PostgresDecodable>(of type: T.Type = T.self) throws -> [T?] {
-        let (elements, oid, format) = try flatArray(maxDimensions: 1)
-        return try elements.map { bytes in try bytes.map { try T.decode($0, oid: oid, format: format) } }
-    }
+private func arrayShapeError(_ oid: Int32, _ format: PostgresFormat, _ reason: String) -> PerunError {
+    .decodingFailed(type: "array", oid: oid, format: format == .binary ? "binary" : "text", reason: reason)
+}
 
-    /// Decode a two-dimensional array into `[[T]]`. Throws on a NULL element.
-    func decodeArray<T: PostgresDecodable>(of type: T.Type = T.self) throws -> [[T]] {
-        let (rows, oid, format) = try rowsArray()
-        return try rows.map { try $0.map { try decodeElement($0, oid: oid, format: format) } }
-    }
-
-    /// Decode a two-dimensional array into `[[T?]]`, mapping SQL NULL elements to `nil`.
-    func decodeArray<T: PostgresDecodable>(of type: T.Type = T.self) throws -> [[T?]] {
-        let (rows, oid, format) = try rowsArray()
-        return try rows.map { row in try row.map { bytes in try bytes.map { try T.decode($0, oid: oid, format: format) } } }
-    }
-
-    private func decodeElement<T: PostgresDecodable>(_ bytes: [UInt8]?, oid: Int32, format: PostgresFormat) throws -> T {
-        guard let bytes else { throw PerunError.unexpectedNull(column: column.name) }
-        return try T.decode(bytes, oid: oid, format: format)
-    }
-
-    private func flatArray(maxDimensions: Int) throws -> (elements: [[UInt8]?], oid: Int32, format: PostgresFormat) {
-        guard let bytes else { throw PerunError.unexpectedNull(column: column.name) }
-        let format: PostgresFormat = column.formatCode == 1 ? .binary : .text
-        let parsed = try parsePostgresArray(bytes, arrayOID: column.dataTypeOID, format: format)
-        guard parsed.dimensions.count <= maxDimensions else {
-            throw PerunError.decodingFailed(type: "array", oid: column.dataTypeOID,
-                                            format: format == .binary ? "binary" : "text",
-                                            reason: "\(parsed.dimensions.count)-dimensional array, expected \(maxDimensions)")
+/// A nesting level: consume one dimension, decoding `dimensions.first` children.
+extension Array: PostgresArrayDecodable where Element: PostgresArrayDecodable {
+    public typealias ArrayScalar = Element.ArrayScalar
+    public static func _decodeArrayLevel(_ dimensions: ArraySlice<Int>, from elements: [[UInt8]?],
+                                         at index: inout Int, oid: Int32, format: PostgresFormat,
+                                         columnName: String) throws -> [Element] {
+        guard let count = dimensions.first else {
+            throw arrayShapeError(oid, format, "array has fewer dimensions than the requested nesting")
         }
-        return (parsed.elements, parsed.elementOID, format)
-    }
-
-    private func rowsArray() throws -> (rows: [[[UInt8]?]], oid: Int32, format: PostgresFormat) {
-        guard let bytes else { throw PerunError.unexpectedNull(column: column.name) }
-        let format: PostgresFormat = column.formatCode == 1 ? .binary : .text
-        let parsed = try parsePostgresArray(bytes, arrayOID: column.dataTypeOID, format: format)
-        if parsed.elements.isEmpty { return ([], parsed.elementOID, format) }        // {} → []
-        guard parsed.dimensions.count == 2 else {
-            throw PerunError.decodingFailed(type: "array", oid: column.dataTypeOID,
-                                            format: format == .binary ? "binary" : "text",
-                                            reason: "\(parsed.dimensions.count)-dimensional array, expected 2")
+        let rest = dimensions.dropFirst()
+        var out: [Element] = []
+        out.reserveCapacity(count)
+        for _ in 0 ..< count {
+            out.append(try Element._decodeArrayLevel(rest, from: elements, at: &index,
+                                                     oid: oid, format: format, columnName: columnName))
         }
-        let width = parsed.dimensions[1]
-        var rows: [[[UInt8]?]] = []
-        var i = 0
-        while i < parsed.elements.count {
-            rows.append(Array(parsed.elements[i ..< min(i + width, parsed.elements.count)]))
-            i += width
-        }
-        return (rows, parsed.elementOID, format)
+        return out
     }
 }
 
-// MARK: - Typed decoding on a row
+/// A nullable leaf: a SQL NULL element becomes `nil`.
+extension Optional: PostgresArrayDecodable where Wrapped: PostgresDecodable {
+    public typealias ArrayScalar = Wrapped
+    public static func _decodeArrayLevel(_ dimensions: ArraySlice<Int>, from elements: [[UInt8]?],
+                                         at index: inout Int, oid: Int32, format: PostgresFormat,
+                                         columnName: String) throws -> Wrapped? {
+        guard dimensions.isEmpty else {
+            throw arrayShapeError(oid, format, "array has more dimensions than the requested nesting")
+        }
+        guard index < elements.count else { throw arrayShapeError(oid, format, "array element count mismatch") }
+        defer { index += 1 }
+        guard let bytes = elements[index] else { return nil }
+        return try Wrapped.decode(bytes, oid: oid, format: format)
+    }
+}
+
+/// A non-null leaf: any `PostgresDecodable` scalar. A SQL NULL element throws.
+public extension PostgresArrayDecodable where Self: PostgresDecodable, ArrayScalar == Self {
+    static func _decodeArrayLevel(_ dimensions: ArraySlice<Int>, from elements: [[UInt8]?],
+                                  at index: inout Int, oid: Int32, format: PostgresFormat,
+                                  columnName: String) throws -> Self {
+        guard dimensions.isEmpty else {
+            throw arrayShapeError(oid, format, "array has more dimensions than the requested nesting")
+        }
+        guard index < elements.count else { throw arrayShapeError(oid, format, "array element count mismatch") }
+        defer { index += 1 }
+        guard let bytes = elements[index] else { throw PerunError.unexpectedNull(column: columnName) }
+        return try Self.decode(bytes, oid: oid, format: format)
+    }
+}
+
+// Scalar leaves — every built-in `PostgresDecodable` scalar. (`[UInt8]` bytea is itself an
+// `Array`, so it can't also be a leaf; decode a `bytea[]` column into `[Data]` instead.)
+extension Bool: PostgresArrayDecodable { public typealias ArrayScalar = Bool }
+extension Int16: PostgresArrayDecodable { public typealias ArrayScalar = Int16 }
+extension Int32: PostgresArrayDecodable { public typealias ArrayScalar = Int32 }
+extension Int64: PostgresArrayDecodable { public typealias ArrayScalar = Int64 }
+extension Int: PostgresArrayDecodable { public typealias ArrayScalar = Int }
+extension Float: PostgresArrayDecodable { public typealias ArrayScalar = Float }
+extension Double: PostgresArrayDecodable { public typealias ArrayScalar = Double }
+extension String: PostgresArrayDecodable { public typealias ArrayScalar = String }
+extension Data: PostgresArrayDecodable { public typealias ArrayScalar = Data }
+extension UUID: PostgresArrayDecodable { public typealias ArrayScalar = UUID }
+extension Date: PostgresArrayDecodable { public typealias ArrayScalar = Date }
+extension Decimal: PostgresArrayDecodable { public typealias ArrayScalar = Decimal }
+extension PostgresJSON: PostgresArrayDecodable { public typealias ArrayScalar = PostgresJSON }
+
+// MARK: - Typed decoding on a cell and row
+
+public extension PostgresCell {
+    /// Decode an array column into a nested Swift array — `[T]`, `[T?]`, `[[T]]`, `[[[T]]]`
+    /// and deeper — of any `PostgresDecodable` scalar `T`. The nesting depth must match the
+    /// array's dimensionality (a mismatch throws); an empty array is `[]`. Use an optional
+    /// scalar (`[T?]`, `[[T?]]`, …) for arrays that contain SQL NULLs.
+    func decodeArray<Element: PostgresArrayDecodable>(
+        of scalar: Element.ArrayScalar.Type = Element.ArrayScalar.self) throws -> [Element] {
+        guard let bytes else { throw PerunError.unexpectedNull(column: column.name) }
+        let format: PostgresFormat = column.formatCode == 1 ? .binary : .text
+        let parsed = try parsePostgresArray(bytes, arrayOID: column.dataTypeOID, format: format)
+        guard !parsed.dimensions.isEmpty else { return [] }        // {} → []
+        var index = 0
+        return try [Element]._decodeArrayLevel(parsed.dimensions[...], from: parsed.elements, at: &index,
+                                               oid: parsed.elementOID, format: format, columnName: column.name)
+    }
+}
 
 public extension PostgresRow {
-    func decodeArray<T: PostgresDecodable>(_ name: String, of type: T.Type = T.self) throws -> [T] {
-        try cell(name).decodeArray(of: type)
-    }
-
-    func decodeArray<T: PostgresDecodable>(_ name: String, of type: T.Type = T.self) throws -> [T?] {
-        try cell(name).decodeArray(of: type)
-    }
-
-    func decodeArray<T: PostgresDecodable>(_ name: String, of type: T.Type = T.self) throws -> [[T]] {
-        try cell(name).decodeArray(of: type)
-    }
-
-    func decodeArray<T: PostgresDecodable>(_ name: String, of type: T.Type = T.self) throws -> [[T?]] {
-        try cell(name).decodeArray(of: type)
+    /// Decode a named array column into a nested Swift array. See `PostgresCell.decodeArray`.
+    func decodeArray<Element: PostgresArrayDecodable>(
+        _ name: String, of scalar: Element.ArrayScalar.Type = Element.ArrayScalar.self) throws -> [Element] {
+        try cell(name).decodeArray(of: scalar)
     }
 }

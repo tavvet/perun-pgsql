@@ -28,6 +28,14 @@ final class ArrayDecodingTests: XCTestCase {
         XCTAssertEqual(matrix, [[1, 2, 3], [4, 5, 6]])
     }
 
+    func testDecodeThreeDimensionalTextArray() throws {
+        let cube: [[[Int]]] = try textCell("{{{1,2},{3,4}},{{5,6},{7,8}}}", oid: 1007).decodeArray(of: Int.self)
+        XCTAssertEqual(cube, [[[1, 2], [3, 4]], [[5, 6], [7, 8]]])
+        // NULLs at depth need an optional leaf.
+        let withNull: [[[Int?]]] = try textCell("{{{1,NULL}}}", oid: 1007).decodeArray(of: Int.self)
+        XCTAssertEqual(withNull, [[[1, nil]]])
+    }
+
     func testTextArrayWithNonDefaultLowerBounds() throws {
         // PostgreSQL prints an explicit `[lower:upper]=` decoration when a lower bound isn't 1.
         let ones: [Int] = try textCell("[2:4]={7,7,7}", oid: 1007).decodeArray(of: Int.self)
@@ -39,6 +47,7 @@ final class ArrayDecodingTests: XCTestCase {
     func testDimensionalityMismatchThrows() throws {
         XCTAssertThrowsError(try textCell("{{1,2},{3,4}}", oid: 1007).decodeArray(of: Int.self) as [Int])     // 2-D as 1-D
         XCTAssertThrowsError(try textCell("{{{1}}}", oid: 1007).decodeArray(of: Int.self) as [[Int]])         // 3-D as 2-D
+        XCTAssertThrowsError(try textCell("{{1,2},{3,4}}", oid: 1007).decodeArray(of: Int.self) as [[[Int]]]) // 2-D as 3-D
     }
 
     // MARK: - Binary (no server)
@@ -56,6 +65,24 @@ final class ArrayDecodingTests: XCTestCase {
         ]
         let ints: [Int] = try cell(binary, oid: 1016, binary: true).decodeArray(of: Int.self)
         XCTAssertEqual(ints, [10, 20])
+    }
+
+    func testDecodeThreeDimensionalBinaryArray() throws {
+        // int8[][][] shaped [2][1][2]: header with three dimensions, then four elements.
+        let binary: [UInt8] = [
+            0, 0, 0, 3,        // ndim 3
+            0, 0, 0, 0,        // flags
+            0, 0, 0, 20,       // element OID int8
+            0, 0, 0, 2, 0, 0, 0, 1,   // dimension 0: length 2, lower bound 1
+            0, 0, 0, 1, 0, 0, 0, 1,   // dimension 1: length 1, lower bound 1
+            0, 0, 0, 2, 0, 0, 0, 1,   // dimension 2: length 2, lower bound 1
+            0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 10,
+            0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 20,
+            0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 30,
+            0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 40,
+        ]
+        let cube: [[[Int]]] = try cell(binary, oid: 1016, binary: true).decodeArray(of: Int.self)
+        XCTAssertEqual(cube, [[[10, 20]], [[30, 40]]])
     }
 
     // MARK: - Live round-trip
@@ -99,6 +126,18 @@ final class ArrayDecodingTests: XCTestCase {
             "SELECT $1::int8[] AS a", [PostgresArray([[Int64(7), 8], [9, 10]])], parameterFormat: .binary)
             .rows[0].decodeArray("a", of: Int.self)
         XCTAssertEqual(matrixBinary, [[7, 8], [9, 10]])
+
+        // Three dimensions decode too.
+        let cube: [[[Int]]] = try await connection.query("SELECT ARRAY[[[1,2],[3,4]],[[5,6],[7,8]]] AS a")
+            .rows[0].decodeArray("a", of: Int.self)
+        XCTAssertEqual(cube, [[[1, 2], [3, 4]], [[5, 6], [7, 8]]])
+
+        // A three-dimensional parameter round-trips through the server.
+        let cubeParam = PostgresArray(dimensions: [2, 1, 2],
+                                      elements: [1, 2, 3, 4] as [PostgresEncodable?], elementTypeOID: PostgresOID.int8)
+        let cubeBack: [[[Int]]] = try await connection.query("SELECT $1::int8[] AS a", [cubeParam])
+            .rows[0].decodeArray("a", of: Int.self)
+        XCTAssertEqual(cubeBack, [[[1, 2]], [[3, 4]]])
 
         try await connection.close()
     }

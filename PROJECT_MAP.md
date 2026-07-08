@@ -435,7 +435,7 @@ Supported built-in type families:
 - UUID;
 - date/timestamp/timestamptz as `Date`;
 - numeric as `Decimal`;
-- arrays of any of the above (`decodeArray`, 1-D and 2-D).
+- arrays of any of the above (`decodeArray`, any number of dimensions).
 
 Parameters are sent through `PostgresEncodable`.
 
@@ -458,10 +458,14 @@ Parameters are sent through `PostgresEncodable`.
   `PostgresDecodable` protocol without clashing with the `[UInt8]` bytea decoder). A
   parser handles both wire formats — recursive descent for the `{…}` text form (including
   the `[lower:upper]=` dimension decoration PostgreSQL prints when a lower bound isn't 1),
-  header + row-major elements for binary — producing flat elements plus a dimension list,
-  which the typed overloads reshape into `[T]` / `[T?]` (1-D) or `[[T]]` / `[[T?]]` (2-D).
-  Higher dimensions throw. Text elements get their type OID from the array-OID reverse map;
-  binary carries it in the header. (Swift arrays are 0-based, so the lower bound is dropped.)
+  header + row-major elements for binary — producing flat elements plus a dimension list.
+  A recursive `PostgresArrayDecodable` protocol (conformed by `Array` for each nesting
+  level, `Optional` for a nullable leaf, and every scalar `PostgresDecodable` as a leaf)
+  then reshapes them into `[T]`, `[[T]]`, `[[[T]]]` and deeper; the nesting depth is
+  checked against the dimensions (a mismatch throws). `[UInt8]` (bytea) is itself an
+  `Array`, so it can't also be a leaf — decode a `bytea[]` column into `[Data]`. Text
+  elements get their type OID from the array-OID reverse map; binary carries it in the
+  header. (Swift arrays are 0-based, so the lower bound is dropped.)
 
 Implementation notes:
 
@@ -801,10 +805,10 @@ header) — plus the `Bind` message layout when binary parameters are requested.
 
 ### `ArrayDecodingTests`
 
-Array-column decoding: the text parser (quoting, escapes, NULLs, 2-D) and the binary
-parser, dimensionality mismatches, and a live round-trip (1-D int, text with commas/NULLs,
-2-D, a binary result, a multi-dimensional `PostgresArray` parameter round-tripped as text
-and binary, and encode-via-`PostgresArray` then decode back).
+Array-column decoding: the text and binary parsers (quoting, escapes, NULLs, 2-D and 3-D),
+dimensionality mismatches, and a live round-trip (1-D int, text with commas/NULLs, 2-D, 3-D,
+a binary result, multi-dimensional `PostgresArray` parameters round-tripped as text and
+binary, and encode-via-`PostgresArray` then decode back).
 
 ### `PipelineTests`
 
