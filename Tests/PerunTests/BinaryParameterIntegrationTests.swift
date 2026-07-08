@@ -65,6 +65,24 @@ final class BinaryParameterIntegrationTests: XCTestCase {
         await pool.shutdown()
     }
 
+    func testDataAndDecimalParametersRoundTrip() async throws {
+        let configuration = try integrationConfiguration()
+        let pool = PostgresClient(configuration: configuration, maxConnections: 1)
+
+        let blob = Data([0x00, 0x01, 0x7f, 0x80, 0xfe, 0xff, 0xDE, 0xAD])
+        let amount = Decimal(string: "-12345.6789")!
+
+        for format in [PostgresFormat.text, .binary] {
+            let row = try await pool.query("SELECT $1::bytea AS b, $2::numeric AS n",
+                                           [blob, amount],
+                                           parameterFormat: format).rows[0]
+            XCTAssertEqual(try row.decode("b", as: Data.self), blob, "bytea via \(format)")
+            XCTAssertEqual(try row.decode("n", as: Decimal.self), amount, "numeric via \(format)")
+        }
+
+        await pool.shutdown()
+    }
+
     private func integrationConfiguration() throws -> ConnectionConfiguration {
         let environment = ProcessInfo.processInfo.environment
         guard environment["PERUN_PGSQL_INTEGRATION"] == "1" else {

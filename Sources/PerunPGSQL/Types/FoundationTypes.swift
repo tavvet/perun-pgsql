@@ -1,9 +1,10 @@
 import Foundation
 
 // Codecs for common Foundation value types: decoders for all of them, plus
-// parameter encoders for UUID and Date. This is the only part of the driver that
-// leans on Foundation; the wire / crypto / socket core stays free of it. These are
-// the natural Swift representations for uuid, bytea, the temporal types and numeric.
+// parameter encoders for UUID, Date, Data (bytea) and Decimal (numeric). This is
+// the only part of the driver that leans on Foundation; the wire / crypto / socket
+// core stays free of it. These are the natural Swift representations for uuid,
+// bytea, the temporal types and numeric.
 
 extension Data: PostgresDecodable {
     public static func decode(_ bytes: [UInt8], oid: Int32, format: PostgresFormat) throws -> Data {
@@ -233,6 +234,73 @@ extension Date: PostgresEncodable {
         let secondsSinceEpoch = timeIntervalSinceReferenceDate + 31_622_400
         return bigEndianBytes(Int64((secondsSinceEpoch * 1_000_000).rounded()))
     }
+}
+
+extension Data: PostgresEncodable {
+    public var postgresText: String? { "\\x" + hexEncode(Array(self)) }   // bytea hex input
+    public var postgresTypeOID: Int32 { PostgresOID.bytea }
+    public func postgresBinary() -> [UInt8]? { Array(self) }              // binary is the raw bytes
+}
+
+extension Decimal: PostgresEncodable {
+    public var postgresText: String? { description }                     // plain decimal, e.g. "-12345.6789"
+    public var postgresTypeOID: Int32 { PostgresOID.numeric }
+    public func postgresBinary() -> [UInt8]? { postgresNumericBinary(description) }
+}
+
+/// Encode a plain decimal string (`Decimal.description`, e.g. `-12345.6789`) into
+/// PostgreSQL's `numeric` binary form: int16 ndigits, int16 weight, uint16 sign,
+/// int16 dscale, then `ndigits` base-10000 groups (value = Σ digit·10000^(weight−i)).
+/// Returns nil for anything that isn't plain decimal digits — `NaN`, an exponent —
+/// so the caller falls back to text, which PostgreSQL still parses. Inverse of
+/// `Decimal.decodeBinaryNumeric`.
+private func postgresNumericBinary(_ text: String) -> [UInt8]? {
+    var body = Substring(text)
+    var sign: UInt16 = 0x0000
+    if body.first == "-" { sign = 0x4000; body = body.dropFirst() }
+    else if body.first == "+" { body = body.dropFirst() }
+
+    func asciiDigitValues(_ s: Substring) -> [UInt8]? {
+        var values = [UInt8]()
+        for byte in s.utf8 {
+            guard byte >= 0x30, byte <= 0x39 else { return nil }         // digits only
+            values.append(byte - 0x30)
+        }
+        return values
+    }
+    let halves = body.split(separator: ".", maxSplits: 1, omittingEmptySubsequences: false)
+    guard let intValues = asciiDigitValues(halves[0]),
+          let fracValues = asciiDigitValues(halves.count == 2 ? halves[1] : "") else { return nil }
+    let dscale = fracValues.count
+
+    // Align to base-10000 groups: pad the integer part on the left and the fraction
+    // on the right, so the decimal point falls on a group boundary.
+    let intAligned = Array(repeating: UInt8(0), count: (4 - intValues.count % 4) % 4) + intValues
+    let fracAligned = fracValues + Array(repeating: UInt8(0), count: (4 - fracValues.count % 4) % 4)
+    let integerGroups = intAligned.count / 4
+
+    var groups = [Int16]()
+    let stream = intAligned + fracAligned
+    var i = 0
+    while i < stream.count {
+        let value = Int(stream[i]) * 1000 + Int(stream[i + 1]) * 100
+                  + Int(stream[i + 2]) * 10 + Int(stream[i + 3])
+        groups.append(Int16(value))
+        i += 4
+    }
+
+    var weight = integerGroups - 1
+    while groups.first == 0 { groups.removeFirst(); weight -= 1 }         // leading zero groups shift the point
+    while groups.last == 0 { groups.removeLast() }                        // trailing zero groups are implicit
+    if groups.isEmpty { weight = 0; sign = 0x0000 }                       // canonical zero
+
+    var out = [UInt8]()
+    out += bigEndianBytes(Int16(groups.count))
+    out += bigEndianBytes(Int16(weight))
+    out += bigEndianBytes(sign)
+    out += bigEndianBytes(Int16(dscale))
+    for group in groups { out += bigEndianBytes(group) }
+    return out
 }
 
 /// Render a `Date` as PostgreSQL `timestamptz` text at UTC, microsecond precision:

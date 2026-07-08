@@ -98,4 +98,34 @@ final class EncodingTests: XCTestCase {
         let viaText = try Date.decode(Array(bce.postgresText!.utf8), oid: PostgresOID.timestamptz, format: .text)
         XCTAssertEqual(viaText.timeIntervalSince1970, bce.timeIntervalSince1970, accuracy: 0.000_001)
     }
+
+    func testDataEncoding() {
+        let blob = Data([0xDE, 0xAD, 0xBE, 0xEF])
+        XCTAssertEqual(blob.postgresBinary(), [0xDE, 0xAD, 0xBE, 0xEF])   // binary == raw bytes
+        XCTAssertEqual(blob.postgresText, "\\xdeadbeef")                  // text == bytea hex input
+        XCTAssertEqual(blob.postgresTypeOID, 17)
+        XCTAssertEqual(Data().postgresBinary(), [])                       // empty bytea
+    }
+
+    func testDecimalBinaryEncoding() throws {
+        XCTAssertEqual(Decimal(string: "0.5")!.postgresBinary(),
+                       [0x00, 0x01,     // 1 base-10000 group
+                        0xFF, 0xFF,     // weight -1
+                        0x00, 0x00,     // sign +
+                        0x00, 0x01,     // dscale 1
+                        0x13, 0x88])    // 5000
+        XCTAssertEqual(Decimal(0).postgresBinary(),
+                       [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])  // canonical zero: no digits
+        XCTAssertEqual(Decimal(string: "-1")!.postgresBinary(),
+                       [0x00, 0x01, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x01])  // sign 0x4000
+        XCTAssertEqual(Decimal(string: "12345.6789")!.postgresTypeOID, 1700)
+
+        // Binary encode → decode round-trips exactly across magnitudes and signs.
+        for text in ["0", "1", "-1", "100", "10000", "0.5", "-0.001", "0.0001",
+                     "12345.6789", "9999.9999", "123456789012345.678"] {
+            let value = Decimal(string: text)!
+            let decoded = try Decimal.decode(value.postgresBinary()!, oid: PostgresOID.numeric, format: .binary)
+            XCTAssertEqual(decoded, value, "numeric round-trip for \(text)")
+        }
+    }
 }
