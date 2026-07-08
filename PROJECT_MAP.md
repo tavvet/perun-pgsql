@@ -295,6 +295,7 @@ The returned `PreparedStatement` contains:
 - server-side statement name;
 - parameter type OIDs;
 - result columns.
+- creating connection ID.
 
 Execution sends:
 
@@ -304,10 +305,10 @@ Execute portal
 Sync
 ```
 
-Important review note: prepared statement names are currently generated from a
-per-connection counter (`perun_stmt_N`). A handle from one connection can name a
-different statement on another pooled connection unless ownership or globally
-unique names are added.
+Prepared statement names include the connection ID plus a per-connection
+counter. `execute` and `closePrepared` validate the handle's creating
+connection ID before sending it to the server, so prepared-statement handles are
+scoped to the backend connection that created them.
 
 ## Result Model
 
@@ -363,10 +364,10 @@ Current parameter encoding:
 - `postgresTypeOID` exists as a hint surface, but unnamed parse currently lets
   PostgreSQL infer types by default.
 
-Important review notes:
+Implementation notes:
 
-- Binary `numeric` decoding should defensively reject malformed negative digit
-  counts and out-of-range values.
+- Binary `numeric` decoding defensively rejects malformed negative digit counts
+  and out-of-range values.
 - Text timestamp parsing is intentionally small and does not fully cover all
   PostgreSQL date/time forms.
 - Decode errors report byte length but do not include raw byte previews by
@@ -455,9 +456,9 @@ Decodes server messages:
 - in failed transaction
 - unknown byte
 
-Important review note: transaction status is decoded but not yet used by the
-pool to quarantine/discard connections returned in transaction or failed
-transaction state.
+The pool uses this status on release: only idle connections are returned to the
+idle list; connections still inside a transaction or failed transaction are
+discarded.
 
 ## Framing And Read Buffering
 
@@ -498,10 +499,9 @@ from the actual `recv`/`SSL_read` return value.
 them onto a dedicated queue. This keeps Swift concurrency cooperative threads
 from being blocked by `connect`, `send`, `recv`, `SSL_read`, or `SSL_write`.
 
-Important review note: `send` and `receive` capture fd/TLS state and then await
-the I/O queue. They should guard closed state so requests queued after
-`close()` fail cleanly rather than using a closed/recycled fd or freed TLS
-object.
+`send` and `receive` check closed state before queueing blocking I/O, so calls
+made after `close()` fail with `PerunError.connectionClosed` instead of using a
+closed/recycled fd or freed TLS object.
 
 ## Pool
 
@@ -539,13 +539,14 @@ Error behavior:
 - `PerunError.server` is treated as clean and reusable.
 - Other errors close/drop the connection and may open a replacement for a waiter.
 
-Important review notes:
+Transaction hygiene:
 
-- There is no transaction helper yet. `pool.query("BEGIN")` returns the
-  connection to the pool while the transaction remains open.
-- Pool release does not inspect `ReadyForQuery` transaction status.
-- A replacement connection opened after an error should re-check shutdown before
-  being handed to a waiter.
+- `withTransaction` keeps one connection checked out and wire-locked until
+  COMMIT or ROLLBACK completes.
+- Pool release checks `ReadyForQuery` transaction status and discards
+  connections that are still inside a transaction or failed transaction.
+- Replacement connections opened for waiters re-check shutdown before being
+  handed out.
 
 ## Notifications And Notices
 
@@ -698,20 +699,9 @@ navigation document.
 
 Already reflected in current code:
 
-- H1: Parse/Bind parameter count overflow guard appears implemented.
-- H2: Backend message payload size cap and receive chunk clamp appear
-  implemented.
-
-Still worth prioritizing:
-
-- SCRAM exchange completion state.
-- Guarding I/O after close.
-- Pool transaction hygiene and transaction helper.
-- Prepared statement ownership/global uniqueness.
-- Binary numeric hardening.
-- Safer by-name row API.
-- Bounded notification stream.
-- TLS default/security semantics.
+- HIGH findings from `REVIEW.md` have been addressed.
+- MEDIUM findings from `REVIEW.md` have been addressed.
+- LOW findings from `REVIEW.md` have been addressed.
 
 ## Where To Start When Changing Things
 
