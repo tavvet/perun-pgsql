@@ -9,14 +9,18 @@
 // `init(dimensions:elements:elementTypeOID:)`.
 
 public struct PostgresArray: PostgresEncodable {
+    // Read-only after init: the initializers are the only place the shape invariant
+    // (`dimensions` multiplying to `elements.count`) is established, so nothing outside
+    // can desync them. Build a new value to change one.
+
     /// The elements in row-major order, each `nil` for SQL NULL.
-    public var elements: [PostgresEncodable?]
+    public private(set) var elements: [PostgresEncodable?]
     /// The length of each dimension, outermost first; their product is `elements.count`.
     /// A single entry is a one-dimensional array.
-    public var dimensions: [Int]
+    public private(set) var dimensions: [Int]
     /// OID of the *element* type (e.g. `PostgresOID.int8`). Drives the binary header
     /// and the array-type hint; `0` means "let the server infer" and forces text.
-    public var elementTypeOID: Int32
+    public private(set) var elementTypeOID: Int32
 
     /// A multi-dimensional array from a flat, row-major element list and an explicit
     /// shape. `dimensions` must multiply to `elements.count`.
