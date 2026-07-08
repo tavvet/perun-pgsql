@@ -106,6 +106,32 @@ final class BinaryParameterIntegrationTests: XCTestCase {
         await pool.shutdown()
     }
 
+    func testArrayParametersRoundTrip() async throws {
+        let configuration = try integrationConfiguration()
+        let pool = PostgresClient(configuration: configuration, maxConnections: 1)
+
+        for format in [PostgresFormat.text, .binary] {
+            // `array_eq` (the `=` operator) treats two NULL elements as equal, so the
+            // text[] case exercises a NULL element and a comma inside an element.
+            let row = try await pool.query(
+                """
+                SELECT $1::int8[] = '{1,2,3}'::int8[]                      AS ints,
+                       $2::text[] = '{plain,"has,comma",NULL}'::text[]     AS texts,
+                       $3::int8[] = '{}'::int8[]                           AS empty
+                """,
+                [PostgresArray([1, 2, 3]),
+                 PostgresArray([String?.some("plain"), "has,comma", nil]),
+                 PostgresArray([Int]())],
+                parameterFormat: format).rows[0]
+
+            XCTAssertTrue(try row.decode("ints", as: Bool.self), "int8[] via \(format)")
+            XCTAssertTrue(try row.decode("texts", as: Bool.self), "text[] via \(format)")
+            XCTAssertTrue(try row.decode("empty", as: Bool.self), "empty int8[] via \(format)")
+        }
+
+        await pool.shutdown()
+    }
+
     private func integrationConfiguration() throws -> ConnectionConfiguration {
         let environment = ProcessInfo.processInfo.environment
         guard environment["PERUN_PGSQL_INTEGRATION"] == "1" else {

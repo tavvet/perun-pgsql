@@ -369,6 +369,10 @@ Parameters are sent through `PostgresEncodable`.
   provided for the integer, floating-point, `Bool`, `String`, `UUID`, `Date`
   (timestamptz), `Data`/`[UInt8]` (bytea), `Decimal` (numeric) and `PostgresJSON`
   (json/jsonb) types.
+- One-dimensional arrays are sent through `PostgresArray` (any `PostgresEncodable`
+  elements, `nil` for NULL): the `{…}` text form, or the binary array wire format —
+  `ndim`/flags/element-OID header plus length-framed elements — when every element
+  has a binary form. Decoding arrays back into Swift arrays is not provided.
 
 Implementation notes:
 
@@ -704,8 +708,8 @@ environment variables.
   connections; shutdown does not leak a concurrently released connection; a healthy
   connection is reused after a local (non-wire) error.
 - `BinaryParameterIntegrationTests`: round-trip of binary parameters (integers, floats,
-  bool, text, UUID, timestamptz, bytea, numeric, json/jsonb), NULL parameters and
-  binary results.
+  bool, text, UUID, timestamptz, bytea, numeric, json/jsonb, arrays), NULL parameters
+  and binary results.
 
 ## Local Verification
 

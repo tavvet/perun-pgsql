@@ -156,4 +156,37 @@ final class EncodingTests: XCTestCase {
             XCTAssertEqual(decoded, value, "numeric round-trip for \(text)")
         }
     }
+
+    func testArrayTextEncoding() {
+        XCTAssertEqual(PostgresArray([1, 2, 3]).postgresText, #"{"1","2","3"}"#)
+        XCTAssertEqual(PostgresArray([1, 2, 3]).postgresTypeOID, 1016)          // _int8
+        XCTAssertEqual(PostgresArray([Int]()).postgresText, "{}")               // empty
+        // Quoting carries commas and quotes literally; a nil element is unquoted NULL.
+        XCTAssertEqual(PostgresArray([String?.some("a"), "b,c", #"d"e"#, nil]).postgresText,
+                       #"{"a","b,c","d\"e",NULL}"#)
+        XCTAssertEqual(PostgresArray(["a", "b,c"]).postgresTypeOID, 1009)       // _text
+    }
+
+    func testArrayBinaryEncoding() {
+        XCTAssertEqual(PostgresArray([Int16(1), Int16(2)]).postgresBinary(), [
+            0, 0, 0, 1,        // ndim = 1
+            0, 0, 0, 0,        // flags = 0 (no nulls)
+            0, 0, 0, 21,       // element OID 21 (int2)
+            0, 0, 0, 2,        // dimension length 2
+            0, 0, 0, 1,        // lower bound 1
+            0, 0, 0, 2, 0, 1,  // element: length 2, value 0x0001
+            0, 0, 0, 2, 0, 2,  // element: length 2, value 0x0002
+        ])
+        // A NULL element sets the has-nulls flag and is written as length -1.
+        XCTAssertEqual(PostgresArray([Int16?.some(7), nil]).postgresBinary(), [
+            0, 0, 0, 1,        // ndim = 1
+            0, 0, 0, 1,        // flags = 1 (has nulls)
+            0, 0, 0, 21,       // element OID 21
+            0, 0, 0, 2,        // dimension length 2
+            0, 0, 0, 1,        // lower bound 1
+            0, 0, 0, 2, 0, 7,  // element: length 2, value 0x0007
+            0xFF, 0xFF, 0xFF, 0xFF,  // element: length -1 (NULL)
+        ])
+        XCTAssertNil(PostgresArray([Int]()).postgresBinary())                   // empty → text fallback
+    }
 }
