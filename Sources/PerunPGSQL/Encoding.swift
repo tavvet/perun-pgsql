@@ -25,7 +25,7 @@ public extension PostgresEncodable {
 }
 
 /// Big-endian bytes of a fixed-width value (the PostgreSQL binary wire order).
-private func bigEndianBytes<T: FixedWidthInteger>(_ value: T) -> [UInt8] {
+func bigEndianBytes<T: FixedWidthInteger>(_ value: T) -> [UInt8] {
     withUnsafeBytes(of: value.bigEndian) { Array($0) }
 }
 

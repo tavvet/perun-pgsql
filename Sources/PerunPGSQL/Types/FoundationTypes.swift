@@ -210,3 +210,58 @@ private func daysFromCivil(year: Int, month: Int, day: Int) -> Int {
     let dayOfEra = yearOfEra * 365 + yearOfEra / 4 - yearOfEra / 100 + dayOfYear
     return era * 146_097 + dayOfEra - 719_468
 }
+
+// MARK: - Parameter encoding
+
+extension UUID: PostgresEncodable {
+    public var postgresText: String? { uuidString }
+    public var postgresTypeOID: Int32 { PostgresOID.uuid }
+    public func postgresBinary() -> [UInt8]? {
+        let b = uuid
+        return [b.0, b.1, b.2, b.3, b.4, b.5, b.6, b.7,
+                b.8, b.9, b.10, b.11, b.12, b.13, b.14, b.15]
+    }
+}
+
+extension Date: PostgresEncodable {
+    /// A `Date` is an instant, so it maps to `timestamptz`.
+    public var postgresText: String? { postgresTimestampText(self) }
+    public var postgresTypeOID: Int32 { PostgresOID.timestamptz }
+    public func postgresBinary() -> [UInt8]? {
+        // Microseconds since 2000-01-01 UTC (PostgreSQL's epoch), which is
+        // 31_622_400 s after Swift's 2001-01-01 reference date. Big-endian int8.
+        let secondsSinceEpoch = timeIntervalSinceReferenceDate + 31_622_400
+        return bigEndianBytes(Int64((secondsSinceEpoch * 1_000_000).rounded()))
+    }
+}
+
+/// Render a `Date` as PostgreSQL `timestamptz` text at UTC, microsecond precision:
+/// `YYYY-MM-DD HH:MM:SS.ffffff+00`. (Used for the text parameter path; binary is exact.)
+private func postgresTimestampText(_ date: Date) -> String {
+    let totalMicros = Int64((date.timeIntervalSince1970 * 1_000_000).rounded())
+    var seconds = totalMicros / 1_000_000
+    var micros = totalMicros - seconds * 1_000_000
+    if micros < 0 { micros += 1_000_000; seconds -= 1 }        // floor toward negative infinity
+    let days = Int((Double(seconds) / 86_400).rounded(.down))
+    let secondOfDay = Int(seconds - Int64(days) * 86_400)
+    let (year, month, day) = civilFromDays(days)
+    return String(format: "%04d-%02d-%02d %02d:%02d:%02d.%06d+00",
+                  year, month, day,
+                  secondOfDay / 3600, (secondOfDay % 3600) / 60, secondOfDay % 60,
+                  Int(micros))
+}
+
+/// Inverse of `daysFromCivil`: the proleptic Gregorian date for a day count since
+/// 1970-01-01. Howard Hinnant's `civil_from_days`.
+private func civilFromDays(_ days: Int) -> (year: Int, month: Int, day: Int) {
+    let z = days + 719_468
+    let era = (z >= 0 ? z : z - 146_096) / 146_097
+    let dayOfEra = z - era * 146_097                                              // [0, 146096]
+    let yearOfEra = (dayOfEra - dayOfEra / 1460 + dayOfEra / 36_524 - dayOfEra / 146_096) / 365
+    let year = yearOfEra + era * 400
+    let dayOfYear = dayOfEra - (365 * yearOfEra + yearOfEra / 4 - yearOfEra / 100)  // [0, 365]
+    let monthPortion = (5 * dayOfYear + 2) / 153                                  // [0, 11]
+    let day = dayOfYear - (153 * monthPortion + 2) / 5 + 1                        // [1, 31]
+    let month = monthPortion < 10 ? monthPortion + 3 : monthPortion - 9          // [1, 12]
+    return (month <= 2 ? year + 1 : year, month, day)
+}

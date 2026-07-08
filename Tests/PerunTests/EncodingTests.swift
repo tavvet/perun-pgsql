@@ -1,4 +1,5 @@
 import XCTest
+import Foundation
 @testable import PerunPGSQL
 
 /// Binary parameter encoding: the byte-exact wire form for each encodable type,
@@ -61,5 +62,29 @@ final class EncodingTests: XCTestCase {
             0x00, 0x00,                              // 0 result format codes
         ]
         XCTAssertEqual(Array(message.suffix(expectedTail.count)), expectedTail)
+    }
+
+    func testUUIDEncoding() {
+        let uuid = UUID(uuidString: "550e8400-e29b-41d4-a716-446655440000")!
+        XCTAssertEqual(uuid.postgresBinary(),
+                       [0x55, 0x0e, 0x84, 0x00, 0xe2, 0x9b, 0x41, 0xd4,
+                        0xa7, 0x16, 0x44, 0x66, 0x55, 0x44, 0x00, 0x00])
+        XCTAssertEqual(uuid.postgresTypeOID, 2950)
+        XCTAssertEqual(uuid.postgresText?.lowercased(), "550e8400-e29b-41d4-a716-446655440000")
+    }
+
+    func testDateEncoding() throws {
+        // PostgreSQL's epoch (2000-01-01 00:00:00 UTC) → 0 microseconds.
+        let epoch = Date(timeIntervalSince1970: 946_684_800)
+        XCTAssertEqual(epoch.postgresBinary(), [0, 0, 0, 0, 0, 0, 0, 0])
+        XCTAssertEqual(epoch.postgresTypeOID, 1184)
+        XCTAssertEqual(epoch.postgresText, "2000-01-01 00:00:00.000000+00")
+
+        // Encode → decode round-trips to the same instant in both formats.
+        let instant = Date(timeIntervalSince1970: 1_783_457_424.5)   // exact half-second
+        let viaBinary = try Date.decode(instant.postgresBinary()!, oid: PostgresOID.timestamptz, format: .binary)
+        XCTAssertEqual(viaBinary.timeIntervalSince1970, instant.timeIntervalSince1970, accuracy: 0.000_001)
+        let viaText = try Date.decode(Array(instant.postgresText!.utf8), oid: PostgresOID.timestamptz, format: .text)
+        XCTAssertEqual(viaText.timeIntervalSince1970, instant.timeIntervalSince1970, accuracy: 0.000_001)
     }
 }

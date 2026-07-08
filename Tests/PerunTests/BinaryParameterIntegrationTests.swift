@@ -46,6 +46,25 @@ final class BinaryParameterIntegrationTests: XCTestCase {
         await pool.shutdown()
     }
 
+    func testUUIDAndDateParametersRoundTrip() async throws {
+        let configuration = try integrationConfiguration()
+        let pool = PostgresClient(configuration: configuration, maxConnections: 1)
+
+        let uuid = UUID()
+        let date = Date(timeIntervalSince1970: 1_783_457_424.5)
+
+        for format in [PostgresFormat.text, .binary] {
+            let row = try await pool.query("SELECT $1::uuid AS u, $2::timestamptz AS t",
+                                           [uuid, date],
+                                           parameterFormat: format).rows[0]
+            XCTAssertEqual(try row.decode("u", as: UUID.self), uuid, "uuid via \(format)")
+            XCTAssertEqual(try row.decode("t", as: Date.self).timeIntervalSince1970,
+                           date.timeIntervalSince1970, accuracy: 0.000_001, "date via \(format)")
+        }
+
+        await pool.shutdown()
+    }
+
     private func integrationConfiguration() throws -> ConnectionConfiguration {
         let environment = ProcessInfo.processInfo.environment
         guard environment["PERUN_PGSQL_INTEGRATION"] == "1" else {
