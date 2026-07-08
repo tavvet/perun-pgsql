@@ -69,7 +69,7 @@ lines the ORM can rely on and reshape, not an opaque dependency.
 | **Arrays** | One-dimensional array **parameters** (`int8[]`, `text[]`, `uuid[]`, …) via `PostgresArray` — text or binary |
 | **TLS** | `SSLRequest` negotiation + OpenSSL channel; modes = disable / allow plaintext fallback / encrypt without verification / verify full |
 | **Pool** | `PostgresClient` — lazy, bounded, `withConnection {}`, reuse/replace, graceful shutdown |
-| **Concurrency** | Readers-writer wire access (cancellation-aware): concurrent autocommit queries **pipeline** on one connection via a background reader; transactions and other inline reads take it exclusively. Cancelling a parked task fails it cleanly |
+| **Concurrency** | Readers-writer wire access (cancellation-aware): concurrent autocommit queries, `prepare`s and `execute`s **pipeline** on one connection via a background reader; transactions and batches take it exclusively. Cancelling a parked task fails it cleanly |
 | **Extras** | `NoticeResponse` handler, **LISTEN/NOTIFY** via `AsyncStream`, query **cancellation** (`CancelRequest`) |
 
 ## Requirements

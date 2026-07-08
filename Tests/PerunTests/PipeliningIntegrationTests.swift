@@ -28,6 +28,27 @@ final class PipeliningIntegrationTests: XCTestCase {
         try await connection.close()
     }
 
+    func testConcurrentExecutesEachGetTheirOwnResult() async throws {
+        let connection = try await PostgresConnection.connect(integrationConfiguration())
+        let statement = try await connection.prepare("SELECT $1::int AS n")
+
+        // `execute` is shared too, so many executes of one statement pipeline; each must
+        // still get its own reply (the unnamed portal is reused in strict wire order).
+        let results = try await withThrowingTaskGroup(of: (Int, Int).self) { group -> [Int: Int] in
+            for i in 1 ... 50 {
+                group.addTask {
+                    (i, try await connection.execute(statement, [i]).rows[0].decode("n", as: Int.self))
+                }
+            }
+            var byRequest: [Int: Int] = [:]
+            for try await (i, n) in group { byRequest[i] = n }
+            return byRequest
+        }
+
+        for i in 1 ... 50 { XCTAssertEqual(results[i], i, "execute \(i) got another execute's result") }
+        try await connection.close()
+    }
+
     func testConcurrentQueryWaitsForTransactionToCommit() async throws {
         let connection = try await PostgresConnection.connect(integrationConfiguration())
         _ = try? await connection.query("DROP TABLE IF EXISTS perun_pin_test")

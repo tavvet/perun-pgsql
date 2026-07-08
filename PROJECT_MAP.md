@@ -227,13 +227,16 @@ Wire access is a **readers-writer lock** (`acquireShared` / `lock`), because the
 alone is not enough — actors are reentrant across `await`, so without it two tasks could
 interleave protocol messages on one socket.
 
-- **Shared** — the two `query` methods. They pipeline through the background reader, so
-  several can be in flight on one connection at once.
-- **Exclusive** (`lock`) — `prepare`, `execute`, `closePrepared`, pipelined batches,
-  transactions, `waitForNotifications`. These read inline, so they take exclusive access:
-  it drains the in-flight shared queries and blocks new ones, owning the wire while the
-  reader sits idle. Writer priority (shared waits while an exclusive holder is active or
-  waiting) keeps exclusive access from starving.
+- **Shared** — `query`, `prepare`, `execute`, `closePrepared`. Each is a single request
+  with a single `Sync`-delimited reply, so they pipeline through the background reader and
+  several can be in flight on one connection at once. Wire order keeps the reused unnamed
+  statement/portal conflict-free (each request's group is processed before the next).
+- **Exclusive** (`lock`) — pipelined batches, transactions, `waitForNotifications`. These
+  read inline, so they take exclusive access: it drains the in-flight shared queries and
+  blocks new ones, owning the wire while the reader sits idle. Writer priority (shared
+  waits while an exclusive holder is active or waiting) keeps exclusive access from
+  starving. Transactions still pin, so `query`/`execute` from other tasks wait for a
+  BEGIN…COMMIT to finish rather than interleaving into it.
 
 Both waiter kinds are cancellation-aware: cancelled before acquiring, a waiter is dropped
 from its queue and throws `CancellationError` (it never touched the socket). Because a
@@ -243,7 +246,7 @@ back, and throws — so a cancelled task never proceeds holding the wire.
 
 ### Background response reader (transparent pipelining)
 
-The `query` paths do not read their own response inline. A caller takes shared access,
+The shared paths do not read their own response inline. A caller takes shared access,
 enqueues a `PendingRead`, writes its request without awaiting completion (`kickWrite` on
 the write queue), and awaits its result; a background reader task (`readerLoop`) delivers
 responses in FIFO order — the correlation, since v3 has no request IDs. So concurrent

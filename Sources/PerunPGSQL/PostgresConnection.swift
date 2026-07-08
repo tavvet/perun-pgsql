@@ -300,8 +300,12 @@ public actor PostgresConnection {
     /// Parse a statement once so it can be executed repeatedly with different
     /// parameters. The server reports the parameter and result types up front.
     public func prepare(_ sql: String) async throws -> PreparedStatement {
-        try await lock(); defer { unlock() }
-        return try await runPrepare(sql)
+        try await acquireShared(); defer { releaseShared() }
+        let name = nextStatementName()
+        let request = try FrontendMessage.prepare(statement: name, query: sql)
+        return try await runReadOp(sending: request) {
+            try await self.readPrepareResult(name: name)
+        }
     }
 
     /// Execute a prepared statement with the given parameters.
@@ -310,10 +314,14 @@ public actor PostgresConnection {
                         _ parameters: [(any PostgresEncodable)?] = [],
                         parameterFormat: PostgresFormat = .text,
                         resultFormat: PostgresFormat = .text) async throws -> QueryResult {
-        try await lock(); defer { unlock() }
-        return try await runExecute(statement, parameters,
-                                    parameterFormat: parameterFormat,
-                                    resultFormat: resultFormat)
+        try validatePreparedStatement(statement)
+        try await acquireShared(); defer { releaseShared() }
+        let request = try FrontendMessage.execute(statement: statement.name, parameters: parameters,
+                                                  parameterFormat: parameterFormat, resultFormat: resultFormat)
+        let columns = preparedResultColumns(statement, resultFormat: resultFormat)
+        return try await runReadOp(sending: request) {
+            try await self.collectResults(initialColumns: columns)
+        }
     }
 
     /// Pipeline one prepared statement over many parameter sets as a single **atomic**
@@ -377,8 +385,11 @@ public actor PostgresConnection {
 
     /// Release a prepared statement's server-side resources.
     public func closePrepared(_ statement: PreparedStatement) async throws {
-        try await lock(); defer { unlock() }
-        try await runClosePrepared(statement)
+        try validatePreparedStatement(statement)
+        try await acquireShared(); defer { releaseShared() }
+        _ = try await runReadOp(sending: FrontendMessage.closeAndSync(.statement, name: statement.name)) {
+            try await self.collectResults()
+        }
     }
 
     /// Run `body` inside a SQL transaction on this connection.
@@ -556,12 +567,19 @@ public actor PostgresConnection {
         return try await collectResults()
     }
 
-    private func runPrepare(_ sql: String) async throws -> PreparedStatement {
+    private func nextStatementName() -> String {
         preparedStatementCounter += 1
-        let name = "perun_stmt_\(String(connectionID, radix: 16))_\(preparedStatementCounter)"
+        return "perun_stmt_\(String(connectionID, radix: 16))_\(preparedStatementCounter)"
+    }
 
+    private func runPrepare(_ sql: String) async throws -> PreparedStatement {
+        let name = nextStatementName()
         try await send(try FrontendMessage.prepare(statement: name, query: sql))
+        return try await readPrepareResult(name: name)
+    }
 
+    /// Read a `Parse`/`Describe` reply: parameter and row descriptions up to `ReadyForQuery`.
+    private func readPrepareResult(name: String) async throws -> PreparedStatement {
         var parameterTypeOIDs: [Int32] = []
         var columns: [ColumnMetadata] = []
         var pendingError: PostgresServerError?
@@ -608,14 +626,8 @@ public actor PostgresConnection {
                                                    parameters: parameters,
                                                    parameterFormat: parameterFormat,
                                                    resultFormat: resultFormat))
-
-        // Execute alone sends no RowDescription; reuse the columns from prepare.
-        // The prepared statement was described in text, so re-tag the columns as
-        // binary when that's what we asked Bind to return.
-        let columns = resultFormat == .binary
-            ? statement.columns.map { $0.withFormatCode(1) }
-            : statement.columns
-        return try await collectResults(initialColumns: columns)
+        // Execute alone sends no RowDescription; reuse the prepared statement's columns.
+        return try await collectResults(initialColumns: preparedResultColumns(statement, resultFormat: resultFormat))
     }
 
     private func runClosePrepared(_ statement: PreparedStatement) async throws {
