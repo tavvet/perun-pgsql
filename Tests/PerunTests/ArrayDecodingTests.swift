@@ -44,6 +44,22 @@ final class ArrayDecodingTests: XCTestCase {
         XCTAssertEqual(matrix, [[1, 2, 3], [4, 5, 6]])
     }
 
+    func testRejectsMalformedArrays() throws {
+        // Ragged: dimensions come from the first branch ([2,1]) but flattening yields three
+        // elements — the reshape would silently drop the extra one without the count check.
+        XCTAssertThrowsError(try textCell("{{1},{2,3}}", oid: 1007).decodeArray(of: Int.self) as [[Int]])
+        // Trailing content past the closing brace.
+        XCTAssertThrowsError(try textCell("{1,2,3}x", oid: 1007).decodeArray(of: Int.self) as [Int])
+        // Trailing bytes past the last binary element.
+        let binary: [UInt8] = [
+            0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 20,   // ndim 1, flags, int8 element OID
+            0, 0, 0, 1, 0, 0, 0, 1,                // dimension length 1, lower bound 1
+            0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 10,   // one int8 element
+            0,                                      // one byte too many
+        ]
+        XCTAssertThrowsError(try cell(binary, oid: 1016, binary: true).decodeArray(of: Int.self) as [Int])
+    }
+
     func testDimensionalityMismatchThrows() throws {
         XCTAssertThrowsError(try textCell("{{1,2},{3,4}}", oid: 1007).decodeArray(of: Int.self) as [Int])     // 2-D as 1-D
         XCTAssertThrowsError(try textCell("{{{1}}}", oid: 1007).decodeArray(of: Int.self) as [[Int]])         // 3-D as 2-D

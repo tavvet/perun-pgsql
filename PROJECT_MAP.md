@@ -465,7 +465,10 @@ Parameters are sent through `PostgresEncodable`.
   checked against the dimensions (a mismatch throws). `[UInt8]` (bytea) is itself an
   `Array`, so it can't also be a leaf — decode a `bytea[]` column into `[Data]`. Text
   elements get their type OID from the array-OID reverse map; binary carries it in the
-  header. (Swift arrays are 0-based, so the lower bound is dropped.)
+  header. (Swift arrays are 0-based, so the lower bound is dropped.) Malformed input is
+  rejected rather than silently truncated: the reshape must consume exactly the parsed
+  elements (catching a ragged array like `{{1},{2,3}}`), and neither parser tolerates
+  trailing bytes past the last binary element or content past the closing text brace.
 
 Implementation notes:
 
@@ -806,9 +809,10 @@ header) — plus the `Bind` message layout when binary parameters are requested.
 ### `ArrayDecodingTests`
 
 Array-column decoding: the text and binary parsers (quoting, escapes, NULLs, 2-D and 3-D),
-dimensionality mismatches, and a live round-trip (1-D int, text with commas/NULLs, 2-D, 3-D,
-a binary result, multi-dimensional `PostgresArray` parameters round-tripped as text and
-binary, and encode-via-`PostgresArray` then decode back).
+dimensionality mismatches, malformed-array rejection (ragged, trailing bytes/content), and a
+live round-trip (1-D int, text with commas/NULLs, 2-D, 3-D, a binary result, multi-dimensional
+`PostgresArray` parameters round-tripped as text and binary, and encode-via-`PostgresArray`
+then decode back).
 
 ### `PipelineTests`
 

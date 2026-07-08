@@ -46,6 +46,7 @@ private func parseBinaryArray(_ bytes: [UInt8],
         let length = Int(try reader.readInt32())
         elements.append(length < 0 ? nil : try reader.readBytes(length))
     }
+    guard reader.remaining == 0 else { throw fail() }       // no bytes past the last element
     return (elementOID, dimensions, elements)
 }
 
@@ -117,6 +118,8 @@ private func parseTextArray(_ bytes: [UInt8],
         index += 1
     }
     let root = try parseLevel()
+    skipSpaces()
+    guard index == bytes.count else { throw fail() }       // no content past the closing brace
 
     func dimensions(_ nodes: [Node]) -> [Int] {
         guard !nodes.isEmpty else { return [] }
@@ -263,8 +266,12 @@ public extension PostgresCell {
         let parsed = try parsePostgresArray(bytes, arrayOID: column.dataTypeOID, format: format)
         guard !parsed.dimensions.isEmpty else { return [] }        // {} → []
         var index = 0
-        return try [Element]._decodeArrayLevel(parsed.dimensions[...], from: parsed.elements, at: &index,
-                                               oid: parsed.elementOID, format: format, columnName: column.name)
+        let result = try [Element]._decodeArrayLevel(parsed.dimensions[...], from: parsed.elements, at: &index,
+                                                     oid: parsed.elementOID, format: format, columnName: column.name)
+        guard index == parsed.elements.count else {               // a ragged array leaves elements unconsumed
+            throw arrayShapeError(parsed.elementOID, format, "array element count mismatch")
+        }
+        return result
     }
 }
 
