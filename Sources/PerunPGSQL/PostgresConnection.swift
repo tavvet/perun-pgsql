@@ -394,8 +394,8 @@ public actor PostgresConnection {
 
     /// Run `body` inside a SQL transaction on this connection.
     ///
-    /// The wire lock is held for the whole transaction, so no other task can
-    /// interleave statements between `BEGIN` and `COMMIT` / `ROLLBACK`.
+    /// It holds the wire exclusively for the whole transaction, so no other task can
+    /// interleave or pipeline a statement between `BEGIN` and `COMMIT` / `ROLLBACK`.
     public func withTransaction<T: Sendable>(
         _ body: @Sendable (Transaction) async throws -> T
     ) async throws -> T {
@@ -484,8 +484,8 @@ public actor PostgresConnection {
 
     /// Dedicate this connection to reading notifications, yielding each to
     /// `notifications`, until the task is cancelled or the connection closes.
-    /// Holds the wire lock for its whole duration, so run it on a connection you
-    /// reserve for listening.
+    /// Holds the wire exclusively for its whole duration (no query can pipeline while
+    /// it listens), so run it on a connection you reserve for listening.
     public func waitForNotifications() async throws {
         try await lock(); defer { unlock() }
         while true {
@@ -542,7 +542,13 @@ public actor PostgresConnection {
         return quoted
     }
 
-    // MARK: - Request implementations (each assumes the lock is held)
+    // MARK: - Request drivers and response readers
+    //
+    // The `run*` drivers send a request and read its reply inline, so they run under
+    // exclusive access — the transaction and pipelined-batch paths. The `collect*` /
+    // `readPrepareResult` readers are context-neutral: they also serve as the read
+    // closures the background reader runs for the shared, pipelined `query` / `prepare` /
+    // `execute` paths, so they assume neither exclusive access nor the caller's task.
 
     private func runSimpleQuery(_ sql: String) async throws -> QueryResult {
         try await send(FrontendMessage.query(sql))
