@@ -89,6 +89,17 @@ final class ArrayDecodingTests: XCTestCase {
             .rows[0].decodeArray("a", of: UUID.self)
         XCTAssertEqual(uuids, [uuid])
 
+        // A multi-dimensional parameter round-trips through the server, as text …
+        let matrixParam: [[Int]] = try await connection.query("SELECT $1::int8[] AS a", [PostgresArray([[1, 2, 3], [4, 5, 6]])])
+            .rows[0].decodeArray("a", of: Int.self)
+        XCTAssertEqual(matrixParam, [[1, 2, 3], [4, 5, 6]])
+
+        // … and in binary.
+        let matrixBinary: [[Int]] = try await connection.query(
+            "SELECT $1::int8[] AS a", [PostgresArray([[Int64(7), 8], [9, 10]])], parameterFormat: .binary)
+            .rows[0].decodeArray("a", of: Int.self)
+        XCTAssertEqual(matrixBinary, [[7, 8], [9, 10]])
+
         try await connection.close()
     }
 

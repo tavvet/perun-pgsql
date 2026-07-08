@@ -447,10 +447,13 @@ Parameters are sent through `PostgresEncodable`.
   provided for the integer, floating-point, `Bool`, `String`, `UUID`, `Date`
   (timestamptz), `Data`/`[UInt8]` (bytea), `Decimal` (numeric) and `PostgresJSON`
   (json/jsonb) types.
-- One-dimensional arrays are sent through `PostgresArray` (any `PostgresEncodable`
-  elements, `nil` for NULL): the `{…}` text form, or the binary array wire format —
-  `ndim`/flags/element-OID header plus length-framed elements — when every element
-  has a binary form.
+- Arrays are sent through `PostgresArray` (any `PostgresEncodable` elements, `nil` for
+  NULL) in any number of dimensions: a flat row-major element list plus a `dimensions`
+  shape, with ergonomic initializers for 1-D (`[Element]`) and 2-D (`[[Element]]`) and an
+  explicit `init(dimensions:elements:elementTypeOID:)` for higher. It renders nested `{…}`
+  braces (one level per dimension), or the binary array wire format — `ndim`/flags/
+  element-OID header, per-dimension length/lower-bound, then row-major length-framed
+  elements — when every element has a binary form.
 - Array *columns* decode through `decodeArray` on cells and rows (arrays can't use the
   `PostgresDecodable` protocol without clashing with the `[UInt8]` bytea decoder). A
   parser handles both wire formats — recursive descent for the `{…}` text form (including
@@ -792,14 +795,16 @@ constraint name and leaves the connection usable (skipped unless `PERUN_PGSQL_IN
 
 ### `EncodingTests`
 
-Binary parameter encoding: byte-exact wire form for each encodable type, plus the
-`Bind` message layout when binary parameters are requested.
+Parameter encoding: byte-exact text and binary wire form for each encodable type —
+including multi-dimensional arrays (nested `{…}` braces and the multi-dimension binary
+header) — plus the `Bind` message layout when binary parameters are requested.
 
 ### `ArrayDecodingTests`
 
 Array-column decoding: the text parser (quoting, escapes, NULLs, 2-D) and the binary
 parser, dimensionality mismatches, and a live round-trip (1-D int, text with commas/NULLs,
-2-D, a binary result, and encode-via-`PostgresArray` then decode back).
+2-D, a binary result, a multi-dimensional `PostgresArray` parameter round-tripped as text
+and binary, and encode-via-`PostgresArray` then decode back).
 
 ### `PipelineTests`
 

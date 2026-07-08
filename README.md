@@ -66,7 +66,7 @@ lines the ORM can rely on and reshape, not an opaque dependency.
 | **Authentication** | `trust`, cleartext, **MD5**, **SCRAM-SHA-256** — with SHA-256/HMAC/PBKDF2/MD5/Base64 written from scratch |
 | **Queries** | Simple Query, and the extended protocol: `Parse`/`Bind`/`Describe`/`Execute`/`Sync`, prepared statements, `$1` parameters (text or binary), pipelined bulk execution (atomic / independent) |
 | **Types** | `Int*`, `Float`/`Double`, `Bool`, `String`, `Data`/`[UInt8]` (bytea), `UUID`, `Date` (timestamp/timestamptz/date), `Decimal` (numeric), `PostgresJSON` (json/jsonb) — in **both text and binary** formats |
-| **Arrays** | 1-D array **parameters** (`int8[]`, `text[]`, `uuid[]`, …) via `PostgresArray`, and **decoding** columns into `[T]`/`[T?]` (1-D) or `[[T]]` (2-D) via `decodeArray` — text or binary |
+| **Arrays** | Multi-dimensional array **parameters** (`int8[]`, `text[]`, `uuid[]`, …) via `PostgresArray`, and **decoding** columns into `[T]`/`[T?]` (1-D) or `[[T]]` (2-D) via `decodeArray` — text or binary |
 | **TLS** | `SSLRequest` negotiation + OpenSSL channel; modes = disable / allow plaintext fallback / encrypt without verification / verify full |
 | **Pool** | `PostgresClient` — lazy, bounded, `withConnection {}`, reuse/replace, graceful shutdown |
 | **Concurrency** | Readers-writer wire access (cancellation-aware): concurrent autocommit queries, `prepare`s, `execute`s and pipelined batches **pipeline** on one connection via a background reader; transactions take it exclusively. Cancelling a parked task fails it cleanly |
@@ -148,9 +148,10 @@ floating-point, bool, string, `UUID`, `Date`/timestamptz, `Data`/`[UInt8]` (byte
 `Decimal`/numeric and `PostgresJSON` (json/jsonb) values; any other type falls back
 to text).
 
-One-dimensional arrays are sent through `PostgresArray([1, 2, 3])`, which renders the
-`{…}` text form — or the binary array wire format when every element has one. Elements
-are any encodable value, and `nil` is SQL NULL.
+Arrays are sent through `PostgresArray` — `PostgresArray([1, 2, 3])` for one dimension,
+`PostgresArray([[1, 2], [3, 4]])` for two, or `init(dimensions:elements:elementTypeOID:)`
+for higher — rendering the `{…}` text form, or the binary array wire format when every
+element has one. Elements are any encodable value, and `nil` is SQL NULL.
 
 Array columns decode with `decodeArray` — into `[T]`/`[T?]` (one-dimensional) or `[[T]]`
 (two-dimensional), from either wire format:
@@ -304,9 +305,9 @@ Not yet implemented (each on its own merits):
 
 - **Full SASLprep** (RFC 4013) for non-ASCII passwords — currently the identity
   mapping, which is correct for ASCII.
-- **Arrays beyond two dimensions**, and 1-D arrays as parameters only — `PostgresArray`
-  sends 1-D arrays; `decodeArray` reads 1-D and 2-D back, but higher dimensions throw and
-  parameters aren't multi-dimensional.
+- **Decoding arrays beyond two dimensions** — `decodeArray` reads 1-D and 2-D columns
+  back; higher dimensions throw. (Array *parameters* are already multi-dimensional via
+  `PostgresArray`.)
 
 ## License
 

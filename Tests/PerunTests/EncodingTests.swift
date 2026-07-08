@@ -189,4 +189,34 @@ final class EncodingTests: XCTestCase {
         ])
         XCTAssertNil(PostgresArray([Int]()).postgresBinary())                   // empty → text fallback
     }
+
+    func testMultiDimensionalArrayTextEncoding() {
+        // A rectangular 2-D array nests one brace level per dimension.
+        XCTAssertEqual(PostgresArray([[1, 2], [3, 4]]).postgresText, #"{{"1","2"},{"3","4"}}"#)
+        XCTAssertEqual(PostgresArray([[1, 2], [3, 4]]).postgresTypeOID, 1016)   // _int8, any ndim
+        // A NULL element in a 2-D array of optionals.
+        let withNull: [[Int?]] = [[1, nil], [3, 4]]
+        XCTAssertEqual(PostgresArray(withNull).postgresText, #"{{"1",NULL},{"3","4"}}"#)
+        // Three dimensions through the explicit shape initializer.
+        let elements: [PostgresEncodable?] = [1, 2, 3, 4]
+        let cube = PostgresArray(dimensions: [2, 1, 2], elements: elements, elementTypeOID: PostgresOID.int8)
+        XCTAssertEqual(cube.postgresText, #"{{{"1","2"}},{{"3","4"}}}"#)
+    }
+
+    func testMultiDimensionalArrayBinaryEncoding() {
+        // A 2-D int2 array: two dimensions in the header, elements row-major.
+        XCTAssertEqual(PostgresArray([[Int16(1), Int16(2)], [Int16(3), Int16(4)]]).postgresBinary(), [
+            0, 0, 0, 2,        // ndim = 2
+            0, 0, 0, 0,        // flags = 0 (no nulls)
+            0, 0, 0, 21,       // element OID 21 (int2)
+            0, 0, 0, 2,        // dimension 0 length 2
+            0, 0, 0, 1,        // dimension 0 lower bound 1
+            0, 0, 0, 2,        // dimension 1 length 2
+            0, 0, 0, 1,        // dimension 1 lower bound 1
+            0, 0, 0, 2, 0, 1,  // element 1
+            0, 0, 0, 2, 0, 2,  // element 2
+            0, 0, 0, 2, 0, 3,  // element 3
+            0, 0, 0, 2, 0, 4,  // element 4
+        ])
+    }
 }
