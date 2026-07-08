@@ -66,7 +66,7 @@ lines the ORM can rely on and reshape, not an opaque dependency.
 | **Authentication** | `trust`, cleartext, **MD5**, **SCRAM-SHA-256** — with SHA-256/HMAC/PBKDF2/MD5/Base64 written from scratch |
 | **Queries** | Simple Query, and the extended protocol: `Parse`/`Bind`/`Describe`/`Execute`/`Sync`, prepared statements, `$1` parameters (text or binary), pipelined bulk execution (atomic / independent) |
 | **Types** | `Int*`, `Float`/`Double`, `Bool`, `String`, `Data`/`[UInt8]` (bytea), `UUID`, `Date` (timestamp/timestamptz/date), `Decimal` (numeric), `PostgresJSON` (json/jsonb) — in **both text and binary** formats |
-| **Arrays** | One-dimensional array **parameters** (`int8[]`, `text[]`, `uuid[]`, …) via `PostgresArray` — text or binary |
+| **Arrays** | 1-D array **parameters** (`int8[]`, `text[]`, `uuid[]`, …) via `PostgresArray`, and **decoding** columns into `[T]`/`[T?]` (1-D) or `[[T]]` (2-D) via `decodeArray` — text or binary |
 | **TLS** | `SSLRequest` negotiation + OpenSSL channel; modes = disable / allow plaintext fallback / encrypt without verification / verify full |
 | **Pool** | `PostgresClient` — lazy, bounded, `withConnection {}`, reuse/replace, graceful shutdown |
 | **Concurrency** | Readers-writer wire access (cancellation-aware): concurrent autocommit queries, `prepare`s, `execute`s and pipelined batches **pipeline** on one connection via a background reader; transactions take it exclusively. Cancelling a parked task fails it cleanly |
@@ -151,6 +151,15 @@ to text).
 One-dimensional arrays are sent through `PostgresArray([1, 2, 3])`, which renders the
 `{…}` text form — or the binary array wire format when every element has one. Elements
 are any encodable value, and `nil` is SQL NULL.
+
+Array columns decode with `decodeArray` — into `[T]`/`[T?]` (one-dimensional) or `[[T]]`
+(two-dimensional), from either wire format:
+
+```swift
+let tags: [Int]      = try row.decodeArray("tags")             // {1,2,3}
+let names: [String?] = try row.decodeArray("names")            // {a,NULL,b}
+let grid: [[Int]]    = try row.decodeArray("grid")             // {{1,2},{3,4}}
+```
 
 ### Errors
 
@@ -295,8 +304,9 @@ Not yet implemented (each on its own merits):
 
 - **Full SASLprep** (RFC 4013) for non-ASCII passwords — currently the identity
   mapping, which is correct for ASCII.
-- **Multi-dimensional and decoded arrays** — `PostgresArray` sends 1-D arrays as
-  parameters; reading arrays back into `[T]` and nested arrays are not done.
+- **Arrays beyond two dimensions**, and 1-D arrays as parameters only — `PostgresArray`
+  sends 1-D arrays; `decodeArray` reads 1-D and 2-D back, but higher dimensions throw and
+  parameters aren't multi-dimensional.
 
 ## License
 

@@ -434,7 +434,8 @@ Supported built-in type families:
 - bytea as `[UInt8]` and `Data`;
 - UUID;
 - date/timestamp/timestamptz as `Date`;
-- numeric as `Decimal`.
+- numeric as `Decimal`;
+- arrays of any of the above (`decodeArray`, 1-D and 2-D).
 
 Parameters are sent through `PostgresEncodable`.
 
@@ -449,7 +450,14 @@ Parameters are sent through `PostgresEncodable`.
 - One-dimensional arrays are sent through `PostgresArray` (any `PostgresEncodable`
   elements, `nil` for NULL): the `{…}` text form, or the binary array wire format —
   `ndim`/flags/element-OID header plus length-framed elements — when every element
-  has a binary form. Decoding arrays back into Swift arrays is not provided.
+  has a binary form.
+- Array *columns* decode through `decodeArray` on cells and rows (arrays can't use the
+  `PostgresDecodable` protocol without clashing with the `[UInt8]` bytea decoder). A
+  parser handles both wire formats — recursive descent for the `{…}` text form, header +
+  row-major elements for binary — producing flat elements plus a dimension list, which the
+  typed overloads reshape into `[T]` / `[T?]` (1-D) or `[[T]]` / `[[T?]]` (2-D). Higher
+  dimensions throw. Text elements get their type OID from the array-OID reverse map;
+  binary carries it in the header.
 
 Implementation notes:
 
@@ -785,6 +793,12 @@ constraint name and leaves the connection usable (skipped unless `PERUN_PGSQL_IN
 
 Binary parameter encoding: byte-exact wire form for each encodable type, plus the
 `Bind` message layout when binary parameters are requested.
+
+### `ArrayDecodingTests`
+
+Array-column decoding: the text parser (quoting, escapes, NULLs, 2-D) and the binary
+parser, dimensionality mismatches, and a live round-trip (1-D int, text with commas/NULLs,
+2-D, a binary result, and encode-via-`PostgresArray` then decode back).
 
 ### `PipelineTests`
 
