@@ -34,6 +34,7 @@ Sources/
   PerunPGSQL/
     PostgresConnection.swift
     PostgresClient.swift
+    RowStream.swift
     Result.swift
     Statement.swift
     Encoding.swift
@@ -242,9 +243,10 @@ interleave protocol messages on one socket.
   they pipeline through the background reader and several can be in flight on one connection
   at once. Wire order keeps the reused unnamed statement/portal conflict-free, and a batch's
   bytes are contiguous, so a concurrent query can't interleave into its implicit transaction.
-- **Exclusive** (`lock`) — transactions and `waitForNotifications`. These read inline (a
-  transaction spans several requests), so they take exclusive access: it drains the in-flight
-  shared queries and blocks new ones, owning the wire while the reader sits idle. Writer
+- **Exclusive** (`lock`) — transactions, `waitForNotifications`, and row streaming. These
+  read inline over multiple requests (a transaction spans several; a stream is consumed over
+  time), so they take exclusive access: it drains the in-flight shared queries and blocks new
+  ones, owning the wire while the reader sits idle. Writer
   priority (shared waits while an exclusive holder is active or waiting) keeps exclusive
   access from starving. So `query`/`execute`/batches from other tasks wait for a BEGIN…COMMIT
   to finish rather than interleaving into it.
@@ -291,6 +293,28 @@ means "we asked to cancel", not "the query did not execute" — so a side-effect
 may have committed. (Gating `CancelRequest` on the write having landed, or skipping the
 write on a late cancel, would only narrow the window at the cost of an actor hop per query
 or a new off-actor race — not a real guarantee, so it is documented rather than chased.)
+
+### Row streaming
+
+`queryStream` returns a `PostgresRowStream` (an `AsyncSequence` of `PostgresRow`) that reads
+a large result lazily instead of buffering it. It takes **exclusive** access — the stream
+owns the wire until it ends, like a transaction — and reads inline over the extended protocol
+with a **named portal** fetched in bounded chunks: `Execute(maxRows: chunkSize)` + `Flush` per
+chunk, keeping the portal open across chunks (no `Sync`) so the implicit transaction spans the
+whole stream. Rows are **pulled on demand** (`nextStreamRow`): each `for await` step reads until
+one `DataRow` (return it), crossing chunk boundaries transparently — a `PortalSuspended` asks
+for the next chunk, a `CommandComplete` closes the portal (`Close` + `Sync`) — until
+`ReadyForQuery` ends it (`nil`). Backpressure is real: a slow consumer stops pulling, so the
+socket buffer fills and the server blocks on its write. Memory is bounded to about one chunk.
+
+Early termination is clean because chunking gives the server natural stop points: dropping the
+stream (a `break`, or letting it go) runs `finishStream` from the `StreamCleanup` `deinit`,
+which `Close`s the portal, `Sync`s, and drains the in-flight chunk (≤ `chunkSize` rows) to
+`ReadyForQuery`, then frees the wire — so the connection is immediately reusable. A mid-stream
+server error is handled the same way (drain to `ReadyForQuery`, then throw). `endStream`
+releases the exclusive hold; a wire/IO failure tears the connection down instead. Streaming
+inside `withTransaction` on the same connection would deadlock on `lock`, so it is a top-level
+connection operation.
 
 ### Simple Query
 
@@ -870,6 +894,10 @@ environment variables.
 - `PipeliningIntegrationTests`: concurrent queries / executes on one connection each get
   their own reply (correlation under pipelining); a batch pipelines with queries yet stays
   atomic; and a transaction pins a concurrent query out until it commits.
+- `StreamingIntegrationTests`: `queryStream` matches the buffered result across many chunks;
+  parameters with a one-row chunk size; an empty result; an early `break` frees the wire and
+  the connection is reusable; and a mid-stream server error surfaces and leaves the connection
+  in sync.
 
 ## Local Verification
 

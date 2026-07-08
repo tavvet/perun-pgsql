@@ -168,6 +168,13 @@ enum FrontendMessage {
         frame(tag: "S", body: [])
     }
 
+    /// `Flush`: force the server to send any buffered output without closing the
+    /// current transaction step (unlike `Sync`). Used to read one chunk of a portal
+    /// at a time while keeping it open for the next `Execute`.
+    static func flush() -> [UInt8] {
+        frame(tag: "H", body: [])
+    }
+
     static func parameterizedQuery(query: String,
                                    parameters: [(any PostgresEncodable)?],
                                    parameterFormat: PostgresFormat = .text,

@@ -64,7 +64,7 @@ lines the ORM can rely on and reshape, not an opaque dependency.
 | **Sockets** | Raw POSIX (`Darwin`/`Glibc`), blocking calls bridged to async/await off the cooperative pool |
 | **Wire protocol** | v3 framing, all frontend/backend messages, simple + extended query |
 | **Authentication** | `trust`, cleartext, **MD5**, **SCRAM-SHA-256** — with SHA-256/HMAC/PBKDF2/MD5/Base64 written from scratch |
-| **Queries** | Simple Query, and the extended protocol: `Parse`/`Bind`/`Describe`/`Execute`/`Sync`, prepared statements, `$1` parameters (text or binary), pipelined bulk execution (atomic / independent) |
+| **Queries** | Simple Query, and the extended protocol: `Parse`/`Bind`/`Describe`/`Execute`/`Sync`, prepared statements, `$1` parameters (text or binary), pipelined bulk execution (atomic / independent), and row **streaming** for large results |
 | **Types** | `Int*`, `Float`/`Double`, `Bool`, `String`, `Data`/`[UInt8]` (bytea), `UUID`, `Date` (timestamp/timestamptz/date), `Decimal` (numeric), `PostgresJSON` (json/jsonb) — in **both text and binary** formats |
 | **Arrays** | Multi-dimensional array **parameters** (`int8[]`, `text[]`, `uuid[]`, …) via `PostgresArray`, and **decoding** columns into `[T]`, `[[T]]`, `[[[T]]]` and deeper via `decodeArray` — text or binary |
 | **TLS** | `SSLRequest` negotiation + OpenSSL channel; modes = disable / allow plaintext fallback / encrypt without verification / verify full |
@@ -131,6 +131,29 @@ try await conn.pipeline([
 Commands can't depend on each other's results (all are sent before any reply is read),
 and the batch should have small per-command results — pipelining is for bulk
 `INSERT`/`UPDATE`, not for fetching large result sets.
+
+### Streaming large results
+
+For the other direction — a result too big to hold in memory — `queryStream` returns an
+`AsyncSequence` of rows fetched in bounded chunks, so you process the result one row at a
+time and a slow consumer throttles the server instead of filling memory:
+
+```swift
+for try await row in try await conn.queryStream("SELECT id, body FROM documents") {
+    try index(row.decode("id", as: Int.self), row.decode("body", as: String.self))
+}
+```
+
+The stream holds the connection exclusively until it ends (like a transaction), so no
+other query runs on it meanwhile; `chunkSize:` tunes rows-per-round-trip. Stopping early
+(a `break` or a thrown error) closes the server-side portal and frees the connection — it
+stays usable:
+
+```swift
+for try await row in try await conn.queryStream("SELECT * FROM events", chunkSize: 1000) {
+    if try row.decode("kind", as: String.self) == "target" { return row }   // break → connection reusable
+}
+```
 
 ### Typed decoding (text or binary)
 
@@ -305,8 +328,6 @@ concerns for code built *on top* of the driver, not for the driver itself.
 
 Possible extensions (the driver is complete for its scope — these are additive, not gaps):
 
-- **Row streaming** for large results — an `AsyncSequence` of rows via portals, instead
-  of materializing the whole result set.
 - **COPY protocol** (`COPY … TO/FROM STDIN`) for bulk load and dump.
 - **More scalar types** — `interval`, `time`/`timetz`, `inet`/`cidr`, range and composite
   types.

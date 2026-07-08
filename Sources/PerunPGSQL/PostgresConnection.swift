@@ -297,6 +297,53 @@ public actor PostgresConnection {
         }
     }
 
+    /// Stream a query's rows instead of buffering the whole result set in memory.
+    ///
+    /// Returns a `PostgresRowStream` to consume with `for try await`. The rows are
+    /// fetched from the server in bounded chunks (`chunkSize` rows per round trip) and
+    /// delivered on demand, so a large result never has to fit in memory at once and a
+    /// slow consumer throttles the server (rather than the reverse).
+    ///
+    /// The stream holds this connection's wire **exclusively** until it ends — like a
+    /// transaction, no other query runs on the connection while a stream is open — so
+    /// consume it promptly and don't start a stream inside `withTransaction` on the same
+    /// connection. Stopping early (a `break` or an error) closes the portal and frees the
+    /// wire. `$1…$n` parameters and `resultFormat` work exactly as in `query`.
+    public func queryStream(_ sql: String,
+                            _ parameters: [(any PostgresEncodable)?] = [],
+                            parameterFormat: PostgresFormat = .text,
+                            resultFormat: PostgresFormat = .text,
+                            chunkSize: Int = 512) async throws -> PostgresRowStream {
+        let chunk = Int32(clamping: max(1, chunkSize))
+        try await lock()                         // exclusive; released when the stream ends
+        do {
+            guard !isClosed else { throw PerunError.connectionClosed }
+            streamPortalCounter += 1
+            let portal = "perun_stream_\(String(connectionID, radix: 16))_\(streamPortalCounter)"
+            // Binary parameters need declared type OIDs; text lets the server infer.
+            let typeOIDs: [Int32] = parameterFormat == .binary ? parameters.map { $0?.postgresTypeOID ?? 0 } : []
+            var request = try FrontendMessage.parse(statement: "", query: sql, parameterTypeOIDs: typeOIDs)
+            request += try FrontendMessage.bind(portal: portal, statement: "", parameters: parameters,
+                                                parameterFormat: parameterFormat, resultFormat: resultFormat)
+            request += FrontendMessage.describe(.portal, name: portal)
+            request += FrontendMessage.execute(portal: portal, maxRows: chunk)
+            request += FrontendMessage.flush()
+            try await send(request)
+
+            streamActive = true
+            streamPortal = portal
+            streamChunkSize = chunk
+            streamColumns = []
+            streamColumnIndex = [:]
+            streamTerminating = false
+            streamPendingError = nil
+            return PostgresRowStream(connection: self)
+        } catch {
+            unlock()
+            throw error
+        }
+    }
+
     /// Parse a statement once so it can be executed repeatedly with different
     /// parameters. The server reports the parameter and result types up front.
     public func prepare(_ sql: String) async throws -> PreparedStatement {
@@ -1109,6 +1156,135 @@ public actor PostgresConnection {
             throw PerunError.server(pendingError)
         }
         return QueryResult(columns: columns, values: rowValues, commandTag: commandTag)
+    }
+
+    // MARK: - Row streaming
+    //
+    // A stream holds the wire exclusively (like a transaction) and reads inline, one
+    // portal chunk at a time: `Execute(maxRows)` + `Flush` per chunk, keeping the named
+    // portal open across chunks (no `Sync`) until it is exhausted or the consumer stops.
+    // `nextStreamRow` is the consumer's pull; `finishStream` is the abandon path called
+    // from the stream's `deinit`.
+
+    private var streamActive = false
+    private var streamPortal = ""
+    private var streamChunkSize: Int32 = 0
+    private var streamColumns: [ColumnMetadata] = []
+    private var streamColumnIndex: [String: Int] = [:]
+    private var streamTerminating = false            // terminating Sync sent; draining to ReadyForQuery
+    private var streamPendingError: PostgresServerError?
+    private var streamPortalCounter = 0
+
+    /// The consumer pulled the next row. Read inline until a DataRow (return it), the end
+    /// (ReadyForQuery → nil), or an error. Chunk boundaries are crossed transparently: a
+    /// PortalSuspended asks for the next chunk; a CommandComplete closes the portal.
+    func nextStreamRow() async throws -> PostgresRow? {
+        guard streamActive else { return nil }
+        do {
+            while true {
+                let message = try await readMessage()
+                switch message {
+                case let .dataRow(values) where !streamTerminating:
+                    return PostgresRow(values: values, columns: streamColumns, columnIndexByName: streamColumnIndex)
+
+                case let .rowDescription(fields):
+                    streamColumns = fields.map(ColumnMetadata.init)
+                    streamColumnIndex = PostgresRow.makeColumnIndexByName(streamColumns)
+
+                case .portalSuspended where !streamTerminating:
+                    // Chunk boundary: request the next chunk and keep reading.
+                    try await send(FrontendMessage.execute(portal: streamPortal, maxRows: streamChunkSize)
+                                   + FrontendMessage.flush())
+
+                case .commandComplete, .emptyQueryResponse:
+                    // Portal exhausted: close it and end the implicit transaction.
+                    if !streamTerminating {
+                        streamTerminating = true
+                        try await send(FrontendMessage.close(.portal, name: streamPortal) + FrontendMessage.sync())
+                    }
+
+                case let .errorResponse(error):
+                    if streamPendingError == nil { streamPendingError = error }
+                    if !streamTerminating {          // leave the error state and get ReadyForQuery
+                        streamTerminating = true
+                        try await send(FrontendMessage.sync())
+                    }
+
+                case let .parameterStatus(name, value):
+                    parameters[name] = value
+
+                case let .noticeResponse(notice):
+                    noticeHandler?(notice)
+
+                case let .notificationResponse(processID, channel, payload):
+                    notificationContinuation.yield(
+                        PostgresNotification(processID: processID, channel: channel, payload: payload))
+
+                case let .readyForQuery(status):
+                    transactionStatus = status
+                    let error = streamPendingError
+                    endStream()
+                    if let error { throw PerunError.server(error) }
+                    return nil
+
+                default:
+                    continue                          // a DataRow while draining, and acknowledgements
+                }
+            }
+        } catch {
+            // A clean server error already ran endStream (the wire is still in sync);
+            // anything else is a wire/IO failure mid-stream, so tear the connection down.
+            if streamActive {
+                if !isClosed { forceClose() }
+                streamActive = false
+            }
+            throw error
+        }
+    }
+
+    /// The consumer abandoned the stream (its `deinit`). If it is still open, close the
+    /// portal, drain the current chunk to ReadyForQuery, and free the wire. Idempotent — a
+    /// stream consumed to its end already finished, so this is a no-op.
+    func finishStream() async {
+        guard streamActive else { return }
+        do {
+            if !streamTerminating {
+                streamTerminating = true
+                try await send(FrontendMessage.close(.portal, name: streamPortal) + FrontendMessage.sync())
+            }
+            while streamActive {
+                switch try await readMessage() {
+                case let .readyForQuery(status):
+                    transactionStatus = status
+                    endStream()
+                case let .parameterStatus(name, value):
+                    parameters[name] = value
+                case let .noticeResponse(notice):
+                    noticeHandler?(notice)
+                case let .notificationResponse(processID, channel, payload):
+                    notificationContinuation.yield(
+                        PostgresNotification(processID: processID, channel: channel, payload: payload))
+                default:
+                    continue                          // discard the remaining rows / acknowledgements
+                }
+            }
+        } catch {
+            if !isClosed { forceClose() }
+            streamActive = false
+        }
+    }
+
+    /// Finish a stream whose wire is still in sync: reset its state and release the
+    /// exclusive hold.
+    private func endStream() {
+        guard streamActive else { return }
+        streamActive = false
+        streamTerminating = false
+        streamColumns = []
+        streamColumnIndex = [:]
+        streamPendingError = nil
+        streamPortal = ""
+        unlock()
     }
 
     /// Close the connection and release its socket. Also interrupts any in-flight
