@@ -409,6 +409,14 @@ Builds client messages:
 - Sync
 - Terminate
 
+Extended-query batches are built into one `ByteWriter` with in-place frame
+length back-patching:
+
+- `parameterizedQuery(query:parameters:resultFormat:)`
+- `prepare(statement:query:)`
+- `execute(statement:parameters:resultFormat:)`
+- `closeAndSync(_:name:)`
+
 Notable guard:
 
 - Parse/Bind count fields are encoded as unsigned 16-bit values on the wire.

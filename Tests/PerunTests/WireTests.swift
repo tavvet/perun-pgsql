@@ -63,4 +63,44 @@ final class WireTests: XCTestCase {
             }
         }
     }
+
+    func testParameterizedQueryBatchMatchesIndividualMessages() throws {
+        let parameters: [(any PostgresEncodable)?] = [42, "hello", nil]
+        var expected = try FrontendMessage.parse(statement: "", query: "SELECT $1, $2, $3")
+        expected += try FrontendMessage.bind(portal: "",
+                                             statement: "",
+                                             parameters: parameters,
+                                             resultFormat: .binary)
+        expected += FrontendMessage.describe(.portal, name: "")
+        expected += FrontendMessage.execute(portal: "")
+        expected += FrontendMessage.sync()
+
+        XCTAssertEqual(try FrontendMessage.parameterizedQuery(query: "SELECT $1, $2, $3",
+                                                              parameters: parameters,
+                                                              resultFormat: .binary),
+                       expected)
+    }
+
+    func testPreparedStatementBatchesMatchIndividualMessages() throws {
+        let name = "perun_stmt_test"
+
+        var expectedPrepare = try FrontendMessage.parse(statement: name, query: "SELECT $1")
+        expectedPrepare += FrontendMessage.describe(.statement, name: name)
+        expectedPrepare += FrontendMessage.sync()
+        XCTAssertEqual(try FrontendMessage.prepare(statement: name, query: "SELECT $1"), expectedPrepare)
+
+        var expectedExecute = try FrontendMessage.bind(portal: "",
+                                                       statement: name,
+                                                       parameters: [7],
+                                                       resultFormat: .text)
+        expectedExecute += FrontendMessage.execute(portal: "")
+        expectedExecute += FrontendMessage.sync()
+        XCTAssertEqual(try FrontendMessage.execute(statement: name,
+                                                   parameters: [7],
+                                                   resultFormat: .text),
+                       expectedExecute)
+
+        XCTAssertEqual(FrontendMessage.closeAndSync(.statement, name: name),
+                       FrontendMessage.close(.statement, name: name) + FrontendMessage.sync())
+    }
 }

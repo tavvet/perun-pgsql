@@ -11,6 +11,10 @@ struct ByteWriter {
         bytes.reserveCapacity(capacity)
     }
 
+    mutating func reserveCapacity(_ capacity: Int) {
+        bytes.reserveCapacity(capacity)
+    }
+
     mutating func writeUInt8(_ value: UInt8) {
         bytes.append(value)
     }
@@ -42,6 +46,26 @@ struct ByteWriter {
     mutating func writeCString(_ string: String) {
         bytes.append(contentsOf: string.utf8)
         bytes.append(0)
+    }
+
+    mutating func beginFrame(tag: UInt8) -> Int {
+        writeUInt8(tag)
+        let lengthOffset = bytes.count
+        writeInt32(0)
+        return lengthOffset
+    }
+
+    mutating func endFrame(lengthOffset: Int) {
+        let length = bytes.count - lengthOffset
+        patchInt32(Int32(length), at: lengthOffset)
+    }
+
+    private mutating func patchInt32(_ value: Int32, at offset: Int) {
+        let u = UInt32(bitPattern: value)
+        bytes[offset] = UInt8(truncatingIfNeeded: u >> 24)
+        bytes[offset + 1] = UInt8(truncatingIfNeeded: u >> 16)
+        bytes[offset + 2] = UInt8(truncatingIfNeeded: u >> 8)
+        bytes[offset + 3] = UInt8(truncatingIfNeeded: u)
     }
 }
 

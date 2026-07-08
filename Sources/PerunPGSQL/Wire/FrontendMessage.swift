@@ -109,10 +109,7 @@ enum FrontendMessage {
             throw PerunError.tooManyParameters(count: parameterTypeOIDs.count)
         }
         var body = ByteWriter()
-        body.writeCString(statement)
-        body.writeCString(query)
-        body.writeInt16(Int16(bitPattern: UInt16(parameterTypeOIDs.count)))
-        for oid in parameterTypeOIDs { body.writeInt32(oid) }
+        appendParseBody(to: &body, statement: statement, query: query, parameterTypeOIDs: parameterTypeOIDs)
         return frame(tag: "P", body: body.bytes)
     }
 
@@ -132,27 +129,11 @@ enum FrontendMessage {
             throw PerunError.tooManyParameters(count: parameters.count)
         }
         var body = ByteWriter()
-        body.writeCString(portal)
-        body.writeCString(statement)
-        body.writeInt16(0)                                              // parameter format codes: all text
-        body.writeInt16(Int16(bitPattern: UInt16(parameters.count)))   // parameter values
-        for parameter in parameters {
-            if let text = parameter?.postgresText {
-                let bytes = Array(text.utf8)
-                body.writeInt32(Int32(bytes.count))
-                body.writeBytes(bytes)
-            } else {
-                body.writeInt32(-1)                 // SQL NULL
-            }
-        }
-        // Result format codes: one code applied to all columns. Zero codes would
-        // also mean "all text"; we send an explicit single code either way.
-        if resultFormat == .binary {
-            body.writeInt16(1)
-            body.writeInt16(1)                      // 1 = binary, for every column
-        } else {
-            body.writeInt16(0)                      // all text
-        }
+        appendBindBody(to: &body,
+                       portal: portal,
+                       statement: statement,
+                       parameters: parameters,
+                       resultFormat: resultFormat)
         return frame(tag: "B", body: body.bytes)
     }
 
@@ -185,6 +166,49 @@ enum FrontendMessage {
         frame(tag: "S", body: [])
     }
 
+    static func parameterizedQuery(query: String,
+                                   parameters: [(any PostgresEncodable)?],
+                                   resultFormat: PostgresFormat) throws -> [UInt8] {
+        var request = ByteWriter(reservingCapacity: estimatedExtendedQueryCapacity(query: query,
+                                                                                  statement: "",
+                                                                                  parameters: parameters))
+        try appendParse(to: &request, statement: "", query: query)
+        try appendBind(to: &request, portal: "", statement: "", parameters: parameters, resultFormat: resultFormat)
+        appendDescribe(to: &request, .portal, name: "")
+        appendExecute(to: &request, portal: "")
+        appendSync(to: &request)
+        return request.bytes
+    }
+
+    static func prepare(statement: String, query: String) throws -> [UInt8] {
+        var request = ByteWriter(reservingCapacity: estimatedExtendedQueryCapacity(query: query,
+                                                                                  statement: statement,
+                                                                                  parameters: []))
+        try appendParse(to: &request, statement: statement, query: query)
+        appendDescribe(to: &request, .statement, name: statement)
+        appendSync(to: &request)
+        return request.bytes
+    }
+
+    static func execute(statement: String,
+                        parameters: [(any PostgresEncodable)?],
+                        resultFormat: PostgresFormat) throws -> [UInt8] {
+        var request = ByteWriter(reservingCapacity: estimatedExtendedQueryCapacity(query: "",
+                                                                                  statement: statement,
+                                                                                  parameters: parameters))
+        try appendBind(to: &request, portal: "", statement: statement, parameters: parameters, resultFormat: resultFormat)
+        appendExecute(to: &request, portal: "")
+        appendSync(to: &request)
+        return request.bytes
+    }
+
+    static func closeAndSync(_ target: StatementOrPortal, name: String) -> [UInt8] {
+        var request = ByteWriter(reservingCapacity: name.utf8.count + 16)
+        appendClose(to: &request, target, name: name)
+        appendSync(to: &request)
+        return request.bytes
+    }
+
     /// Politely tell the server we're done.
     static func terminate() -> [UInt8] {
         frame(tag: "X", body: [])
@@ -197,5 +221,112 @@ enum FrontendMessage {
         message.writeInt32(Int32(body.count + 4))
         message.writeBytes(body)
         return message.bytes
+    }
+
+    private static func appendParse(to writer: inout ByteWriter,
+                                    statement: String,
+                                    query: String,
+                                    parameterTypeOIDs: [Int32] = []) throws {
+        guard parameterTypeOIDs.count <= 65535 else {
+            throw PerunError.tooManyParameters(count: parameterTypeOIDs.count)
+        }
+        appendFrame(to: &writer, tag: "P") { body in
+            appendParseBody(to: &body, statement: statement, query: query, parameterTypeOIDs: parameterTypeOIDs)
+        }
+    }
+
+    private static func appendParseBody(to writer: inout ByteWriter,
+                                        statement: String,
+                                        query: String,
+                                        parameterTypeOIDs: [Int32]) {
+        writer.writeCString(statement)
+        writer.writeCString(query)
+        writer.writeInt16(Int16(bitPattern: UInt16(parameterTypeOIDs.count)))
+        for oid in parameterTypeOIDs { writer.writeInt32(oid) }
+    }
+
+    private static func appendBind(to writer: inout ByteWriter,
+                                   portal: String,
+                                   statement: String,
+                                   parameters: [(any PostgresEncodable)?],
+                                   resultFormat: PostgresFormat) throws {
+        guard parameters.count <= 65535 else {
+            throw PerunError.tooManyParameters(count: parameters.count)
+        }
+        appendFrame(to: &writer, tag: "B") { body in
+            appendBindBody(to: &body,
+                           portal: portal,
+                           statement: statement,
+                           parameters: parameters,
+                           resultFormat: resultFormat)
+        }
+    }
+
+    private static func appendBindBody(to writer: inout ByteWriter,
+                                       portal: String,
+                                       statement: String,
+                                       parameters: [(any PostgresEncodable)?],
+                                       resultFormat: PostgresFormat) {
+        writer.writeCString(portal)
+        writer.writeCString(statement)
+        writer.writeInt16(0)                                             // parameter format codes: all text
+        writer.writeInt16(Int16(bitPattern: UInt16(parameters.count)))   // parameter values
+        for parameter in parameters {
+            if let text = parameter?.postgresText {
+                writer.writeInt32(Int32(text.utf8.count))
+                writer.writeString(text)
+            } else {
+                writer.writeInt32(-1)                 // SQL NULL
+            }
+        }
+        // Result format codes: one code applied to all columns. Zero codes would
+        // also mean "all text"; we send an explicit single code either way.
+        if resultFormat == .binary {
+            writer.writeInt16(1)
+            writer.writeInt16(1)                      // 1 = binary, for every column
+        } else {
+            writer.writeInt16(0)                      // all text
+        }
+    }
+
+    private static func appendDescribe(to writer: inout ByteWriter, _ target: StatementOrPortal, name: String) {
+        appendFrame(to: &writer, tag: "D") {
+            $0.writeUInt8(target.tag)
+            $0.writeCString(name)
+        }
+    }
+
+    private static func appendExecute(to writer: inout ByteWriter, portal: String, maxRows: Int32 = 0) {
+        appendFrame(to: &writer, tag: "E") {
+            $0.writeCString(portal)
+            $0.writeInt32(maxRows)
+        }
+    }
+
+    private static func appendClose(to writer: inout ByteWriter, _ target: StatementOrPortal, name: String) {
+        appendFrame(to: &writer, tag: "C") {
+            $0.writeUInt8(target.tag)
+            $0.writeCString(name)
+        }
+    }
+
+    private static func appendSync(to writer: inout ByteWriter) {
+        appendFrame(to: &writer, tag: "S") { _ in }
+    }
+
+    private static func appendFrame(to writer: inout ByteWriter,
+                                    tag: Character,
+                                    writeBody: (inout ByteWriter) -> Void) {
+        let lengthOffset = writer.beginFrame(tag: tag.asciiValue!)
+        writeBody(&writer)
+        writer.endFrame(lengthOffset: lengthOffset)
+    }
+
+    private static func estimatedExtendedQueryCapacity(query: String,
+                                                       statement: String,
+                                                       parameters: [(any PostgresEncodable)?]) -> Int {
+        var capacity = query.utf8.count + statement.utf8.count + 64
+        capacity += parameters.count * 16
+        return capacity
     }
 }

@@ -451,13 +451,9 @@ public actor PostgresConnection {
             return try await runSimpleQuery(sql)
         }
 
-        var request = try FrontendMessage.parse(statement: "", query: sql)
-        request += try FrontendMessage.bind(portal: "", statement: "",
-                                            parameters: parameters, resultFormat: resultFormat)
-        request += FrontendMessage.describe(.portal, name: "")
-        request += FrontendMessage.execute(portal: "")
-        request += FrontendMessage.sync()
-        try await send(request)
+        try await send(try FrontendMessage.parameterizedQuery(query: sql,
+                                                              parameters: parameters,
+                                                              resultFormat: resultFormat))
 
         return try await collectResults()
     }
@@ -466,10 +462,7 @@ public actor PostgresConnection {
         preparedStatementCounter += 1
         let name = "perun_stmt_\(String(connectionID, radix: 16))_\(preparedStatementCounter)"
 
-        var request = try FrontendMessage.parse(statement: name, query: sql)
-        request += FrontendMessage.describe(.statement, name: name)
-        request += FrontendMessage.sync()
-        try await send(request)
+        try await send(try FrontendMessage.prepare(statement: name, query: sql))
 
         var parameterTypeOIDs: [Int32] = []
         var columns: [ColumnMetadata] = []
@@ -512,11 +505,9 @@ public actor PostgresConnection {
                             _ parameters: [(any PostgresEncodable)?],
                             resultFormat: PostgresFormat) async throws -> QueryResult {
         try validatePreparedStatement(statement)
-        var request = try FrontendMessage.bind(portal: "", statement: statement.name,
-                                               parameters: parameters, resultFormat: resultFormat)
-        request += FrontendMessage.execute(portal: "")
-        request += FrontendMessage.sync()
-        try await send(request)
+        try await send(try FrontendMessage.execute(statement: statement.name,
+                                                   parameters: parameters,
+                                                   resultFormat: resultFormat))
 
         // Execute alone sends no RowDescription; reuse the columns from prepare.
         // The prepared statement was described in text, so re-tag the columns as
@@ -529,9 +520,7 @@ public actor PostgresConnection {
 
     private func runClosePrepared(_ statement: PreparedStatement) async throws {
         try validatePreparedStatement(statement)
-        var request = FrontendMessage.close(.statement, name: statement.name)
-        request += FrontendMessage.sync()
-        try await send(request)
+        try await send(FrontendMessage.closeAndSync(.statement, name: statement.name))
         _ = try await collectResults()
     }
 
