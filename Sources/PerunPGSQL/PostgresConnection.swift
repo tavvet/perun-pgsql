@@ -264,7 +264,7 @@ public actor PostgresConnection {
     /// statements; the result reflects the last statement that produced rows.
     @discardableResult
     public func query(_ sql: String) async throws -> QueryResult {
-        try await lock(); defer { unlock() }
+        try await acquireShared(); defer { releaseShared() }
         return try await runReadOp(sending: FrontendMessage.query(sql)) {
             try await self.collectResults()
         }
@@ -282,7 +282,7 @@ public actor PostgresConnection {
                       _ parameters: [(any PostgresEncodable)?],
                       parameterFormat: PostgresFormat = .text,
                       resultFormat: PostgresFormat = .text) async throws -> QueryResult {
-        try await lock(); defer { unlock() }
+        try await acquireShared(); defer { releaseShared() }
         // No parameters and text results → Simple Query is one round trip lighter.
         if parameters.isEmpty && resultFormat == .text {
             return try await runReadOp(sending: FrontendMessage.query(sql)) {
@@ -857,61 +857,131 @@ public actor PostgresConnection {
         }
     }
 
-    // MARK: - Wire serialization lock (FIFO async mutex)
+    // MARK: - Shared / exclusive wire access
+    //
+    // Autocommit `query` calls take SHARED access: they pipeline through the background
+    // reader, so several can be in flight at once. Everything that reads inline —
+    // transactions, prepare, execute, pipelined batches, `waitForNotifications` — takes
+    // EXCLUSIVE access (`lock`), which drains the in-flight shared queries and blocks new
+    // ones, so it owns the wire while the reader sits idle. A readers-writer lock with
+    // writer priority; both waiter kinds are cancellation-aware.
 
-    private var lockHeld = false
-    private var lockWaiters: [(id: UInt64, continuation: CheckedContinuation<Void, Error>)] = []
-    private var nextLockWaiterID: UInt64 = 0
+    private var exclusiveHeld = false
+    private var inFlightShared = 0
+    private var exclusiveWaiters: [(id: UInt64, continuation: CheckedContinuation<Void, Error>)] = []
+    private var sharedWaiters: [(id: UInt64, continuation: CheckedContinuation<Void, Error>)] = []
+    private var nextAccessWaiterID: UInt64 = 0
 
-    /// Take exclusive use of the wire; suspends (FIFO) if another request holds it.
-    ///
-    /// Throws `CancellationError` if the waiting task is cancelled before it acquires
-    /// the lock: a parked waiter never touched the wire, so abandoning the wait is
-    /// safe and must not orphan its continuation.
-    private func lock() async throws {
-        if !lockHeld {
-            lockHeld = true
+    /// Take shared access for a pipelined query. Blocks while an exclusive holder is
+    /// active or waiting (writer priority, so exclusive access can't starve).
+    private func acquireShared() async throws {
+        if !exclusiveHeld && exclusiveWaiters.isEmpty {
+            inFlightShared += 1
             return
         }
-        let id = nextLockWaiterID
-        nextLockWaiterID += 1
+        let id = nextAccessWaiterID
+        nextAccessWaiterID += 1
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                // Runs with actor isolation; already cancelled → fail instead of parking.
                 if Task.isCancelled {
                     continuation.resume(throwing: CancellationError())
                 } else {
-                    lockWaiters.append((id, continuation))
+                    sharedWaiters.append((id, continuation))
                 }
             }
         } onCancel: {
-            Task { await self.cancelLockWaiter(id) }
+            Task { await self.cancelSharedWaiter(id) }
         }
-        // Resumed by `unlock()`, which handed us the wire without clearing the flag.
-        // The hand-off is asynchronous w.r.t. cancellation, so it can win the race
-        // after this task was cancelled. Re-check: don't proceed holding the wire —
-        // pass it to the next waiter and fail, so a cancelled task never runs a query.
+        // Granted: the waker already counted us in `inFlightShared`. If cancellation won
+        // the hand-off, give the slot back and fail.
+        if Task.isCancelled {
+            releaseShared()
+            throw CancellationError()
+        }
+    }
+
+    private func releaseShared() {
+        inFlightShared -= 1
+        if inFlightShared == 0 { grantExclusiveIfReady() }
+    }
+
+    private func cancelSharedWaiter(_ id: UInt64) {
+        guard let index = sharedWaiters.firstIndex(where: { $0.id == id }) else { return }
+        sharedWaiters.remove(at: index).continuation.resume(throwing: CancellationError())
+    }
+
+    /// Take exclusive use of the wire, after draining any in-flight shared queries.
+    /// Suspends (FIFO) while shared queries drain or another exclusive holder is active.
+    /// Throws `CancellationError` if cancelled before it acquires — a parked waiter
+    /// never touched the wire.
+    private func lock() async throws {
+        if !exclusiveHeld && inFlightShared == 0 {
+            exclusiveHeld = true
+            return
+        }
+        let id = nextAccessWaiterID
+        nextAccessWaiterID += 1
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                if Task.isCancelled {
+                    continuation.resume(throwing: CancellationError())
+                } else {
+                    exclusiveWaiters.append((id, continuation))
+                }
+            }
+        } onCancel: {
+            Task { await self.cancelExclusiveWaiter(id) }
+        }
+        // Handed the wire by a release. If cancellation won the hand-off, pass it on.
         if Task.isCancelled {
             unlock()
             throw CancellationError()
         }
     }
 
-    /// Release the wire, passing ownership to the next waiter if there is one.
+    /// Release exclusive access: hand to the next exclusive waiter, else wake all shared.
     private func unlock() {
-        if lockWaiters.isEmpty {
-            lockHeld = false
+        exclusiveHeld = false
+        if !exclusiveWaiters.isEmpty {
+            grantExclusiveIfReady()
         } else {
-            lockWaiters.removeFirst().continuation.resume()
+            grantAllShared()
         }
     }
 
-    /// Drop a cancelled waiter from the lock queue and fail its `lock()`. A no-op if
-    /// `unlock()` already handed it the lock — in that case the resumed `lock()`
-    /// re-checks cancellation and passes the wire on.
-    private func cancelLockWaiter(_ id: UInt64) {
-        guard let index = lockWaiters.firstIndex(where: { $0.id == id }) else { return }
-        lockWaiters.remove(at: index).continuation.resume(throwing: CancellationError())
+    private func cancelExclusiveWaiter(_ id: UInt64) {
+        guard let index = exclusiveWaiters.firstIndex(where: { $0.id == id }) else { return }
+        exclusiveWaiters.remove(at: index).continuation.resume(throwing: CancellationError())
+        // Removing the last exclusive waiter lifts writer priority — parked shared may go.
+        if exclusiveWaiters.isEmpty && !exclusiveHeld { grantAllShared() }
+    }
+
+    /// Grant exclusive to the head waiter once the wire is free and shared has drained.
+    private func grantExclusiveIfReady() {
+        guard !exclusiveHeld, inFlightShared == 0, !exclusiveWaiters.isEmpty else { return }
+        exclusiveHeld = true
+        exclusiveWaiters.removeFirst().continuation.resume()
+    }
+
+    /// Wake every parked shared query — they pipeline together.
+    private func grantAllShared() {
+        guard !exclusiveHeld, exclusiveWaiters.isEmpty else { return }
+        let waiters = sharedWaiters
+        sharedWaiters.removeAll()
+        for waiter in waiters {
+            inFlightShared += 1
+            waiter.continuation.resume()
+        }
+    }
+
+    /// Fail every task parked for wire access (on teardown).
+    private func failAllAccessWaiters(_ error: Error) {
+        let shared = sharedWaiters
+        let exclusive = exclusiveWaiters
+        sharedWaiters.removeAll()
+        exclusiveWaiters.removeAll()
+        for waiter in shared { waiter.continuation.resume(throwing: error) }
+        for waiter in exclusive { waiter.continuation.resume(throwing: error) }
     }
 
     /// Drive the read loop until `ReadyForQuery`, assembling a `QueryResult`.
@@ -1181,6 +1251,7 @@ public actor PostgresConnection {
         isClosed = true
         notificationContinuation.finish()
         failAllPendingReads(PerunError.connectionClosed)   // fail everything the reader still owes
+        failAllAccessWaiters(PerunError.connectionClosed)  // and everyone parked for wire access
         wakeReader()                                        // and let a parked reader loop exit
         let fd = self.fd
         let tls = self.tls

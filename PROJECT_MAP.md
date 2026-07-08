@@ -223,51 +223,46 @@ every iteration.
 
 ## Query Execution
 
-All public query APIs on `PostgresConnection` acquire the internal wire lock:
+Wire access is a **readers-writer lock** (`acquireShared` / `lock`), because the actor
+alone is not enough — actors are reentrant across `await`, so without it two tasks could
+interleave protocol messages on one socket.
 
-- `query(_ sql: String)`
-- `query(_:_:parameterFormat:resultFormat:)`
-- `prepare(_:)`
-- `execute(_:_:parameterFormat:resultFormat:)`
-- `closePrepared(_:)`
-- `waitForNotifications()`
+- **Shared** — the two `query` methods. They pipeline through the background reader, so
+  several can be in flight on one connection at once.
+- **Exclusive** (`lock`) — `prepare`, `execute`, `closePrepared`, pipelined batches,
+  transactions, `waitForNotifications`. These read inline, so they take exclusive access:
+  it drains the in-flight shared queries and blocks new ones, owning the wire while the
+  reader sits idle. Writer priority (shared waits while an exclusive holder is active or
+  waiting) keeps exclusive access from starving.
 
-The actor alone is not enough because actors are reentrant across `await`.
-Without the explicit lock, two tasks could interleave protocol messages on one
-socket.
+Both waiter kinds are cancellation-aware: cancelled before acquiring, a waiter is dropped
+from its queue and throws `CancellationError` (it never touched the socket). Because a
+hand-off reaches the actor asynchronously w.r.t. cancellation and can win the race after a
+cancel, a granted-but-cancelled waiter re-checks `Task.isCancelled`, gives its access
+back, and throws — so a cancelled task never proceeds holding the wire.
 
-A task parked for the lock is cancellation-aware: cancelled before it acquires the
-wire, it is dropped from the queue and its `lock()` throws `CancellationError` (it
-never touched the socket, so abandoning the wait is safe). Both resume paths —
-handoff from `unlock()` and cancellation — run under actor isolation and guard on
-queue membership, so a waiter is resumed exactly once. Because the handoff reaches the
-actor asynchronously w.r.t. cancellation, it can still win the race after a cancel; so
-a waiter resumed by handoff re-checks `Task.isCancelled` and, if cancelled, passes the
-wire on and throws — a cancelled task never proceeds holding the wire.
+### Background response reader (transparent pipelining)
 
-### Background response reader (toward transparent pipelining)
-
-The `query` paths no longer read their own response inline. Instead a caller enqueues a
-`PendingRead`, writes its request without awaiting completion (`kickWrite` on the write
-queue), and awaits its result; a background reader task (`readerLoop`) delivers
-responses in FIFO order — the correlation, since v3 has no request IDs. This is the
-groundwork for transparent pipelining: with the wire lock dropped for autocommit
-queries, several could be in flight at once and the reader would still match each
-response to the right caller.
+The `query` paths do not read their own response inline. A caller takes shared access,
+enqueues a `PendingRead`, writes its request without awaiting completion (`kickWrite` on
+the write queue), and awaits its result; a background reader task (`readerLoop`) delivers
+responses in FIFO order — the correlation, since v3 has no request IDs. So concurrent
+autocommit queries on one connection are genuinely in flight together, and the reader
+still matches each response to the right caller.
 
 Reads run on a **separate dispatch queue** from writes, so the reader's blocking `recv`
-can never starve a concurrent write — the prerequisite for reading while callers keep
-writing. Exactly-once delivery: the reader pops each `PendingRead` before running it, so
-teardown (`failAllPendingReads`) can't double-resume the one in flight; a wire-desync
-error tears the connection down and fails everything still queued.
+can never starve a concurrent write. Exactly-once delivery: the reader pops each
+`PendingRead` before running it, so teardown (`failAllPendingReads`) can't double-resume
+the one in flight; a wire-desync error tears the connection down and fails everything
+still queued (plus everyone parked for access, via `failAllAccessWaiters`).
 
-For now the wire lock is still held across each `query`, so at most one response is
-outstanding — this step is behaviour-preserving (the whole suite passes unchanged).
-Everything else (prepare, execute, pipelined batches, transactions, `waitForNotifications`)
-still reads inline under the lock; because the lock serialises them against `query`, the
-reader is idle whenever they run, so the two read paths never contend for the socket.
-Dropping the lock for autocommit queries (real pipelining) and pinning the connection for
-transactions are the next steps.
+Exclusive holders read inline, and the RW-lock guarantees the reader is idle whenever
+they run (shared drained, new shared blocked), so the two read paths never contend for the
+socket. What pipelining buys is latency (fewer round trips), not server-side parallelism —
+one backend still runs the queries serially — and responses come back in order, so a slow
+query head-of-line-blocks the ones behind it on the same connection. The pool remains the
+mechanism for real concurrency. Still TODO: cancelling an *in-flight* (already-sent) query,
+which needs `CancelRequest` plus draining rather than just dropping a parked waiter.
 
 ### Simple Query
 

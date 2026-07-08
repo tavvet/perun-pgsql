@@ -41,24 +41,28 @@ final class CancellationIntegrationTests: XCTestCase {
     func testWireLockWaiterCancellationFailsAndKeepsConnectionUsable() async throws {
         let connection = try await PostgresConnection.connect(integrationConfiguration())
 
-        // Hold the wire lock with a slow query.
-        let holder = Task { _ = try await connection.query("SELECT pg_sleep(0.5)") }
+        // Hold the wire *exclusively* with a transaction (queries alone would pipeline).
+        let holder = Task {
+            try await connection.withTransaction { transaction in
+                _ = try await transaction.query("SELECT pg_sleep(0.5)")
+            }
+        }
         try await Task.sleep(nanoseconds: 100_000_000)
 
-        // A second query on the same connection has to park on the wire lock.
+        // A query on the same connection has to park behind the exclusive holder.
         let waiter = Task { try await connection.query("SELECT 1") }
         try await Task.sleep(nanoseconds: 60_000_000)
         waiter.cancel()
 
         do {
             _ = try await waiter.value
-            XCTFail("a cancelled wire-lock waiter should throw")
+            XCTFail("a cancelled parked query should throw")
         } catch is CancellationError {
             // expected
         }
 
         try await holder.value
-        // The lock queue is clean and the connection is still usable.
+        // The access queue is clean and the connection is still usable.
         let n = try await connection.query("SELECT 1 AS n").rows[0].decode("n", as: Int.self)
         XCTAssertEqual(n, 1)
         try await connection.close()
