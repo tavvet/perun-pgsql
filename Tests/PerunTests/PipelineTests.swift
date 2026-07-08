@@ -22,6 +22,14 @@ final class PipelineTests: XCTestCase {
         XCTAssertEqual(frameTags(bytes), ["B", "E", "S", "B", "E", "S"])   // Sync per set
     }
 
+    func testHeterogeneousPipelineIsFullExtendedCyclePerQuery() throws {
+        let queries = [PostgresQuery("SELECT 1"), PostgresQuery("SELECT 2")]
+        XCTAssertEqual(frameTags(try FrontendMessage.pipelinedQueries(queries, syncAfterEach: false)),
+                       ["P", "B", "D", "E", "P", "B", "D", "E", "S"])          // Parse/Bind/Describe/Execute ×N, one Sync
+        XCTAssertEqual(frameTags(try FrontendMessage.pipelinedQueries(queries, syncAfterEach: true)),
+                       ["P", "B", "D", "E", "S", "P", "B", "D", "E", "S"])     // Sync per query
+    }
+
     /// Split a frontend buffer into its message tags: each frame is a tag byte then an
     /// Int32 length that counts itself and the body.
     private func frameTags(_ bytes: [UInt8]) -> [Character] {
@@ -84,6 +92,48 @@ final class PipelineTests: XCTestCase {
 
         let persisted = try await ids(connection)
         XCTAssertEqual(persisted, [1, 2, 3])
+        try await drop(connection)
+    }
+
+    func testHeterogeneousAtomicPipeline() async throws {
+        let connection = try await freshTable()
+
+        let results = try await connection.pipeline([
+            PostgresQuery("INSERT INTO perun_pipeline_test (id) VALUES ($1)", [1]),
+            PostgresQuery("INSERT INTO perun_pipeline_test (id) VALUES ($1)", [2]),
+            PostgresQuery("SELECT count(*) AS c FROM perun_pipeline_test"),
+        ])
+
+        XCTAssertEqual(results.count, 3)
+        XCTAssertEqual(results[0].commandTag, "INSERT 0 1")
+        XCTAssertEqual(results[1].commandTag, "INSERT 0 1")
+        // The SELECT runs in order, in the same implicit transaction, so it sees both inserts.
+        let count = try results[2].rows[0].decode("c", as: Int.self)
+        XCTAssertEqual(count, 2)
+
+        try await drop(connection)
+    }
+
+    func testHeterogeneousIndependentPartialSuccess() async throws {
+        let connection = try await freshTable()
+        _ = try await connection.query("INSERT INTO perun_pipeline_test (id) VALUES (2)")   // collides with query 2
+
+        let results = try await connection.pipelineIndependently([
+            PostgresQuery("INSERT INTO perun_pipeline_test (id) VALUES ($1)", [1]),
+            PostgresQuery("INSERT INTO perun_pipeline_test (id) VALUES ($1)", [2]),
+            PostgresQuery("SELECT count(*) AS c FROM perun_pipeline_test"),
+        ])
+
+        XCTAssertEqual(results.count, 3)
+        XCTAssertNoThrow(try results[0].get())
+        XCTAssertThrowsError(try results[1].get()) {
+            XCTAssertEqual(($0 as? PerunError)?.serverError?.sqlState, .uniqueViolation)
+        }
+        // The SELECT is its own unit after the others: it sees 1 plus the pre-existing 2.
+        let selectResult = try results[2].get()
+        let count = try selectResult.rows[0].decode("c", as: Int.self)
+        XCTAssertEqual(count, 2)
+
         try await drop(connection)
     }
 

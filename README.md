@@ -118,8 +118,18 @@ for outcome in try await conn.pipelineIndependently(insert, rows) {
 }
 ```
 
-Sets can't depend on each other's results (all parameters are sent before any reply is
-read), and the batch should have small per-command results — pipelining is for bulk
+A batch can also mix different statements — pass `[PostgresQuery]`. Both modes work the
+same way (atomic here):
+
+```swift
+try await conn.pipeline([
+    PostgresQuery("INSERT INTO log (msg) VALUES ($1)", ["started"]),
+    PostgresQuery("UPDATE counters SET n = n + 1 WHERE k = $1", ["runs"]),
+])
+```
+
+Commands can't depend on each other's results (all are sent before any reply is read),
+and the batch should have small per-command results — pipelining is for bulk
 `INSERT`/`UPDATE`, not for fetching large result sets.
 
 ### Typed decoding (text or binary)

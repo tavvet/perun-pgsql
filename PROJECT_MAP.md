@@ -323,16 +323,20 @@ scoped to the backend connection that created them.
 
 ### Pipelining
 
-Entry points on `PostgresConnection` (one prepared statement, many parameter sets):
+Entry points on `PostgresConnection`, in two shapes — one prepared statement over many
+parameter sets, or a heterogeneous batch of `PostgresQuery` (each its own SQL, params
+and formats):
 
-- `pipeline(_:_:parameterFormat:resultFormat:)` → `[QueryResult]`
-- `pipelineIndependently(_:_:parameterFormat:resultFormat:)` → `[Result<QueryResult, Error>]`
+- `pipeline(_:_:parameterFormat:resultFormat:)` / `pipeline(_ queries:)` → `[QueryResult]`
+- `pipelineIndependently(_:_:…)` / `pipelineIndependently(_ queries:)` → `[Result<QueryResult, Error>]`
 
-Both send all the `Bind`/`Execute` messages before reading any reply — one round trip
-instead of `N`. The wire lock is held for the whole batch, so there is still one owner
-of the wire; pipelining is a mode *within* a single lock hold, not a relaxation of it.
-`FrontendMessage.pipelinedExecute` builds the batch; the `Sync` placement is the only
-difference between the modes:
+All send every message before reading any reply — one round trip instead of `N`. The
+wire lock is held for the whole batch, so there is still one owner of the wire;
+pipelining is a mode *within* a single lock hold, not a relaxation of it. The frontend
+differs by shape — `FrontendMessage.pipelinedExecute` emits `Bind`/`Execute` per set
+against the already-parsed statement; `pipelinedQueries` emits a full
+`Parse`/`Bind`/`Describe`/`Execute` per query against the unnamed statement/portal — but
+both share the readers, and the `Sync` placement is the only difference between the modes:
 
 - **Atomic** (`pipeline`): one trailing `Sync`, so the server runs the batch as a
   single implicit transaction. `collectPipelinedResults` reads one `QueryResult` per
@@ -746,9 +750,11 @@ Binary parameter encoding: byte-exact wire form for each encodable type, plus th
 
 ### `PipelineTests`
 
-The pipelined-batch `Sync` placement at the wire level (atomic = one trailing `Sync`,
-independent = `Sync` per set), plus live semantics: atomic bulk insert, atomic rollback
-on error, and independent partial success (skipped unless `PERUN_PGSQL_INTEGRATION=1`).
+The pipelined-batch `Sync` placement at the wire level, for both shapes — prepared-bulk
+(`Bind`/`Execute` per set) and heterogeneous (`Parse`/`Bind`/`Describe`/`Execute` per
+query) — atomic vs independent. Plus live semantics: atomic bulk insert, atomic rollback
+on error, independent partial success, and a heterogeneous batch whose trailing `SELECT`
+sees the batch's own prior inserts (skipped unless `PERUN_PGSQL_INTEGRATION=1`).
 
 ### `ConfigurationTests`
 

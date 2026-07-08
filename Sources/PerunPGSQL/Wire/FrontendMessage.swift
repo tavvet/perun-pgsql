@@ -234,6 +234,29 @@ enum FrontendMessage {
         return request.bytes
     }
 
+    /// A heterogeneous pipelined batch: full `Parse`/`Bind`/`Describe`/`Execute` for
+    /// each query (against the unnamed statement/portal, reused in order), with the
+    /// same `Sync` placement as `pipelinedExecute` — one trailing (atomic) or one per
+    /// query (independent).
+    static func pipelinedQueries(_ queries: [PostgresQuery], syncAfterEach: Bool) throws -> [UInt8] {
+        var capacity = 0
+        for query in queries { capacity += query.sql.utf8.count + 64 + query.parameters.count * 16 }
+        var request = ByteWriter(reservingCapacity: capacity)
+        for query in queries {
+            // Binary parameters need declared type OIDs; text lets the server infer.
+            let typeOIDs: [Int32] = query.parameterFormat == .binary
+                ? query.parameters.map { $0?.postgresTypeOID ?? 0 } : []
+            try appendParse(to: &request, statement: "", query: query.sql, parameterTypeOIDs: typeOIDs)
+            try appendBind(to: &request, portal: "", statement: "", parameters: query.parameters,
+                           parameterFormat: query.parameterFormat, resultFormat: query.resultFormat)
+            appendDescribe(to: &request, .portal, name: "")
+            appendExecute(to: &request, portal: "")
+            if syncAfterEach { appendSync(to: &request) }
+        }
+        if !syncAfterEach { appendSync(to: &request) }
+        return request.bytes
+    }
+
     static func closeAndSync(_ target: StatementOrPortal, name: String) -> [UInt8] {
         var request = ByteWriter(reservingCapacity: name.utf8.count + 16)
         appendClose(to: &request, target, name: name)

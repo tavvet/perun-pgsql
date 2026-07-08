@@ -338,6 +338,26 @@ public actor PostgresConnection {
                                                           parameterFormat: parameterFormat, resultFormat: resultFormat)
     }
 
+    /// Pipeline a heterogeneous batch of queries (each its own SQL and parameters) as
+    /// one **atomic** batch — the same all-or-nothing semantics as the prepared-bulk
+    /// `pipeline`, but the commands may differ. Results come back in order. The same
+    /// limits apply: a query cannot depend on an earlier query's result, and combined
+    /// replies must stay small enough to fit the socket buffers.
+    @discardableResult
+    public func pipeline(_ queries: [PostgresQuery]) async throws -> [QueryResult] {
+        guard !queries.isEmpty else { return [] }
+        try await lock(); defer { unlock() }
+        return try await runPipelinedQueries(queries, syncAfterEach: false)
+    }
+
+    /// Like `pipeline([PostgresQuery])`, but each query is its own autocommit unit; a
+    /// failure in one doesn't roll back or skip the others. Returns a per-query `Result`.
+    public func pipelineIndependently(_ queries: [PostgresQuery]) async throws -> [Result<QueryResult, Error>] {
+        guard !queries.isEmpty else { return [] }
+        try await lock(); defer { unlock() }
+        return try await runPipelinedQueriesIndependently(queries)
+    }
+
     /// Release a prepared statement's server-side resources.
     public func closePrepared(_ statement: PreparedStatement) async throws {
         try await lock(); defer { unlock() }
@@ -610,18 +630,38 @@ public actor PostgresConnection {
                                                             parameterFormat: parameterFormat,
                                                             resultFormat: resultFormat,
                                                             syncAfterEach: true))
-        let columns = preparedResultColumns(statement, resultFormat: resultFormat)
+        return try await collectIndependentResults(count: parameterSets.count,
+                                                   defaultColumns: preparedResultColumns(statement, resultFormat: resultFormat))
+    }
+
+    /// Reader for a `Sync`-per-command pipeline: run the single-result reader once per
+    /// command, wrapping each outcome in a `Result`. A server/local error there leaves
+    /// the wire in sync for the next command; a wire-desync error propagates and aborts.
+    private func collectIndependentResults(count: Int,
+                                           defaultColumns: [ColumnMetadata]) async throws -> [Result<QueryResult, Error>] {
         var results: [Result<QueryResult, Error>] = []
-        results.reserveCapacity(parameterSets.count)
-        for _ in parameterSets {
+        results.reserveCapacity(count)
+        for _ in 0 ..< count {
             do {
-                results.append(.success(try await collectResults(initialColumns: columns)))
+                results.append(.success(try await collectResults(initialColumns: defaultColumns)))
             } catch let error as PerunError where !error.mayHaveDesynchronizedWire {
-                results.append(.failure(error))     // server/local error: wire still in sync, keep reading
+                results.append(.failure(error))
             }
-            // A wire-desync error (or anything else) propagates — we can't keep reading.
         }
         return results
+    }
+
+    /// Atomic heterogeneous pipeline: `Parse`/`Bind`/`Describe`/`Execute` per query
+    /// under one trailing `Sync`. Each query describes itself, so the reader starts
+    /// each result set with no columns.
+    private func runPipelinedQueries(_ queries: [PostgresQuery], syncAfterEach: Bool) async throws -> [QueryResult] {
+        try await send(try FrontendMessage.pipelinedQueries(queries, syncAfterEach: syncAfterEach))
+        return try await collectPipelinedResults(defaultColumns: [])
+    }
+
+    private func runPipelinedQueriesIndependently(_ queries: [PostgresQuery]) async throws -> [Result<QueryResult, Error>] {
+        try await send(try FrontendMessage.pipelinedQueries(queries, syncAfterEach: true))
+        return try await collectIndependentResults(count: queries.count, defaultColumns: [])
     }
 
     /// A prepared statement is described in text; re-tag its columns as binary when
