@@ -119,6 +119,30 @@ One-dimensional arrays are sent through `PostgresArray([1, 2, 3])`, which render
 `{…}` text form — or the binary array wire format when every element has one. Elements
 are any encodable value, and `nil` is SQL NULL.
 
+### Errors
+
+A failed statement throws `PerunError.server(PostgresServerError)`, carrying the whole
+`ErrorResponse`. Branch on the typed `sqlState` — never on the (localized) message:
+
+```swift
+do {
+    try await conn.query("INSERT INTO users (email) VALUES ($1)", [email])
+} catch let error as PerunError {
+    switch error.serverError?.sqlState {
+    case .uniqueViolation where error.serverError?.constraintName == "users_email_key":
+        throw SignupError.emailTaken                       // your domain error, above the driver
+    case .serializationFailure, .deadlockDetected:
+        break                                              // transient (class 40…); retry is your call
+    default:
+        throw error
+    }
+}
+```
+
+`sqlStateCode` gives the raw five-character code for anything the driver doesn't name.
+A server error leaves the connection healthy — it is not a wire desync — so a pooled
+connection is safely reused after one.
+
 ### Connection pool
 
 ```swift

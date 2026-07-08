@@ -614,14 +614,21 @@ This avoids blocking behind the main connection's query receive loop.
 - pool shutdown;
 - too many parameters.
 
-Server errors are represented as `PostgresServerError`, preserving PostgreSQL
-ErrorResponse fields and exposing common fields:
+Server errors are represented as `PostgresServerError`, preserving every PostgreSQL
+ErrorResponse field and exposing the common ones by name:
 
 - severity;
-- SQLSTATE;
-- message;
-- detail;
-- hint.
+- `sqlState` — a typed `SQLState` condition (unique / foreign-key / not-null / check
+  violations, deadlock, serialization failure, …), with `.other(code)` for unnamed
+  codes; `sqlStateCode` gives the raw five-character string, and class helpers
+  (`isIntegrityConstraintViolation`, `isTransactionRollback`) cover whole classes;
+- message, detail, hint;
+- constraint / schema / table / column / data-type names, and error position.
+
+`PerunError.serverError` bridges to it, so a caller can branch on
+`error.serverError?.sqlState == .uniqueViolation` without unwrapping the case by hand.
+SQLSTATE is the stable signal to switch on; `message` is localized and must not be
+parsed. Mapping a condition to a domain error stays above the driver.
 
 ## Tests
 
@@ -683,6 +690,13 @@ Checks typed decoding:
 
 Checks `PerunError.mayHaveDesynchronizedWire`: wire-desync errors flag the pooled
 connection for discard, local/server errors keep it. Covers every `PerunError` case.
+
+### `ServerErrorTests`
+
+Typed `SQLState` (code ↔ condition round-trip, `.other` for unnamed codes, class
+helpers) and the `PostgresServerError` field accessors (constraint / table / position).
+Plus a live check that a real unique violation surfaces as `.uniqueViolation` with its
+constraint name and leaves the connection usable (skipped unless `PERUN_PGSQL_INTEGRATION=1`).
 
 ### `EncodingTests`
 
