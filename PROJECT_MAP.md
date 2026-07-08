@@ -245,6 +245,30 @@ actor asynchronously w.r.t. cancellation, it can still win the race after a canc
 a waiter resumed by handoff re-checks `Task.isCancelled` and, if cancelled, passes the
 wire on and throws — a cancelled task never proceeds holding the wire.
 
+### Background response reader (toward transparent pipelining)
+
+The `query` paths no longer read their own response inline. Instead a caller enqueues a
+`PendingRead`, writes its request without awaiting completion (`kickWrite` on the write
+queue), and awaits its result; a background reader task (`readerLoop`) delivers
+responses in FIFO order — the correlation, since v3 has no request IDs. This is the
+groundwork for transparent pipelining: with the wire lock dropped for autocommit
+queries, several could be in flight at once and the reader would still match each
+response to the right caller.
+
+Reads run on a **separate dispatch queue** from writes, so the reader's blocking `recv`
+can never starve a concurrent write — the prerequisite for reading while callers keep
+writing. Exactly-once delivery: the reader pops each `PendingRead` before running it, so
+teardown (`failAllPendingReads`) can't double-resume the one in flight; a wire-desync
+error tears the connection down and fails everything still queued.
+
+For now the wire lock is still held across each `query`, so at most one response is
+outstanding — this step is behaviour-preserving (the whole suite passes unchanged).
+Everything else (prepare, execute, pipelined batches, transactions, `waitForNotifications`)
+still reads inline under the lock; because the lock serialises them against `query`, the
+reader is idle whenever they run, so the two read paths never contend for the socket.
+Dropping the lock for autocommit queries (real pipelining) and pinning the connection for
+transactions are the next steps.
+
 ### Simple Query
 
 Entry point:

@@ -118,7 +118,12 @@ public actor PostgresConnection {
     }
 
     private let fd: Int32
+    /// Writes (and connect/TLS setup) run here.
     private let ioQueue: DispatchQueue
+    /// Reads run on their own queue so a blocking `recv` parked here can never
+    /// starve a concurrent write on `ioQueue` — the prerequisite for a background
+    /// reader that drains responses while callers keep writing.
+    private let readQueue: DispatchQueue
     /// Remembered so `cancelCurrentQuery` can open a fresh connection.
     private let host: String
     private let port: UInt16
@@ -176,6 +181,7 @@ public actor PostgresConnection {
                  notificationBufferLimit: Int) {
         self.fd = fd
         self.ioQueue = ioQueue
+        self.readQueue = DispatchQueue(label: "perun.connection.read")
         self.host = host
         self.port = port
         self.maxMessageSize = maxMessageSize
@@ -240,7 +246,7 @@ public actor PostgresConnection {
     /// message buffer (this byte precedes all framed messages).
     private func receiveSSLResponseByte() async throws -> UInt8 {
         let fd = self.fd
-        let bytes = try await withBlockingIO(on: ioQueue) {
+        let bytes = try await withBlockingIO(on: readQueue) {
             try SystemSocket.receive(fd: fd, maxLength: 1)
         }
         guard let byte = bytes.first else { throw PerunError.connectionClosed }
@@ -259,7 +265,9 @@ public actor PostgresConnection {
     @discardableResult
     public func query(_ sql: String) async throws -> QueryResult {
         try await lock(); defer { unlock() }
-        return try await runSimpleQuery(sql)
+        return try await runReadOp(sending: FrontendMessage.query(sql)) {
+            try await self.collectResults()
+        }
     }
 
     /// Run a parameterized query over the extended protocol. `$1…$n` in the SQL
@@ -275,9 +283,18 @@ public actor PostgresConnection {
                       parameterFormat: PostgresFormat = .text,
                       resultFormat: PostgresFormat = .text) async throws -> QueryResult {
         try await lock(); defer { unlock() }
-        return try await runParameterizedQuery(sql, parameters,
-                                               parameterFormat: parameterFormat,
-                                               resultFormat: resultFormat)
+        // No parameters and text results → Simple Query is one round trip lighter.
+        if parameters.isEmpty && resultFormat == .text {
+            return try await runReadOp(sending: FrontendMessage.query(sql)) {
+                try await self.collectResults()
+            }
+        }
+        let request = try FrontendMessage.parameterizedQuery(query: sql, parameters: parameters,
+                                                             parameterFormat: parameterFormat,
+                                                             resultFormat: resultFormat)
+        return try await runReadOp(sending: request) {
+            try await self.collectResults()
+        }
     }
 
     /// Parse a statement once so it can be executed repeatedly with different
@@ -737,6 +754,109 @@ public actor PostgresConnection {
         }
     }
 
+    // MARK: - Background response reader
+
+    /// One outstanding request whose response the reader will deliver. `run` reads the
+    /// response with the operation's own reader, resumes the caller, and reports whether
+    /// the wire is still in sync; `fail` resumes the caller during teardown.
+    private struct PendingRead {
+        let run: () async -> Bool
+        let fail: (Error) -> Void
+    }
+
+    private var pendingReads: [PendingRead] = []
+    private var readerWaiter: CheckedContinuation<Void, Never>?
+    private var readerStarted = false
+
+    /// Send a request and let the background reader deliver its response: enqueue the
+    /// read (in order), write the request, and await the result. Responses are matched
+    /// to requests by wire order — v3 has no request IDs, so order is the correlation.
+    private func runReadOp<T>(sending request: [UInt8],
+                              read: @escaping @Sendable () async throws -> T) async throws -> T {
+        guard !isClosed else { throw PerunError.connectionClosed }
+        startReaderIfNeeded()
+        return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<T, Error>) in
+            let op = PendingRead(
+                run: {
+                    do {
+                        continuation.resume(returning: try await read())
+                        return true
+                    } catch {
+                        continuation.resume(throwing: error)
+                        if let perun = error as? PerunError, perun.mayHaveDesynchronizedWire { return false }
+                        return true                      // server/local error: wire still in sync
+                    }
+                },
+                fail: { continuation.resume(throwing: $0) }
+            )
+            pendingReads.append(op)
+            if isClosed {                                // close raced in after the guard
+                failAllPendingReads(PerunError.connectionClosed)
+                return
+            }
+            wakeReader()
+            kickWrite(request)
+        }
+    }
+
+    private func startReaderIfNeeded() {
+        guard !readerStarted else { return }
+        readerStarted = true
+        Task { await self.readerLoop() }
+    }
+
+    /// Deliver responses in FIFO order. Pops each read *before* running it, so teardown
+    /// can never double-resume the one in flight. A wire-desync error tears the
+    /// connection down and fails everything still queued.
+    private func readerLoop() async {
+        while !isClosed {
+            if pendingReads.isEmpty {
+                await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                    if pendingReads.isEmpty && !isClosed {
+                        readerWaiter = continuation
+                    } else {
+                        continuation.resume()
+                    }
+                }
+                continue
+            }
+            let op = pendingReads.removeFirst()
+            if await op.run() == false {
+                forceClose()
+                break
+            }
+        }
+        failAllPendingReads(PerunError.connectionClosed)
+    }
+
+    private func wakeReader() {
+        if let waiter = readerWaiter {
+            readerWaiter = nil
+            waiter.resume()
+        }
+    }
+
+    private func failAllPendingReads(_ error: Error) {
+        let ops = pendingReads
+        pendingReads.removeAll()
+        for op in ops { op.fail(error) }
+    }
+
+    /// Write a request without awaiting completion, preserving enqueue order. A write
+    /// failure is fatal to the wire, so it tears the connection down.
+    private func kickWrite(_ bytes: [UInt8]) {
+        guard !isClosed else { return }
+        let fd = self.fd
+        let tls = self.tls
+        ioQueue.async {
+            do {
+                if let tls { try tls.send(bytes) } else { try SystemSocket.sendAll(fd: fd, bytes) }
+            } catch {
+                Task { await self.forceClose() }
+            }
+        }
+    }
+
     // MARK: - Wire serialization lock (FIFO async mutex)
 
     private var lockHeld = false
@@ -1047,7 +1167,7 @@ public actor PostgresConnection {
         guard !isClosed else { throw PerunError.connectionClosed }
         let fd = self.fd
         let tls = self.tls
-        return try await withBlockingIO(on: ioQueue) {
+        return try await withBlockingIO(on: readQueue) {
             if let tls {
                 return try tls.receive(maxLength: maxLength)
             } else {
@@ -1060,13 +1180,15 @@ public actor PostgresConnection {
         guard !isClosed else { return }
         isClosed = true
         notificationContinuation.finish()
+        failAllPendingReads(PerunError.connectionClosed)   // fail everything the reader still owes
+        wakeReader()                                        // and let a parked reader loop exit
         let fd = self.fd
         let tls = self.tls
         self.tls = nil
-        // Shut the socket down from here so any recv parked on ioQueue returns;
+        // Shut the socket down from here so any recv parked on readQueue returns;
         // otherwise the teardown dispatched below would queue behind it forever.
         SystemSocket.shutdownBoth(fd: fd)
-        ioQueue.async {
+        readQueue.async {
             tls?.close()
             SystemSocket.disconnect(fd: fd)
         }
