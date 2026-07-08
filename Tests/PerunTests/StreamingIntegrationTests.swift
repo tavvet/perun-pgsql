@@ -113,6 +113,30 @@ final class StreamingIntegrationTests: XCTestCase {
         XCTAssertEqual(answer, 42)
     }
 
+    func testCancellationBeforeFirstReadFreesConnectionPromptly() async throws {
+        let connection = try await PostgresConnection.connect(integrationConfiguration())
+        defer { Task { try? await connection.close() } }
+
+        let clock = ContinuousClock()
+        let start = clock.now
+        // Cancel immediately: the exclusive lock is free, so queryStream still sends the query,
+        // and the first read finds the task already cancelled (the pre-read fast path).
+        let streaming = Task {
+            for try await _ in try await connection.queryStream("SELECT pg_sleep(3)") {}
+        }
+        streaming.cancel()
+
+        var cancelled = false
+        do { try await streaming.value } catch is CancellationError { cancelled = true } catch { }
+        let elapsed = clock.now - start
+
+        XCTAssertTrue(cancelled, "a stream cancelled before its first read should throw CancellationError")
+        XCTAssertLessThan(elapsed, .seconds(2), "the pre-read cancel path must abort the query, not wait for pg_sleep")
+
+        let answer = try await connection.query("SELECT 42 AS a").rows[0].decode("a", as: Int.self)
+        XCTAssertEqual(answer, 42)
+    }
+
     // MARK: - Helpers
 
     private func integrationConfiguration() throws -> ConnectionConfiguration {

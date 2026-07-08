@@ -1185,6 +1185,9 @@ public actor PostgresConnection {
     func nextStreamRow() async throws -> PostgresRow? {
         guard streamActive else { return nil }
         if Task.isCancelled {
+            // Already cancelled before we read a byte: abort the running query too, so a
+            // slow one (e.g. mid `pg_sleep`) doesn't stall the drain inside finishStream.
+            await cancelStreamInFlight(generation: streamGeneration)
             await finishStream()
             throw CancellationError()
         }

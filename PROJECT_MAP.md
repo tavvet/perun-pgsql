@@ -319,7 +319,9 @@ connection operation.
 `nextStreamRow` is cancellation-aware, the same way autocommit queries are: the pull is wrapped
 in `withTaskCancellationHandler`, and a cancel fires a `CancelRequest` (`cancelStreamInFlight`)
 so a read blocked on a slow query — e.g. `pg_sleep` — unblocks instead of hanging until the
-next backend message. It then runs `finishStream` and throws `CancellationError`. A
+next backend message. It then runs `finishStream` and throws `CancellationError`. The same
+`CancelRequest` fires on the pre-read fast path (a task already cancelled when the first pull
+begins), so `finishStream`'s drain doesn't stall behind a still-running query either. A
 `streamGeneration` guard makes a late cancel a no-op once its stream has ended (so it can never
 cancel the query of a *later* stream that now holds the wire) — the streaming analogue of the
 shared path's `currentRead === op` check. Without this, a cancelled `for await` on a slow
@@ -906,8 +908,9 @@ environment variables.
 - `StreamingIntegrationTests`: `queryStream` matches the buffered result across many chunks;
   parameters with a one-row chunk size; an empty result; an early `break` frees the wire and
   the connection is reusable; a mid-stream server error surfaces and leaves the connection in
-  sync; and cancelling a task blocked on a slow stream (`pg_sleep`) returns promptly (via
-  `CancelRequest`) and frees the connection rather than waiting for the query.
+  sync; and cancelling a task on a slow stream (`pg_sleep`) — both while blocked mid-read and
+  before the first read — returns promptly (via `CancelRequest`) and frees the connection
+  rather than waiting for the query.
 
 ## Local Verification
 
