@@ -126,11 +126,18 @@ public actor PostgresClient {
 
     private func release(_ connection: PostgresConnection) async {
         if isShutDown {
-            openCount -= 1
-            Task { try? await connection.close() }
+            closeDuringShutdown(connection)
             return
         }
-        guard await connection.transactionStatus == .idle else {
+        let status = await connection.transactionStatus
+        // Re-check: shutdown() may have run — and drained `idle` — while we were
+        // suspended on the await above. Without this we would append to an
+        // already-torn-down pool and leak the connection.
+        if isShutDown {
+            closeDuringShutdown(connection)
+            return
+        }
+        guard status == .idle else {
             await discardAndReplaceIfNeeded(connection)
             return
         }
@@ -139,6 +146,11 @@ public actor PostgresClient {
         } else {
             idle.append(connection)
         }
+    }
+
+    private func closeDuringShutdown(_ connection: PostgresConnection) {
+        openCount -= 1
+        Task { try? await connection.close() }
     }
 
     private func releaseAfterError(_ connection: PostgresConnection, error: Error) async {

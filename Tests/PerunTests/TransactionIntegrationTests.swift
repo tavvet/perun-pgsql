@@ -49,6 +49,22 @@ final class TransactionIntegrationTests: XCTestCase {
         await pool.shutdown()
     }
 
+    /// Releasing a connection concurrently with shutdown() must not leave it in
+    /// the idle list (which shutdown has already drained), leaking it. Stress the
+    /// window; with the fix `connectionCount` is always 0 once everything settles.
+    func testShutdownDoesNotLeakConcurrentlyReleasedConnections() async throws {
+        let configuration = try integrationConfiguration()
+        for _ in 0 ..< 100 {
+            let pool = PostgresClient(configuration: configuration, maxConnections: 4)
+            _ = try await pool.query("SELECT 1")                 // warm one idle connection
+            let racer = Task { _ = try? await pool.query("SELECT 1") }   // release races shutdown
+            await pool.shutdown()
+            _ = await racer.value
+            let remaining = await pool.connectionCount
+            XCTAssertEqual(remaining, 0, "shutdown leaked a connection back into the pool")
+        }
+    }
+
     private func integrationConfiguration() throws -> ConnectionConfiguration {
         let environment = ProcessInfo.processInfo.environment
         guard environment["PERUN_PGSQL_INTEGRATION"] == "1" else {
