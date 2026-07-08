@@ -107,6 +107,13 @@ final class EncodingTests: XCTestCase {
         XCTAssertEqual(Data().postgresBinary(), [])                       // empty bytea
     }
 
+    func testByteArrayEncoding() {
+        let bytes: [UInt8] = [0xDE, 0xAD, 0xBE, 0xEF]
+        XCTAssertEqual(bytes.postgresBinary(), [0xDE, 0xAD, 0xBE, 0xEF])  // raw bytes, no copy of meaning
+        XCTAssertEqual(bytes.postgresText, "\\xdeadbeef")                 // same bytea hex form as Data
+        XCTAssertEqual(bytes.postgresTypeOID, 17)
+    }
+
     func testDecimalBinaryEncoding() throws {
         XCTAssertEqual(Decimal(string: "0.5")!.postgresBinary(),
                        [0x00, 0x01,     // 1 base-10000 group

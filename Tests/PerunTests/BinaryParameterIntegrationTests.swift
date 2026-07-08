@@ -71,13 +71,15 @@ final class BinaryParameterIntegrationTests: XCTestCase {
 
         let blob = Data([0x00, 0x01, 0x7f, 0x80, 0xfe, 0xff, 0xDE, 0xAD])
         let amount = Decimal(string: "-12345.6789")!
+        let rawBytes: [UInt8] = [0x01, 0x02, 0x03, 0x00, 0xff]
 
         for format in [PostgresFormat.text, .binary] {
-            let row = try await pool.query("SELECT $1::bytea AS b, $2::numeric AS n",
-                                           [blob, amount],
+            let row = try await pool.query("SELECT $1::bytea AS b, $2::numeric AS n, $3::bytea AS c",
+                                           [blob, amount, rawBytes],
                                            parameterFormat: format).rows[0]
             XCTAssertEqual(try row.decode("b", as: Data.self), blob, "bytea via \(format)")
             XCTAssertEqual(try row.decode("n", as: Decimal.self), amount, "numeric via \(format)")
+            XCTAssertEqual(try row.decode("c", as: [UInt8].self), rawBytes, "bytea [UInt8] via \(format)")
         }
 
         await pool.shutdown()

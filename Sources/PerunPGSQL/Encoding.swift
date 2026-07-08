@@ -76,3 +76,9 @@ extension Bool: PostgresEncodable {
     public var postgresTypeOID: Int32 { 16 }        // bool
     public func postgresBinary() -> [UInt8]? { [self ? 1 : 0] }
 }
+
+extension Array: PostgresEncodable where Element == UInt8 {
+    public var postgresText: String? { "\\x" + hexEncode(self) }   // bytea hex input
+    public var postgresTypeOID: Int32 { 17 }        // bytea
+    public func postgresBinary() -> [UInt8]? { self }   // binary == raw bytes
+}

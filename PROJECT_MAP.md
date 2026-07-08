@@ -366,7 +366,7 @@ Parameters are sent through `PostgresEncodable`.
   is sent in binary and `Parse` declares its `postgresTypeOID`; values without a
   binary form fall back to text (per-parameter format codes). Binary encoders are
   provided for the integer, floating-point, `Bool`, `String`, `UUID`, `Date`
-  (timestamptz), `Data` (bytea) and `Decimal` (numeric) types.
+  (timestamptz), `Data`/`[UInt8]` (bytea) and `Decimal` (numeric) types.
 
 Implementation notes:
 
