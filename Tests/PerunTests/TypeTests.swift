@@ -60,6 +60,31 @@ final class TypeTests: XCTestCase {
         XCTAssertThrowsError(try Double.decode(Array("1e".utf8), oid: PostgresOID.float8, format: .text))
     }
 
+    // Regression: PostgreSQL prints the shortest float text that round-trips, so a
+    // correctly-rounded parse must return the exact same bits. Several of these were
+    // mis-parsed (off by 1–3 ULP) by the previous accumulate-and-pow(10,e) parser.
+    func testFloatTextRoundTripsExactly() throws {
+        let doubles: [Double] = [
+            0.1, 0.2, 0.3, 1.0 / 3.0, 2.0 / 3.0, .pi, -0.0,
+            123456789.123456789, 8.98846567431158e307,
+            1.1011887870356423e-09, -3.5142406180792793e257,
+        ]
+        for d in doubles {
+            let decoded = try Double.decode(Array(String(d).utf8), oid: PostgresOID.float8, format: .text)
+            XCTAssertEqual(decoded.bitPattern, d.bitPattern, "Double round-trip failed for \(d)")
+        }
+
+        let floats: [Float] = [0.1, 0.2, 1.0 / 3.0, .pi, 3.4028235e38, 1.175_494_4e-38]
+        for f in floats {
+            let decoded = try Float.decode(Array(String(f).utf8), oid: PostgresOID.float4, format: .text)
+            XCTAssertEqual(decoded.bitPattern, f.bitPattern, "Float round-trip failed for \(f)")
+        }
+
+        XCTAssertTrue(try Double.decode(Array("NaN".utf8), oid: PostgresOID.float8, format: .text).isNaN)
+        XCTAssertEqual(try Double.decode(Array("Infinity".utf8), oid: PostgresOID.float8, format: .text), .infinity)
+        XCTAssertEqual(try Double.decode(Array("-Infinity".utf8), oid: PostgresOID.float8, format: .text), -.infinity)
+    }
+
     // MARK: Bool
 
     func testBool() throws {
