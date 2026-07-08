@@ -227,16 +227,17 @@ Wire access is a **readers-writer lock** (`acquireShared` / `lock`), because the
 alone is not enough — actors are reentrant across `await`, so without it two tasks could
 interleave protocol messages on one socket.
 
-- **Shared** — `query`, `prepare`, `execute`, `closePrepared`. Each is a single request
-  with a single `Sync`-delimited reply, so they pipeline through the background reader and
-  several can be in flight on one connection at once. Wire order keeps the reused unnamed
-  statement/portal conflict-free (each request's group is processed before the next).
-- **Exclusive** (`lock`) — pipelined batches, transactions, `waitForNotifications`. These
-  read inline, so they take exclusive access: it drains the in-flight shared queries and
-  blocks new ones, owning the wire while the reader sits idle. Writer priority (shared
-  waits while an exclusive holder is active or waiting) keeps exclusive access from
-  starving. Transactions still pin, so `query`/`execute` from other tasks wait for a
-  BEGIN…COMMIT to finish rather than interleaving into it.
+- **Shared** — `query`, `prepare`, `execute`, `closePrepared`, and pipelined batches. Each
+  is a single request (a batch is one contiguous write) delivered as one `PendingRead`, so
+  they pipeline through the background reader and several can be in flight on one connection
+  at once. Wire order keeps the reused unnamed statement/portal conflict-free, and a batch's
+  bytes are contiguous, so a concurrent query can't interleave into its implicit transaction.
+- **Exclusive** (`lock`) — transactions and `waitForNotifications`. These read inline (a
+  transaction spans several requests), so they take exclusive access: it drains the in-flight
+  shared queries and blocks new ones, owning the wire while the reader sits idle. Writer
+  priority (shared waits while an exclusive holder is active or waiting) keeps exclusive
+  access from starving. So `query`/`execute`/batches from other tasks wait for a BEGIN…COMMIT
+  to finish rather than interleaving into it.
 
 Both waiter kinds are cancellation-aware: cancelled before acquiring, a waiter is dropped
 from its queue and throws `CancellationError` (it never touched the socket). Because a
@@ -366,9 +367,10 @@ and formats):
 - `pipeline(_:_:parameterFormat:resultFormat:)` / `pipeline(_ queries:)` → `[QueryResult]`
 - `pipelineIndependently(_:_:…)` / `pipelineIndependently(_ queries:)` → `[Result<QueryResult, Error>]`
 
-All send every message before reading any reply — one round trip instead of `N`. The
-wire lock is held for the whole batch, so there is still one owner of the wire;
-pipelining is a mode *within* a single lock hold, not a relaxation of it. The frontend
+All send every message before reading any reply — one round trip instead of `N`. A batch
+is a single request (one contiguous write) delivered as one `PendingRead`, so it takes
+shared access like a plain query: it pipelines with other queries, and its bytes stay
+contiguous on the wire, so its implicit transaction can't be interleaved. The frontend
 differs by shape — `FrontendMessage.pipelinedExecute` emits `Bind`/`Execute` per set
 against the already-parsed statement; `pipelinedQueries` emits a full
 `Parse`/`Bind`/`Describe`/`Execute` per query against the unnamed statement/portal — but
@@ -816,7 +818,10 @@ environment variables.
 - `CancellationIntegrationTests`: cancelling a task parked for a pool slot or for the
   wire lock fails it with `CancellationError` and leaves the pool / connection usable;
   includes a looped test that races a cancel against a pool hand-off (proven to catch a
-  missing re-check).
+  missing re-check); and cancelling an in-flight query stops it early via `CancelRequest`.
+- `PipeliningIntegrationTests`: concurrent queries / executes on one connection each get
+  their own reply (correlation under pipelining); a batch pipelines with queries yet stays
+  atomic; and a transaction pins a concurrent query out until it commits.
 
 ## Local Verification
 

@@ -49,6 +49,33 @@ final class PipeliningIntegrationTests: XCTestCase {
         try await connection.close()
     }
 
+    func testAtomicBatchPipelinesWithConcurrentQueries() async throws {
+        let connection = try await PostgresConnection.connect(integrationConfiguration())
+        _ = try? await connection.query("DROP TABLE IF EXISTS perun_batch_test")
+        _ = try await connection.query("CREATE TABLE perun_batch_test (id int PRIMARY KEY)")
+        let insert = try await connection.prepare("INSERT INTO perun_batch_test (id) VALUES ($1)")
+
+        // A batch is shared now, so it pipelines alongside plain queries on one connection.
+        async let batch: [QueryResult] = connection.pipeline(insert, [[1], [2], [3]])
+        let sum = try await withThrowingTaskGroup(of: Int.self) { group -> Int in
+            for i in 100 ..< 110 {
+                group.addTask { try await connection.query("SELECT \(i) AS n").rows[0].decode("n", as: Int.self) }
+            }
+            return try await group.reduce(0, +)
+        }
+
+        let batchResults = try await batch
+        XCTAssertEqual(batchResults.count, 3)
+        XCTAssertEqual(sum, (100 ..< 110).reduce(0, +))         // the queries got their own results
+        // The batch's three rows all landed atomically, amid the concurrent queries.
+        let count = try await connection.query("SELECT count(*) AS c FROM perun_batch_test")
+            .rows[0].decode("c", as: Int.self)
+        XCTAssertEqual(count, 3)
+
+        _ = try await connection.query("DROP TABLE perun_batch_test")
+        try await connection.close()
+    }
+
     func testConcurrentQueryWaitsForTransactionToCommit() async throws {
         let connection = try await PostgresConnection.connect(integrationConfiguration())
         _ = try? await connection.query("DROP TABLE IF EXISTS perun_pin_test")

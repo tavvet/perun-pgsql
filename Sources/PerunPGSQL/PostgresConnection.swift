@@ -342,7 +342,7 @@ public actor PostgresConnection {
                          resultFormat: PostgresFormat = .text) async throws -> [QueryResult] {
         try validatePreparedStatement(statement)
         guard !parameterSets.isEmpty else { return [] }
-        try await lock(); defer { unlock() }
+        try await acquireShared(); defer { releaseShared() }
         return try await runPipelinedExecute(statement, parameterSets,
                                              parameterFormat: parameterFormat, resultFormat: resultFormat,
                                              syncAfterEach: false)
@@ -358,7 +358,7 @@ public actor PostgresConnection {
                                       resultFormat: PostgresFormat = .text) async throws -> [Result<QueryResult, Error>] {
         try validatePreparedStatement(statement)
         guard !parameterSets.isEmpty else { return [] }
-        try await lock(); defer { unlock() }
+        try await acquireShared(); defer { releaseShared() }
         return try await runPipelinedExecuteIndependently(statement, parameterSets,
                                                           parameterFormat: parameterFormat, resultFormat: resultFormat)
     }
@@ -371,7 +371,7 @@ public actor PostgresConnection {
     @discardableResult
     public func pipeline(_ queries: [PostgresQuery]) async throws -> [QueryResult] {
         guard !queries.isEmpty else { return [] }
-        try await lock(); defer { unlock() }
+        try await acquireShared(); defer { releaseShared() }
         return try await runPipelinedQueries(queries, syncAfterEach: false)
     }
 
@@ -379,7 +379,7 @@ public actor PostgresConnection {
     /// failure in one doesn't roll back or skip the others. Returns a per-query `Result`.
     public func pipelineIndependently(_ queries: [PostgresQuery]) async throws -> [Result<QueryResult, Error>] {
         guard !queries.isEmpty else { return [] }
-        try await lock(); defer { unlock() }
+        try await acquireShared(); defer { releaseShared() }
         return try await runPipelinedQueriesIndependently(queries)
     }
 
@@ -649,12 +649,15 @@ public actor PostgresConnection {
                                      parameterFormat: PostgresFormat,
                                      resultFormat: PostgresFormat,
                                      syncAfterEach: Bool) async throws -> [QueryResult] {
-        try await send(try FrontendMessage.pipelinedExecute(statement: statement.name,
-                                                            parameterSets: parameterSets,
-                                                            parameterFormat: parameterFormat,
-                                                            resultFormat: resultFormat,
-                                                            syncAfterEach: syncAfterEach))
-        return try await collectPipelinedResults(defaultColumns: preparedResultColumns(statement, resultFormat: resultFormat))
+        let request = try FrontendMessage.pipelinedExecute(statement: statement.name,
+                                                           parameterSets: parameterSets,
+                                                           parameterFormat: parameterFormat,
+                                                           resultFormat: resultFormat,
+                                                           syncAfterEach: syncAfterEach)
+        let columns = preparedResultColumns(statement, resultFormat: resultFormat)
+        return try await runReadOp(sending: request) {
+            try await self.collectPipelinedResults(defaultColumns: columns)
+        }
     }
 
     /// Independent pipeline: a `Sync` after each set, so results and errors are
@@ -664,13 +667,16 @@ public actor PostgresConnection {
                                                   _ parameterSets: [[(any PostgresEncodable)?]],
                                                   parameterFormat: PostgresFormat,
                                                   resultFormat: PostgresFormat) async throws -> [Result<QueryResult, Error>] {
-        try await send(try FrontendMessage.pipelinedExecute(statement: statement.name,
-                                                            parameterSets: parameterSets,
-                                                            parameterFormat: parameterFormat,
-                                                            resultFormat: resultFormat,
-                                                            syncAfterEach: true))
-        return try await collectIndependentResults(count: parameterSets.count,
-                                                   defaultColumns: preparedResultColumns(statement, resultFormat: resultFormat))
+        let request = try FrontendMessage.pipelinedExecute(statement: statement.name,
+                                                           parameterSets: parameterSets,
+                                                           parameterFormat: parameterFormat,
+                                                           resultFormat: resultFormat,
+                                                           syncAfterEach: true)
+        let columns = preparedResultColumns(statement, resultFormat: resultFormat)
+        let count = parameterSets.count
+        return try await runReadOp(sending: request) {
+            try await self.collectIndependentResults(count: count, defaultColumns: columns)
+        }
     }
 
     /// Reader for a `Sync`-per-command pipeline: run the single-result reader once per
@@ -694,13 +700,18 @@ public actor PostgresConnection {
     /// under one trailing `Sync`. Each query describes itself, so the reader starts
     /// each result set with no columns.
     private func runPipelinedQueries(_ queries: [PostgresQuery], syncAfterEach: Bool) async throws -> [QueryResult] {
-        try await send(try FrontendMessage.pipelinedQueries(queries, syncAfterEach: syncAfterEach))
-        return try await collectPipelinedResults(defaultColumns: [])
+        let request = try FrontendMessage.pipelinedQueries(queries, syncAfterEach: syncAfterEach)
+        return try await runReadOp(sending: request) {
+            try await self.collectPipelinedResults(defaultColumns: [])
+        }
     }
 
     private func runPipelinedQueriesIndependently(_ queries: [PostgresQuery]) async throws -> [Result<QueryResult, Error>] {
-        try await send(try FrontendMessage.pipelinedQueries(queries, syncAfterEach: true))
-        return try await collectIndependentResults(count: queries.count, defaultColumns: [])
+        let request = try FrontendMessage.pipelinedQueries(queries, syncAfterEach: true)
+        let count = queries.count
+        return try await runReadOp(sending: request) {
+            try await self.collectIndependentResults(count: count, defaultColumns: [])
+        }
     }
 
     /// A prepared statement is described in text; re-tag its columns as binary when
