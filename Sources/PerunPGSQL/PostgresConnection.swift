@@ -823,6 +823,10 @@ public actor PostgresConnection {
     /// only fire it when the running query is this one; a still-queued cancelled query
     /// would cancel someone else's, so we let it finish instead. Either way the response
     /// drains and `runReadOp` reports `CancellationError`.
+    ///
+    /// Best-effort, as `CancelRequest` is: it races the query. The query may already have
+    /// committed (or not yet reached the server, since the write is dispatched
+    /// asynchronously), so `CancellationError` does not prove it didn't run.
     private func cancelInFlightRead(_ op: PendingRead) async {
         guard !isClosed, currentRead === op else { return }
         try? await sendCancelRequest()

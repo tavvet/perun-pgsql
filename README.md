@@ -205,16 +205,21 @@ default `1024`) so an unconsumed notification stream cannot grow without bound.
 
 ### Cancellation
 
-Cancelling the task is enough — an in-flight query sends a `CancelRequest` to stop the
-server work, drains the response, and throws `CancellationError`:
+Cancelling the task asks the server to cancel an in-flight query (a `CancelRequest` on a
+side connection), drains the response, and throws `CancellationError`:
 
 ```swift
 let work = Task { try await conn.query("SELECT slow_thing()") }
-work.cancel()                                           // stops the query, throws CancellationError
+work.cancel()
 ```
 
-`conn.cancelCurrentQuery()` sends the same `CancelRequest` explicitly (on a side
-connection) if you want to cancel without cancelling the task.
+Cancellation is **best-effort**, exactly as PostgreSQL's `CancelRequest` is: the request
+races the query, so one that has already finished — or not yet reached the server — runs
+to completion anyway. `CancellationError` therefore does **not** prove the query didn't
+execute; a side-effecting statement may have committed. Don't rely on cancellation to undo
+writes — use explicit transaction control if you need that guarantee.
+
+`conn.cancelCurrentQuery()` sends the same request explicitly, without cancelling the task.
 
 ## Architecture
 

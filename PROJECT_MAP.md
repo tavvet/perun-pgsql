@@ -270,6 +270,14 @@ and would otherwise cancel whichever query is running; a still-queued cancelled 
 let finish instead. Either way the response still drains through the reader (the wire stays
 in sync), and `runReadOp` converts the outcome to `CancellationError`.
 
+This is best-effort, as `CancelRequest` is — it races the query. The write is dispatched
+asynchronously (`kickWrite` on the write queue), so a cancel can fire before the query even
+reaches the server; and a query that already committed can't be un-run. `CancellationError`
+means "we asked to cancel", not "the query did not execute" — so a side-effecting statement
+may have committed. (Gating `CancelRequest` on the write having landed, or skipping the
+write on a late cancel, would only narrow the window at the cost of an actor hop per query
+or a new off-actor race — not a real guarantee, so it is documented rather than chased.)
+
 ### Simple Query
 
 Entry point:
