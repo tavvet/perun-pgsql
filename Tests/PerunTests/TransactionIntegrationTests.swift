@@ -65,6 +65,45 @@ final class TransactionIntegrationTests: XCTestCase {
         }
     }
 
+    /// A non-server error (one thrown by the caller's closure, or a decode error)
+    /// leaves the wire synchronized, so the pooled connection must be reused, not
+    /// dropped. With maxConnections 1, reuse keeps `connectionCount` at 1.
+    func testHealthyConnectionReusedAfterLocalError() async throws {
+        struct BodyError: Error {}
+        let configuration = try integrationConfiguration()
+        let pool = PostgresClient(configuration: configuration, maxConnections: 1)
+
+        _ = try await pool.query("SELECT 1")
+        let afterWarmup = await pool.connectionCount
+        XCTAssertEqual(afterWarmup, 1)
+
+        // Error thrown by the closure after a completed query.
+        do {
+            try await pool.withConnection { connection -> Void in
+                _ = try await connection.query("SELECT 1")
+                throw BodyError()
+            }
+            XCTFail("expected BodyError")
+        } catch is BodyError {}
+        let afterClosureError = await pool.connectionCount
+        XCTAssertEqual(afterClosureError, 1, "healthy connection was dropped on a closure error")
+
+        // A decode error is likewise non-desyncing.
+        do {
+            _ = try await pool.withConnection { connection in
+                let result = try await connection.query("SELECT 'x'::text AS t")
+                return try result.rows[0].decode("t", as: Int.self)
+            }
+            XCTFail("expected a decoding error")
+        } catch let error as PerunError {
+            guard case .decodingFailed = error else { throw error }
+        }
+        let afterDecodeError = await pool.connectionCount
+        XCTAssertEqual(afterDecodeError, 1, "healthy connection was dropped on a decode error")
+
+        await pool.shutdown()
+    }
+
     private func integrationConfiguration() throws -> ConnectionConfiguration {
         let environment = ProcessInfo.processInfo.environment
         guard environment["PERUN_PGSQL_INTEGRATION"] == "1" else {

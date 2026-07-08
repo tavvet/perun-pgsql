@@ -154,15 +154,16 @@ public actor PostgresClient {
     }
 
     private func releaseAfterError(_ connection: PostgresConnection, error: Error) async {
-        // A server error leaves the connection in a clean, reusable state (it was
-        // drained up to ReadyForQuery). Anything else may have desynced the wire,
-        // so drop the connection and open a replacement if someone is waiting.
-        if case PerunError.server = error {
+        // Only errors that may have left the wire out of sync require dropping the
+        // connection. A server (SQL) error, a decode/local error, or an error from
+        // the caller's own closure all surface after the query drained to
+        // ReadyForQuery, so the connection is reusable — release() still discards
+        // it if it came back mid-transaction.
+        if let perun = error as? PerunError, perun.mayHaveDesynchronizedWire {
+            await discardAndReplaceIfNeeded(connection)
+        } else {
             await release(connection)
-            return
         }
-
-        await discardAndReplaceIfNeeded(connection)
     }
 
     private func discardAndReplaceIfNeeded(_ connection: PostgresConnection) async {
@@ -183,6 +184,21 @@ public actor PostgresClient {
         } catch {
             openCount -= 1
             waiter.resume(throwing: error)
+        }
+    }
+}
+
+private extension PerunError {
+    /// Whether this error may have left the connection's wire out of sync, so a
+    /// pooled connection that hit it must be discarded rather than reused.
+    var mayHaveDesynchronizedWire: Bool {
+        switch self {
+        case .connectionClosed, .protocolViolation, .tlsHandshakeFailed, .tlsIO,
+             .tlsNotAvailable, .authenticationFailed, .unsupportedAuthentication:
+            return true
+        case .server, .unexpectedNull, .columnNotFound, .decodingFailed, .tooManyParameters,
+             .clientShutdown, .preparedStatementConnectionMismatch:
+            return false
         }
     }
 }

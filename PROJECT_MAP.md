@@ -537,8 +537,11 @@ Release behavior:
 
 Error behavior:
 
-- `PerunError.server` is treated as clean and reusable.
-- Other errors close/drop the connection and may open a replacement for a waiter.
+- Only errors that may have desynchronized the wire (connection closed, protocol
+  violation, TLS failures) drop the connection and may open a replacement.
+- Server (SQL) errors, decode/local errors and errors from the caller's closure
+  leave the wire synchronized, so the connection is reused (release() still
+  discards it if it came back inside a transaction).
 
 Transaction hygiene:
 
