@@ -64,6 +64,44 @@ final class CancellationIntegrationTests: XCTestCase {
         try await connection.close()
     }
 
+    // The hand-off (release / unlock) resumes a waiter asynchronously w.r.t.
+    // cancellation, so a hand-off can win the race *after* a waiter is cancelled. A
+    // waiter cancelled while parked must still fail — never run on the resource it was
+    // handed. This loops to exercise that window; with the fix the cancelled waiter
+    // always throws, whoever wins the hand-off. (Only the pool is tested this way: the
+    // pool's `release()` is round-trip-free, so `resume(returning:)` genuinely races
+    // the cancel. Releasing the wire lock always follows a query round-trip, which
+    // lets `cancelLockWaiter` win first — so its hand-off branch isn't reachable from a
+    // test. Its checkpoint is the identical pattern, covered by symmetry.)
+
+    func testPoolWaiterCancelledDuringHandoffStillFails() async throws {
+        let pool = PostgresClient(configuration: try integrationConfiguration(), maxConnections: 1)
+        for _ in 0 ..< 15 {
+            let holding = Gate(), release = Gate()
+            let holder = Task {
+                try await pool.withConnection { _ in
+                    await holding.open()                     // signal: the only connection is now held
+                    await release.wait()                     // keep holding until released
+                }
+            }
+            await holding.wait()                             // start the waiter only once it's genuinely held
+
+            let waiter = Task { try await pool.query("SELECT 1") }
+            try await Task.sleep(nanoseconds: 20_000_000)    // let the waiter park in the queue
+            waiter.cancel()
+            await release.open()                             // release now: hand-off races the cancel
+
+            do {
+                _ = try await waiter.value
+                XCTFail("a pool waiter cancelled while parked must throw, never run its query")
+            } catch is CancellationError {
+                // expected
+            }
+            try await holder.value
+        }
+        await pool.shutdown()
+    }
+
     private func integrationConfiguration() throws -> ConnectionConfiguration {
         let environment = ProcessInfo.processInfo.environment
         guard environment["PERUN_PGSQL_INTEGRATION"] == "1" else {
@@ -82,5 +120,24 @@ final class CancellationIntegrationTests: XCTestCase {
             database: environment["PGDATABASE"] ?? "perun",
             password: environment["PGPASSWORD"],
             tlsMode: tlsMode)
+    }
+}
+
+/// A one-shot gate: holders `wait()` until someone `open()`s it. Lets a test hold a
+/// pooled connection / the wire lock until it deliberately releases, so the release
+/// and a cancel can be made to race.
+private actor Gate {
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var opened = false
+
+    func wait() async {
+        if opened { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func open() {
+        opened = true
+        for waiter in waiters { waiter.resume() }
+        waiters.removeAll()
     }
 }

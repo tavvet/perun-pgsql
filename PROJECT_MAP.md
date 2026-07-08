@@ -239,8 +239,11 @@ socket.
 A task parked for the lock is cancellation-aware: cancelled before it acquires the
 wire, it is dropped from the queue and its `lock()` throws `CancellationError` (it
 never touched the socket, so abandoning the wait is safe). Both resume paths —
-handoff from `unlock()` and cancellation — run under actor isolation, and each guards
-on queue membership, so a waiter is resumed exactly once.
+handoff from `unlock()` and cancellation — run under actor isolation and guard on
+queue membership, so a waiter is resumed exactly once. Because the handoff reaches the
+actor asynchronously w.r.t. cancellation, it can still win the race after a cancel; so
+a waiter resumed by handoff re-checks `Task.isCancelled` and, if cancelled, passes the
+wire on and throws — a cancelled task never proceeds holding the wire.
 
 ### Simple Query
 
@@ -545,8 +548,11 @@ Acquire behavior:
 3. Open a new connection if under capacity.
 4. Otherwise enqueue a waiter. An enqueued waiter is cancellation-aware — the same
    pattern as the wire lock: if its task is cancelled it leaves the queue and
-   `acquire()` throws `CancellationError` (it never held a slot), and the resume is
-   guarded so a waiter handed a connection concurrently is not resumed twice.
+   `acquire()` throws `CancellationError` (it never held a slot). Because `release()`
+   hands a connection off asynchronously w.r.t. cancellation, a handoff can win the
+   race after a cancel; so a waiter resumed with a connection re-checks
+   `Task.isCancelled` and, if cancelled, returns the connection to the pool and throws
+   rather than running on it.
 
 Release behavior:
 
@@ -734,7 +740,9 @@ environment variables.
   bool, text, UUID, timestamptz, bytea, numeric, json/jsonb, arrays), NULL parameters
   and binary results.
 - `CancellationIntegrationTests`: cancelling a task parked for a pool slot or for the
-  wire lock fails it with `CancellationError` and leaves the pool / connection usable.
+  wire lock fails it with `CancellationError` and leaves the pool / connection usable;
+  includes a looped test that races a cancel against a pool hand-off (proven to catch a
+  missing re-check).
 
 ## Local Verification
 

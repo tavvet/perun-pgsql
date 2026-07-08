@@ -128,8 +128,8 @@ public actor PostgresClient {
         // leave the queue and fail, not orphan its continuation and hold its slot.
         let id = nextWaiterID
         nextWaiterID += 1
-        return try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
+        let connection = try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<PostgresConnection, Error>) in
                 if Task.isCancelled {
                     continuation.resume(throwing: CancellationError())
                 } else {
@@ -139,10 +139,20 @@ public actor PostgresClient {
         } onCancel: {
             Task { await self.cancelWaiter(id) }
         }
+        // `release()` hands connections off asynchronously w.r.t. cancellation, so a
+        // hand-off can win the race after this task was cancelled. Re-check: a
+        // cancelled task must not run on a connection it only holds by that race —
+        // return it to the pool and fail instead.
+        if Task.isCancelled {
+            await release(connection)
+            throw CancellationError()
+        }
+        return connection
     }
 
     /// Drop a cancelled waiter from the queue and fail its `acquire()`. A no-op if a
-    /// connection was already handed to it (it won the race with cancellation).
+    /// connection was already handed to it — in that case the resumed `acquire()`
+    /// re-checks cancellation and returns the connection to the pool.
     private func cancelWaiter(_ id: UInt64) {
         guard let index = waiters.firstIndex(where: { $0.id == id }) else { return }
         waiters.remove(at: index).continuation.resume(throwing: CancellationError())

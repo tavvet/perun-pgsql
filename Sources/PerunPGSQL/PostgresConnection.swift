@@ -580,7 +580,14 @@ public actor PostgresConnection {
         } onCancel: {
             Task { await self.cancelLockWaiter(id) }
         }
-        // Resumed by `unlock()`, which hands ownership over without clearing the flag.
+        // Resumed by `unlock()`, which handed us the wire without clearing the flag.
+        // The hand-off is asynchronous w.r.t. cancellation, so it can win the race
+        // after this task was cancelled. Re-check: don't proceed holding the wire —
+        // pass it to the next waiter and fail, so a cancelled task never runs a query.
+        if Task.isCancelled {
+            unlock()
+            throw CancellationError()
+        }
     }
 
     /// Release the wire, passing ownership to the next waiter if there is one.
@@ -593,7 +600,8 @@ public actor PostgresConnection {
     }
 
     /// Drop a cancelled waiter from the lock queue and fail its `lock()`. A no-op if
-    /// `unlock()` already handed it the lock (it won the race with cancellation).
+    /// `unlock()` already handed it the lock — in that case the resumed `lock()`
+    /// re-checks cancellation and passes the wire on.
     private func cancelLockWaiter(_ id: UInt64) {
         guard let index = lockWaiters.firstIndex(where: { $0.id == id }) else { return }
         lockWaiters.remove(at: index).continuation.resume(throwing: CancellationError())
