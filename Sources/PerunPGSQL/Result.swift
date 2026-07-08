@@ -26,9 +26,9 @@ public struct ColumnMetadata: Sendable {
 /// A single cell: the raw bytes for one column in one row, plus the column's
 /// metadata so it knows how to interpret itself.
 ///
-/// In this milestone results come back in text format, so `string()` and the
-/// numeric helpers parse the textual representation. Binary decoding arrives
-/// with the type system in a later milestone.
+/// Decode it with `decode(_:)` / `decodeIfPresent(_:)`, which handle both the
+/// text and binary wire formats. The `string()`/`int()`/… helpers are
+/// convenience shortcuts over the same format-aware decoders.
 public struct PostgresCell: Sendable {
     public let bytes: [UInt8]?
     public let column: ColumnMetadata

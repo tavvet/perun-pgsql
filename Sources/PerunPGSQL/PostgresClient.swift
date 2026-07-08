@@ -38,8 +38,10 @@ public actor PostgresClient {
 
     /// Check out a connection, run `body`, and return the connection to the pool.
     ///
-    /// On a server-side (SQL) error the connection is healthy and is reused; on a
-    /// transport/protocol error it is discarded and replaced.
+    /// The connection is reused unless the error may have desynchronized the wire
+    /// (connection closed, protocol violation, TLS failure), in which case it is
+    /// discarded and replaced. Server (SQL) errors, decode/local errors and errors
+    /// thrown by `body` all leave the wire in sync, so the connection is kept.
     public nonisolated func withConnection<T: Sendable>(
         _ body: (PostgresConnection) async throws -> T
     ) async throws -> T {

@@ -1,8 +1,8 @@
 /// A Swift value that can be sent as a bound query parameter.
 ///
-/// In this milestone parameters travel in PostgreSQL **text** format: each value
-/// is rendered to its textual SQL form and the server parses it according to the
-/// inferred column type. Binary encoding arrives with the type system later.
+/// Parameters travel in PostgreSQL **text** format: each value is rendered to its
+/// textual SQL form and the server parses it according to the inferred column
+/// type. (Binary parameter encoding is a possible future optimization.)
 public protocol PostgresEncodable: Sendable {
     /// The text-format rendering of the value; `nil` means SQL NULL.
     var postgresText: String? { get }

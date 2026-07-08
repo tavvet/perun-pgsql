@@ -75,8 +75,8 @@ enum FrontendMessage {
         return frame(tag: "Q", body: body.bytes)
     }
 
-    /// A password response (`PasswordMessage`). Used for cleartext auth and, in
-    /// later milestones, to carry MD5 and SASL payloads.
+    /// A password response (`PasswordMessage`). Used for cleartext and MD5 auth
+    /// responses; SASL/SCRAM uses the dedicated messages below.
     static func password(_ payload: String) -> [UInt8] {
         var body = ByteWriter()
         body.writeCString(payload)
@@ -115,9 +115,9 @@ enum FrontendMessage {
 
     /// `Bind`: bind parameter values to a statement, creating a portal.
     ///
-    /// We send all parameters and request all results in **text** format (both
-    /// format-code counts are zero, which means "all default = text"). Binary
-    /// formats arrive with the type system in a later milestone.
+    /// Parameters are always sent in **text** format (the parameter format-code
+    /// count is zero). Result columns are requested in `resultFormat` — text
+    /// (default) or binary. Binary parameter encoding is not implemented yet.
     static func bind(portal: String,
                      statement: String,
                      parameters: [(any PostgresEncodable)?],

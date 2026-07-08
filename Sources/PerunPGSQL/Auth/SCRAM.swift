@@ -6,9 +6,10 @@
 ///   2. client-final   →  server-final   (proof  →  server signature)
 ///   3. server verifies the proof and replies AuthenticationOk
 ///
-/// We use channel binding "n,," (not supported), which is correct until TLS
-/// lands in a later milestone. Passwords are used as raw UTF-8; full SASLprep
-/// (RFC 4013) normalization is a TODO and is the identity mapping for ASCII.
+/// We use channel binding "n,," (the client does not offer channel binding);
+/// combined with `.verifyFull` TLS this is safe. SCRAM-SHA-256-PLUS channel
+/// binding is a possible future hardening. Passwords are used as raw UTF-8; full
+/// SASLprep (RFC 4013) normalization is a TODO and is the identity for ASCII.
 struct SCRAMClient {
     static let mechanism = "SCRAM-SHA-256"
 
