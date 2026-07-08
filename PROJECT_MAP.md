@@ -226,9 +226,9 @@ every iteration.
 All public query APIs on `PostgresConnection` acquire the internal wire lock:
 
 - `query(_ sql: String)`
-- `query(_:_:resultFormat:)`
+- `query(_:_:parameterFormat:resultFormat:)`
 - `prepare(_:)`
-- `execute(_:_:resultFormat:)`
+- `execute(_:_:parameterFormat:resultFormat:)`
 - `closePrepared(_:)`
 - `waitForNotifications()`
 
@@ -256,7 +256,7 @@ The simple query string may contain multiple SQL statements.
 
 Entry point:
 
-- `runParameterizedQuery(_:_:resultFormat:)`
+- `runParameterizedQuery(_:_:parameterFormat:resultFormat:)`
 
 If there are no parameters and text results were requested, it falls back to
 Simple Query for a cheaper round trip.
@@ -271,15 +271,17 @@ Execute portal
 Sync
 ```
 
-Parameters are encoded as text. Result columns can be requested as text or
-binary.
+Parameters are encoded as text by default. With `parameterFormat: .binary`,
+values that provide `postgresBinary()` are sent in binary and the rest fall
+back to text through per-parameter format codes. Result columns can be requested
+as text or binary.
 
 ### Prepared Statements
 
 Entry points:
 
 - `runPrepare(_:)`
-- `runExecute(_:_:resultFormat:)`
+- `runExecute(_:_:parameterFormat:resultFormat:)`
 - `runClosePrepared(_:)`
 
 Prepare sends:
@@ -520,7 +522,7 @@ State:
 Public API:
 
 - `withConnection(_:)`
-- `query(_:_:resultFormat:)`
+- `query(_:_:parameterFormat:resultFormat:)`
 - `shutdown()`
 - `connectionCount`
 
