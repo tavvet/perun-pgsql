@@ -145,9 +145,9 @@ for try await row in try await conn.queryStream("SELECT id, body FROM documents"
 ```
 
 The stream holds the connection exclusively until it ends (like a transaction), so no
-other query runs on it meanwhile; `chunkSize:` tunes rows-per-round-trip. Stopping early
-(a `break` or a thrown error) closes the server-side portal and frees the connection — it
-stays usable:
+other query runs on it meanwhile; `chunkSize:` tunes rows-per-round-trip. Stopping early —
+a `break`, a thrown error, or cancelling the task (even while it waits on a slow query) —
+closes the server-side portal and frees the connection, which stays usable:
 
 ```swift
 for try await row in try await conn.queryStream("SELECT * FROM events", chunkSize: 1000) {

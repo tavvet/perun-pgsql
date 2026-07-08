@@ -331,6 +331,7 @@ public actor PostgresConnection {
             try await send(request)
 
             streamActive = true
+            streamGeneration += 1
             streamPortal = portal
             streamChunkSize = chunk
             streamColumns = []
@@ -1174,12 +1175,37 @@ public actor PostgresConnection {
     private var streamTerminating = false            // terminating Sync sent; draining to ReadyForQuery
     private var streamPendingError: PostgresServerError?
     private var streamPortalCounter = 0
+    private var streamGeneration: UInt64 = 0          // identifies the current stream for cancellation
 
-    /// The consumer pulled the next row. Read inline until a DataRow (return it), the end
-    /// (ReadyForQuery → nil), or an error. Chunk boundaries are crossed transparently: a
-    /// PortalSuspended asks for the next chunk; a CommandComplete closes the portal.
+    /// The consumer pulled the next row. Cancellation-aware: if the consuming task is
+    /// cancelled while we wait for the server (e.g. mid `pg_sleep`), fire a `CancelRequest`
+    /// so the read unblocks — exactly as an autocommit query does — then tear the stream
+    /// down and throw `CancellationError`, so a cancelled `for await` frees the connection
+    /// promptly instead of blocking until the next backend message arrives.
     func nextStreamRow() async throws -> PostgresRow? {
         guard streamActive else { return nil }
+        if Task.isCancelled {
+            await finishStream()
+            throw CancellationError()
+        }
+        let generation = streamGeneration
+        let outcome: Result<PostgresRow?, Error> = await withTaskCancellationHandler {
+            do { return .success(try await readNextStreamRow()) }
+            catch { return .failure(error) }
+        } onCancel: {
+            Task { await self.cancelStreamInFlight(generation: generation) }
+        }
+        if Task.isCancelled {
+            await finishStream()          // idempotent; cleans up even if a row raced the cancel
+            throw CancellationError()
+        }
+        return try outcome.get()
+    }
+
+    /// Read the wire until one DataRow (return it), the end (ReadyForQuery → nil), or an
+    /// error, assuming an active stream. Chunk boundaries are crossed transparently: a
+    /// PortalSuspended asks for the next chunk; a CommandComplete closes the portal.
+    private func readNextStreamRow() async throws -> PostgresRow? {
         do {
             while true {
                 let message = try await readMessage()
@@ -1285,6 +1311,16 @@ public actor PostgresConnection {
         streamPendingError = nil
         streamPortal = ""
         unlock()
+    }
+
+    /// A streaming consumer was cancelled while awaiting a row: ask the server to cancel the
+    /// running query so the read unblocks. Best-effort, like `cancelInFlightRead`. The
+    /// `generation` guard makes a late cancel a no-op if that stream already ended (and a new
+    /// one may hold the wire) — the stream owns the wire exclusively, so we never cancel a
+    /// query that isn't the one this stream started.
+    private func cancelStreamInFlight(generation: UInt64) async {
+        guard !isClosed, streamActive, streamGeneration == generation else { return }
+        try? await sendCancelRequest()
     }
 
     /// Close the connection and release its socket. Also interrupts any in-flight

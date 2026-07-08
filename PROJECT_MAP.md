@@ -316,6 +316,15 @@ releases the exclusive hold; a wire/IO failure tears the connection down instead
 inside `withTransaction` on the same connection would deadlock on `lock`, so it is a top-level
 connection operation.
 
+`nextStreamRow` is cancellation-aware, the same way autocommit queries are: the pull is wrapped
+in `withTaskCancellationHandler`, and a cancel fires a `CancelRequest` (`cancelStreamInFlight`)
+so a read blocked on a slow query — e.g. `pg_sleep` — unblocks instead of hanging until the
+next backend message. It then runs `finishStream` and throws `CancellationError`. A
+`streamGeneration` guard makes a late cancel a no-op once its stream has ended (so it can never
+cancel the query of a *later* stream that now holds the wire) — the streaming analogue of the
+shared path's `currentRead === op` check. Without this, a cancelled `for await` on a slow
+stream would keep the exclusive hold until the server replied.
+
 ### Simple Query
 
 Entry point:
@@ -896,8 +905,9 @@ environment variables.
   atomic; and a transaction pins a concurrent query out until it commits.
 - `StreamingIntegrationTests`: `queryStream` matches the buffered result across many chunks;
   parameters with a one-row chunk size; an empty result; an early `break` frees the wire and
-  the connection is reusable; and a mid-stream server error surfaces and leaves the connection
-  in sync.
+  the connection is reusable; a mid-stream server error surfaces and leaves the connection in
+  sync; and cancelling a task blocked on a slow stream (`pg_sleep`) returns promptly (via
+  `CancelRequest`) and frees the connection rather than waiting for the query.
 
 ## Local Verification
 
