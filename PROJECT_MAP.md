@@ -371,6 +371,8 @@ Important review notes:
 - Decode errors report byte length but do not include raw byte previews by
   default. A compile-time `PERUN_ENABLE_DECODE_ERROR_BYTE_PREVIEW` flag can
   enable the preview while debugging.
+- Scalar integer and floating-point text decoders parse ASCII bytes directly
+  instead of allocating an intermediate `String`.
 
 ## Wire Layer
 

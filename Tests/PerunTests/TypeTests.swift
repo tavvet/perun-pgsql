@@ -11,12 +11,23 @@ final class TypeTests: XCTestCase {
         // int4 = 42
         XCTAssertEqual(try Int.decode([0, 0, 0, 42], oid: PostgresOID.int4, format: .binary), 42)
         XCTAssertEqual(try Int.decode(Array("42".utf8), oid: PostgresOID.int4, format: .text), 42)
+        XCTAssertEqual(try Int16.decode(Array("-32768".utf8), oid: PostgresOID.int2, format: .text), -32768)
+        XCTAssertEqual(try Int32.decode(Array("+2147483647".utf8), oid: PostgresOID.int4, format: .text),
+                       2147483647)
         // int8 = -1  → 0xFFFF_FFFF_FFFF_FFFF
         XCTAssertEqual(
             try Int64.decode([0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
                              oid: PostgresOID.int8, format: .binary), -1)
         // int2 = 258 = 0x0102
         XCTAssertEqual(try Int16.decode([0x01, 0x02], oid: PostgresOID.int2, format: .binary), 258)
+    }
+
+    func testIntTextRejectsInvalidAndOverflow() {
+        XCTAssertThrowsError(try Int16.decode(Array("32768".utf8), oid: PostgresOID.int2, format: .text))
+        XCTAssertThrowsError(try Int32.decode(Array("12x".utf8), oid: PostgresOID.int4, format: .text))
+        XCTAssertThrowsError(try Int64.decode(Array("-9223372036854775809".utf8),
+                                              oid: PostgresOID.int8,
+                                              format: .text))
     }
 
     func testDecodeErrorDoesNotExposeRawBytesByDefault() {
@@ -37,6 +48,16 @@ final class TypeTests: XCTestCase {
         let bytes = withUnsafeBytes(of: &bits) { Array($0) }
         XCTAssertEqual(try Double.decode(bytes, oid: PostgresOID.float8, format: .binary), 3.5)
         XCTAssertEqual(try Double.decode(Array("3.5".utf8), oid: PostgresOID.float8, format: .text), 3.5)
+        XCTAssertEqual(try Double.decode(Array("-1.25e2".utf8), oid: PostgresOID.float8, format: .text), -125)
+        XCTAssertEqual(try Float.decode(Array("+6.5E-1".utf8), oid: PostgresOID.float4, format: .text), 0.65)
+        XCTAssertTrue(try Double.decode(Array("NaN".utf8), oid: PostgresOID.float8, format: .text).isNaN)
+        XCTAssertEqual(try Double.decode(Array("-Infinity".utf8), oid: PostgresOID.float8, format: .text),
+                       -Double.infinity)
+    }
+
+    func testFloatTextRejectsInvalidInput() {
+        XCTAssertThrowsError(try Double.decode(Array("1.2.3".utf8), oid: PostgresOID.float8, format: .text))
+        XCTAssertThrowsError(try Double.decode(Array("1e".utf8), oid: PostgresOID.float8, format: .text))
     }
 
     // MARK: Bool
