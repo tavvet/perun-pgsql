@@ -667,6 +667,17 @@ Checks typed decoding:
 - numeric;
 - jsonb binary header.
 
+### Integration tests (live server)
+
+Skipped unless `PERUN_PGSQL_INTEGRATION=1`; they require a live PostgreSQL and `PG*`
+environment variables.
+
+- `PreparedStatementIntegrationTests`: a prepared-statement handle is rejected on a
+  different connection.
+- `TransactionIntegrationTests`: commit/rollback; the pool discards open-transaction
+  connections; shutdown does not leak a concurrently released connection; a healthy
+  connection is reused after a local (non-wire) error.
+
 ## Local Verification
 
 Unit tests:
@@ -675,10 +686,11 @@ Unit tests:
 rtk swift test
 ```
 
-Observed on 2026-07-07:
+Observed:
 
-- 26 XCTest tests passed.
-- No live PostgreSQL server needed.
+- The unit suite passes with no live PostgreSQL server.
+- The live integration tests pass against PostgreSQL 17 with
+  `PERUN_PGSQL_INTEGRATION=1` (and `PG*`) set.
 
 Demo against PostgreSQL:
 

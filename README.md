@@ -42,9 +42,9 @@ try await conn.close()
 - **Perun ORM** — built on top of this driver: models, relationships, query building, migrations.
 
 This package is the lowest layer. It owns the bytes on the wire and gives the ORM typed
-rows, prepared statements, a connection pool and (soon) transactions. Everything
-higher-level — a query builder, row-to-model mapping, migrations — lives in the ORM and
-leans on the primitives here.
+rows, prepared statements, a connection pool and transactions. Everything higher-level —
+a query builder, row-to-model mapping, migrations — lives in the ORM and leans on the
+primitives here.
 
 > **Module name:** the Swift module is **`PerunPGSQL`** (`import PerunPGSQL`), matching the
 > repository. The umbrella **Perun** framework and a future `PerunORM` build on top of it.
@@ -116,10 +116,9 @@ let pool = PostgresClient(configuration: config, maxConnections: 8)
 
 let rows = try await pool.query("SELECT * FROM users").rows          // check-out/run/return
 
-try await pool.withConnection { conn in                              // a whole transaction
-    try await conn.query("BEGIN")
-    try await conn.execute(stmt, [a])
-    try await conn.query("COMMIT")
+try await pool.withTransaction { tx in                               // BEGIN … COMMIT (ROLLBACK on throw)
+    try await tx.query("INSERT INTO ledger (delta) VALUES ($1)", [amount])
+    try await tx.query("UPDATE accounts SET balance = balance + $1", [amount])
 }
 await pool.shutdown()
 ```
@@ -174,7 +173,7 @@ layer imports Foundation for `UUID`/`Date`/`Data`/`Decimal`.
 ```
 Sources/
   COpenSSL/            C-interop shim for libssl/libcrypto
-  Perun/
+  PerunPGSQL/
     Socket/            POSIX socket wrapper
     Wire/              ByteReader/Writer, frontend & backend messages
     Crypto/            SHA-256, MD5, HMAC, PBKDF2, Base64 (from scratch)
@@ -184,7 +183,7 @@ Sources/
     PostgresConnection.swift   the connection actor
     PostgresClient.swift       the pool
   perun-demo/          runnable end-to-end showcase
-Tests/PerunTests/      crypto vectors (RFC), SCRAM (RFC 7677), wire & type codecs
+Tests/PerunTests/      crypto vectors (RFC), SCRAM (RFC 7677), wire & type codecs, live integration
 ```
 
 ## Testing
@@ -211,13 +210,13 @@ docker run -d --name pg -e POSTGRES_HOST_AUTH_METHOD=trust \
 
 The ORM builds on these driver primitives. The next driver-side pieces that unlock it:
 
-- **Transactions** — a `withTransaction { }` helper (BEGIN/COMMIT/ROLLBACK + savepoints).
 - **Row → model decoding** — materialize a `PostgresRow` into a Swift struct (a
   `RowDecodable`/`Codable` bridge), so the ORM gets models, not cells.
 - **`RETURNING` and batch** ergonomics for inserts and updates.
 - **Binary parameter encoding** for the hot insert/update path.
 
-Typed columns, prepared statements and the pool are already in place to build on.
+Typed columns, prepared statements, the pool, transactions (`withTransaction`) and
+throwing by-name decoding (`row.decode("col", as:)`) are already in place to build on.
 
 ## Status & limitations
 
