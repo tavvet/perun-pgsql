@@ -69,7 +69,7 @@ lines the ORM can rely on and reshape, not an opaque dependency.
 | **Arrays** | One-dimensional array **parameters** (`int8[]`, `text[]`, `uuid[]`, …) via `PostgresArray` — text or binary |
 | **TLS** | `SSLRequest` negotiation + OpenSSL channel; modes = disable / allow plaintext fallback / encrypt without verification / verify full |
 | **Pool** | `PostgresClient` — lazy, bounded, `withConnection {}`, reuse/replace, graceful shutdown |
-| **Concurrency** | Per-connection FIFO async lock so overlapping queries can't interleave on the wire |
+| **Concurrency** | Per-connection FIFO async lock (cancellation-aware) so overlapping queries can't interleave on the wire; cancelling a task parked for the wire or a pool slot fails it cleanly |
 | **Extras** | `NoticeResponse` handler, **LISTEN/NOTIFY** via `AsyncStream`, query **cancellation** (`CancelRequest`) |
 
 ## Requirements
@@ -251,7 +251,6 @@ Not yet implemented (each on its own merits):
 
 - **Full SASLprep** (RFC 4013) for non-ASCII passwords — currently the identity
   mapping, which is correct for ASCII.
-- **Cancellation of tasks parked** in the connection lock / pool waiters.
 - **Statement pipelining** — an optional throughput win over the extended protocol.
 
 ## License

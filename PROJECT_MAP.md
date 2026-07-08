@@ -236,6 +236,12 @@ The actor alone is not enough because actors are reentrant across `await`.
 Without the explicit lock, two tasks could interleave protocol messages on one
 socket.
 
+A task parked for the lock is cancellation-aware: cancelled before it acquires the
+wire, it is dropped from the queue and its `lock()` throws `CancellationError` (it
+never touched the socket, so abandoning the wait is safe). Both resume paths —
+handoff from `unlock()` and cancellation — run under actor isolation, and each guards
+on queue membership, so a waiter is resumed exactly once.
+
 ### Simple Query
 
 Entry point:
@@ -537,7 +543,10 @@ Acquire behavior:
 1. Fail if shut down.
 2. Reuse idle connection if available.
 3. Open a new connection if under capacity.
-4. Otherwise enqueue a waiter.
+4. Otherwise enqueue a waiter. An enqueued waiter is cancellation-aware — the same
+   pattern as the wire lock: if its task is cancelled it leaves the queue and
+   `acquire()` throws `CancellationError` (it never held a slot), and the resume is
+   guarded so a waiter handed a connection concurrently is not resumed twice.
 
 Release behavior:
 
@@ -724,6 +733,8 @@ environment variables.
 - `BinaryParameterIntegrationTests`: round-trip of binary parameters (integers, floats,
   bool, text, UUID, timestamptz, bytea, numeric, json/jsonb, arrays), NULL parameters
   and binary results.
+- `CancellationIntegrationTests`: cancelling a task parked for a pool slot or for the
+  wire lock fails it with `CancellationError` and leaves the pool / connection usable.
 
 ## Local Verification
 

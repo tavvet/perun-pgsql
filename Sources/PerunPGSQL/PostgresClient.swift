@@ -22,7 +22,8 @@ public actor PostgresClient {
     /// How many connections currently exist (idle + checked out + connecting).
     private var openCount = 0
     /// Tasks parked waiting for a connection to free up.
-    private var waiters: [CheckedContinuation<PostgresConnection, Error>] = []
+    private var waiters: [(id: UInt64, continuation: CheckedContinuation<PostgresConnection, Error>)] = []
+    private var nextWaiterID: UInt64 = 0
     private var isShutDown = false
 
     public init(configuration: ConnectionConfiguration, maxConnections: Int = 10) {
@@ -94,7 +95,7 @@ public actor PostgresClient {
         let parked = waiters
         waiters.removeAll()
         for waiter in parked {
-            waiter.resume(throwing: PerunError.clientShutdown)
+            waiter.continuation.resume(throwing: PerunError.clientShutdown)
         }
         // Connections still checked out are closed when they are released.
     }
@@ -123,10 +124,28 @@ public actor PostgresClient {
             }
         }
 
-        // At capacity — wait for a connection to come back.
-        return try await withCheckedThrowingContinuation { continuation in
-            waiters.append(continuation)
+        // At capacity — wait for a connection to come back. A cancelled waiter must
+        // leave the queue and fail, not orphan its continuation and hold its slot.
+        let id = nextWaiterID
+        nextWaiterID += 1
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                if Task.isCancelled {
+                    continuation.resume(throwing: CancellationError())
+                } else {
+                    waiters.append((id, continuation))
+                }
+            }
+        } onCancel: {
+            Task { await self.cancelWaiter(id) }
         }
+    }
+
+    /// Drop a cancelled waiter from the queue and fail its `acquire()`. A no-op if a
+    /// connection was already handed to it (it won the race with cancellation).
+    private func cancelWaiter(_ id: UInt64) {
+        guard let index = waiters.firstIndex(where: { $0.id == id }) else { return }
+        waiters.remove(at: index).continuation.resume(throwing: CancellationError())
     }
 
     private func release(_ connection: PostgresConnection) async {
@@ -147,7 +166,7 @@ public actor PostgresClient {
             return
         }
         if !waiters.isEmpty {
-            waiters.removeFirst().resume(returning: connection)   // hand straight to a waiter
+            waiters.removeFirst().continuation.resume(returning: connection)   // hand straight to a waiter
         } else {
             idle.append(connection)
         }
@@ -182,13 +201,13 @@ public actor PostgresClient {
             if isShutDown {
                 openCount -= 1
                 try? await replacement.close()
-                waiter.resume(throwing: PerunError.clientShutdown)
+                waiter.continuation.resume(throwing: PerunError.clientShutdown)
                 return
             }
-            waiter.resume(returning: replacement)
+            waiter.continuation.resume(returning: replacement)
         } catch {
             openCount -= 1
-            waiter.resume(throwing: error)
+            waiter.continuation.resume(throwing: error)
         }
     }
 }

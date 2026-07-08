@@ -258,7 +258,7 @@ public actor PostgresConnection {
     /// statements; the result reflects the last statement that produced rows.
     @discardableResult
     public func query(_ sql: String) async throws -> QueryResult {
-        await lock(); defer { unlock() }
+        try await lock(); defer { unlock() }
         return try await runSimpleQuery(sql)
     }
 
@@ -274,7 +274,7 @@ public actor PostgresConnection {
                       _ parameters: [(any PostgresEncodable)?],
                       parameterFormat: PostgresFormat = .text,
                       resultFormat: PostgresFormat = .text) async throws -> QueryResult {
-        await lock(); defer { unlock() }
+        try await lock(); defer { unlock() }
         return try await runParameterizedQuery(sql, parameters,
                                                parameterFormat: parameterFormat,
                                                resultFormat: resultFormat)
@@ -283,7 +283,7 @@ public actor PostgresConnection {
     /// Parse a statement once so it can be executed repeatedly with different
     /// parameters. The server reports the parameter and result types up front.
     public func prepare(_ sql: String) async throws -> PreparedStatement {
-        await lock(); defer { unlock() }
+        try await lock(); defer { unlock() }
         return try await runPrepare(sql)
     }
 
@@ -293,7 +293,7 @@ public actor PostgresConnection {
                         _ parameters: [(any PostgresEncodable)?] = [],
                         parameterFormat: PostgresFormat = .text,
                         resultFormat: PostgresFormat = .text) async throws -> QueryResult {
-        await lock(); defer { unlock() }
+        try await lock(); defer { unlock() }
         return try await runExecute(statement, parameters,
                                     parameterFormat: parameterFormat,
                                     resultFormat: resultFormat)
@@ -301,7 +301,7 @@ public actor PostgresConnection {
 
     /// Release a prepared statement's server-side resources.
     public func closePrepared(_ statement: PreparedStatement) async throws {
-        await lock(); defer { unlock() }
+        try await lock(); defer { unlock() }
         try await runClosePrepared(statement)
     }
 
@@ -312,7 +312,7 @@ public actor PostgresConnection {
     public func withTransaction<T: Sendable>(
         _ body: @Sendable (Transaction) async throws -> T
     ) async throws -> T {
-        await lock()
+        try await lock()
         transactionContextCounter += 1
         let contextID = transactionContextCounter
         activeTransactionContext = contextID
@@ -400,7 +400,7 @@ public actor PostgresConnection {
     /// Holds the wire lock for its whole duration, so run it on a connection you
     /// reserve for listening.
     public func waitForNotifications() async throws {
-        await lock(); defer { unlock() }
+        try await lock(); defer { unlock() }
         while true {
             try Task.checkCancellation()
             switch try await readMessage() {
@@ -553,16 +553,32 @@ public actor PostgresConnection {
     // MARK: - Wire serialization lock (FIFO async mutex)
 
     private var lockHeld = false
-    private var lockWaiters: [CheckedContinuation<Void, Never>] = []
+    private var lockWaiters: [(id: UInt64, continuation: CheckedContinuation<Void, Error>)] = []
+    private var nextLockWaiterID: UInt64 = 0
 
     /// Take exclusive use of the wire; suspends (FIFO) if another request holds it.
-    private func lock() async {
+    ///
+    /// Throws `CancellationError` if the waiting task is cancelled before it acquires
+    /// the lock: a parked waiter never touched the wire, so abandoning the wait is
+    /// safe and must not orphan its continuation.
+    private func lock() async throws {
         if !lockHeld {
             lockHeld = true
             return
         }
-        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-            lockWaiters.append(continuation)
+        let id = nextLockWaiterID
+        nextLockWaiterID += 1
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                // Runs with actor isolation; already cancelled → fail instead of parking.
+                if Task.isCancelled {
+                    continuation.resume(throwing: CancellationError())
+                } else {
+                    lockWaiters.append((id, continuation))
+                }
+            }
+        } onCancel: {
+            Task { await self.cancelLockWaiter(id) }
         }
         // Resumed by `unlock()`, which hands ownership over without clearing the flag.
     }
@@ -572,8 +588,15 @@ public actor PostgresConnection {
         if lockWaiters.isEmpty {
             lockHeld = false
         } else {
-            lockWaiters.removeFirst().resume()
+            lockWaiters.removeFirst().continuation.resume()
         }
+    }
+
+    /// Drop a cancelled waiter from the lock queue and fail its `lock()`. A no-op if
+    /// `unlock()` already handed it the lock (it won the race with cancellation).
+    private func cancelLockWaiter(_ id: UInt64) {
+        guard let index = lockWaiters.firstIndex(where: { $0.id == id }) else { return }
+        lockWaiters.remove(at: index).continuation.resume(throwing: CancellationError())
     }
 
     /// Drive the read loop until `ReadyForQuery`, assembling a `QueryResult`.
