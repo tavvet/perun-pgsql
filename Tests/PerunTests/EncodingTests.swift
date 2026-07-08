@@ -87,4 +87,15 @@ final class EncodingTests: XCTestCase {
         let viaText = try Date.decode(Array(instant.postgresText!.utf8), oid: PostgresOID.timestamptz, format: .text)
         XCTAssertEqual(viaText.timeIntervalSince1970, instant.timeIntervalSince1970, accuracy: 0.000_001)
     }
+
+    func testDateTextEncodingUsesPostgresBCEra() throws {
+        let bce = try Date.decode(Array("0044-03-15 12:30:00 BC".utf8),
+                                  oid: PostgresOID.timestamptz,
+                                  format: .text)
+
+        XCTAssertEqual(bce.postgresText, "0044-03-15 12:30:00.000000+00 BC")
+
+        let viaText = try Date.decode(Array(bce.postgresText!.utf8), oid: PostgresOID.timestamptz, format: .text)
+        XCTAssertEqual(viaText.timeIntervalSince1970, bce.timeIntervalSince1970, accuracy: 0.000_001)
+    }
 }

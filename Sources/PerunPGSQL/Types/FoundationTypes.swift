@@ -245,10 +245,12 @@ private func postgresTimestampText(_ date: Date) -> String {
     let days = Int((Double(seconds) / 86_400).rounded(.down))
     let secondOfDay = Int(seconds - Int64(days) * 86_400)
     let (year, month, day) = civilFromDays(days)
+    let displayYear = year <= 0 ? 1 - year : year               // no year zero: 0 → 1 BC
+    let eraSuffix = year <= 0 ? " BC" : ""
     return String(format: "%04d-%02d-%02d %02d:%02d:%02d.%06d+00",
-                  year, month, day,
+                  displayYear, month, day,
                   secondOfDay / 3600, (secondOfDay % 3600) / 60, secondOfDay % 60,
-                  Int(micros))
+                  Int(micros)) + eraSuffix
 }
 
 /// Inverse of `daysFromCivil`: the proleptic Gregorian date for a day count since
