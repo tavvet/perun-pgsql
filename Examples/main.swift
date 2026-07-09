@@ -13,7 +13,8 @@ case "pool":           try await runPool()
 case "streaming":      try await runStreaming()
 case "copy":           try await runCopy()
 case "notifications":  try await runNotifications()
+case "custom-type":    try await runCustomType()
 default:
     print("usage: swift run Examples <scenario>")
-    print("scenarios: basic-query, error-handling, transactions, pool, streaming, copy, notifications")
+    print("scenarios: basic-query, error-handling, transactions, pool, streaming, copy, notifications, custom-type")
 }

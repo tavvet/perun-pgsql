@@ -60,5 +60,12 @@ query API is injection-safe by construction.
 
 ### Decoding and encoding
 
+- <doc:DecodingAndEncoding>
 - ``PostgresDecodable``
 - ``PostgresEncodable``
+- ``PostgresArray``
+- ``PostgresFormat``
+
+### Under the hood
+
+- <doc:Architecture>
