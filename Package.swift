@@ -30,6 +30,14 @@ let ssl = opensslPrefix()
 let opensslSwiftSettings: [SwiftSetting] = [.unsafeFlags(["-Xcc", "-I\(ssl)/include"])]
 let opensslLinkerSettings: [LinkerSetting] = [.unsafeFlags(["-L\(ssl)/lib"])]
 
+// swift-docc-plugin is pulled in only for documentation builds (set PERUN_BUILD_DOCS=1, as
+// Scripts/build-docs.sh does), so a normal build — and anyone depending on this package — never
+// carries a docs tool in its dependency graph.
+var packageDependencies: [Package.Dependency] = []
+if ProcessInfo.processInfo.environment["PERUN_BUILD_DOCS"] != nil {
+    packageDependencies.append(.package(url: "https://github.com/apple/swift-docc-plugin", from: "1.0.0"))
+}
+
 let package = Package(
     name: "PerunPGSQL",
     platforms: [
@@ -39,6 +47,7 @@ let package = Package(
         .library(name: "PerunPGSQL", targets: ["PerunPGSQL"]),
         .executable(name: "perun-demo", targets: ["perun-demo"]),
     ],
+    dependencies: packageDependencies,
     targets: [
         // C-interop shim exposing libssl/libcrypto to Swift.
         .systemLibrary(name: "COpenSSL", path: "Sources/COpenSSL"),

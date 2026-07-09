@@ -1,2 +1,5 @@
 .build
 
+# Resolved only for a docs build (PERUN_BUILD_DOCS=1); the normal graph has no dependencies.
+Package.resolved
+
