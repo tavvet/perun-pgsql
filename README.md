@@ -80,217 +80,26 @@ lines the ORM can rely on and reshape, not an opaque dependency.
   `export PKG_CONFIG_PATH="$(brew --prefix openssl@3)/lib/pkgconfig"`. On Debian/Ubuntu:
   `apt install libssl-dev pkg-config` (no further configuration needed).
 
-## Usage
+## Documentation
 
-### Connecting
+The full guides are DocC articles. Build them (into a `.doccarchive` you can open in Xcode)
+with:
 
-```swift
-let conn = try await PostgresConnection.connect(
-    ConnectionConfiguration(host: "localhost", user: "me", database: "app",
-                            password: "secret", tlsMode: .verifyFull))
-await conn.isSecure    // true when the channel is encrypted
+```bash
+./Scripts/build-docs.sh
 ```
 
-### Prepared statements
+- **Getting started** — install, connect, run your first query.
+- **Connecting** — configuration, the TLS modes, and authentication.
+- **Running queries** — parameters, prepared statements, and pipelining.
+- **Transactions** and **Connection pool** — atomic work and concurrency.
+- **Streaming**, **COPY**, and **LISTEN / NOTIFY** — large results, bulk load/dump, notifications.
+- **Decoding and encoding** — the type system, arrays, and custom codecs.
+- **Errors and recovery** — the error model, the reusability contract, cancellation, timeouts.
+- **Architecture** — how the driver is put together.
 
-```swift
-let insert = try await conn.prepare("INSERT INTO t (a, b) VALUES ($1, $2)")
-try await conn.execute(insert, [1, "one"])
-try await conn.execute(insert, [2, "two"])
-try await conn.execute(insert, [3, nil])          // nil → SQL NULL
-```
-
-### Pipelining
-
-Run one prepared statement over many parameter sets in a single round trip instead of
-`N` — a large latency win for bulk writes. `pipeline` runs the batch atomically (one
-implicit transaction: all sets commit, or the batch rolls back and it throws):
-
-```swift
-try await conn.pipeline(insert, [[1, "one"], [2, "two"], [3, "three"]])   // all-or-nothing
-```
-
-`pipelineIndependently` gives each set its own autocommit unit — one failing neither
-rolls back nor skips the others — and returns a per-set `Result`:
-
-```swift
-for outcome in try await conn.pipelineIndependently(insert, rows) {
-    if case .failure(let error) = outcome { /* this set failed; the rest still ran */ }
-}
-```
-
-A batch can also mix different statements — pass `[PostgresQuery]`. Both modes work the
-same way (atomic here):
-
-```swift
-try await conn.pipeline([
-    PostgresQuery("INSERT INTO log (msg) VALUES ($1)", ["started"]),
-    PostgresQuery("UPDATE counters SET n = n + 1 WHERE k = $1", ["runs"]),
-])
-```
-
-Commands can't depend on each other's results (all are sent before any reply is read),
-and the batch should have small per-command results — pipelining is for bulk
-`INSERT`/`UPDATE`, not for fetching large result sets.
-
-### Streaming large results
-
-For the other direction — a result too big to hold in memory — `queryStream` returns an
-`AsyncSequence` of rows fetched in bounded chunks, so you process the result one row at a
-time and a slow consumer throttles the server instead of filling memory:
-
-```swift
-for try await row in try await conn.queryStream("SELECT id, body FROM documents") {
-    try index(row.decode("id", as: Int.self), row.decode("body", as: String.self))
-}
-```
-
-The stream holds the connection exclusively until it ends (like a transaction), so no
-other query runs on it meanwhile; `chunkSize:` tunes rows-per-round-trip. Stopping early —
-a `break`, a thrown error, or cancelling the task (even while it waits on a slow query) —
-closes the server-side portal and frees the connection, which stays usable:
-
-```swift
-for try await row in try await conn.queryStream("SELECT * FROM events", chunkSize: 1000) {
-    if try row.decode("kind", as: String.self) == "target" { return row }   // break → connection reusable
-}
-```
-
-### Bulk load and dump with COPY
-
-`COPY` is PostgreSQL's fast bulk path. The driver moves the raw `CopyData` bytes in the COPY
-statement's format (text, CSV, or binary) — formatting and parsing rows is left to you.
-
-`copyIn` bulk-loads from a `write` closure; returning finishes the copy, throwing aborts and
-rolls it back:
-
-```swift
-try await conn.copyIn("COPY people (id, name) FROM STDIN") { writer in
-    for person in people { try await writer.write("\(person.id)\t\(person.name)\n") }
-}
-```
-
-`copyOut` streams `COPY … TO STDOUT` as an `AsyncSequence` of byte chunks (the same
-exclusive-hold, early-stop semantics as `queryStream`):
-
-```swift
-for try await chunk in try await conn.copyOut("COPY people TO STDOUT") {
-    try file.write(contentsOf: chunk)
-}
-```
-
-### Timeouts
-
-`withTimeout` bounds any operation. On a timeout the query is cancelled server-side (a
-`CancelRequest`) and its connection is drained and left reusable — it composes with a single
-query, a pool `query`, or a whole `withTransaction`:
-
-```swift
-let rows = try await withTimeout(.seconds(5)) {
-    try await pool.query("SELECT * FROM big_report").rows
-}   // throws PerunError.timedOut if it overruns; the connection stays usable
-```
-
-### Typed decoding (text or binary)
-
-```swift
-// Request binary result columns; decoded values are identical to text.
-let row = try await conn.query("SELECT now() AS t, 12.5::numeric AS n",
-                               [], resultFormat: .binary).rows[0]
-let t: Date    = try row.decode("t")
-let n: Decimal = try row.decode("n")
-let maybe: String? = try row.decodeIfPresent("optional")   // nil on SQL NULL
-```
-
-Parameters can likewise be sent in binary with `parameterFormat: .binary` (integer,
-floating-point, bool, string, `UUID`, `Date`/timestamptz, `Data`/`[UInt8]` (bytea),
-`Decimal`/numeric and `PostgresJSON` (json/jsonb) values; any other type falls back
-to text).
-
-Arrays are sent through `PostgresArray` — `PostgresArray([1, 2, 3])` for one dimension,
-`PostgresArray([[1, 2], [3, 4]])` for two, or `init(dimensions:elements:elementTypeOID:)`
-for higher — rendering the `{…}` text form, or the binary array wire format when every
-element has one. Elements are any encodable value, and `nil` is SQL NULL.
-
-Array columns decode with `decodeArray` — into `[T]`, `[[T]]`, `[[[T]]]` and deeper, from
-either wire format. The nesting must match the column's dimensionality, and an optional
-scalar (`[T?]`) admits SQL NULLs:
-
-```swift
-let tags: [Int]        = try row.decodeArray("tags")           // {1,2,3}
-let names: [String?]   = try row.decodeArray("names")          // {a,NULL,b}
-let grid: [[Int]]      = try row.decodeArray("grid")           // {{1,2},{3,4}}
-let cube: [[[Int]]]    = try row.decodeArray("cube")           // {{{1,2},{3,4}},…}
-```
-
-### Errors
-
-A failed statement throws `PerunError.server(PostgresServerError)`, carrying the whole
-`ErrorResponse`. Branch on the typed `sqlState` — never on the (localized) message:
-
-```swift
-do {
-    try await conn.query("INSERT INTO users (email) VALUES ($1)", [email])
-} catch let error as PerunError {
-    switch error.serverError?.sqlState {
-    case .uniqueViolation where error.serverError?.constraintName == "users_email_key":
-        throw SignupError.emailTaken                       // your domain error, above the driver
-    case .serializationFailure, .deadlockDetected:
-        break                                              // transient (class 40…); retry is your call
-    default:
-        throw error
-    }
-}
-```
-
-`sqlStateCode` gives the raw five-character code for anything the driver doesn't name.
-A server error leaves the connection healthy — it is not a wire desync — so a pooled
-connection is safely reused after one.
-
-### Connection pool
-
-```swift
-let pool = PostgresClient(configuration: config, maxConnections: 8)
-
-let rows = try await pool.query("SELECT * FROM users").rows          // check-out/run/return
-
-try await pool.withTransaction { tx in                               // BEGIN … COMMIT (ROLLBACK on throw)
-    try await tx.query("INSERT INTO ledger (delta) VALUES ($1)", [amount])
-    try await tx.query("UPDATE accounts SET balance = balance + $1", [amount])
-}
-await pool.shutdown()
-```
-
-### LISTEN / NOTIFY
-
-```swift
-try await conn.listen(to: "events")
-Task { try await conn.waitForNotifications() }          // pump the socket
-for await note in conn.notifications {
-    print(note.channel, note.payload)
-}
-```
-
-`notifications` uses a bounded newest-first buffer (`notificationBufferLimit`,
-default `1024`) so an unconsumed notification stream cannot grow without bound.
-
-### Cancellation
-
-Cancelling the task asks the server to cancel an in-flight query (a `CancelRequest` on a
-side connection), drains the response, and throws `CancellationError`:
-
-```swift
-let work = Task { try await conn.query("SELECT slow_thing()") }
-work.cancel()
-```
-
-Cancellation is **best-effort**, exactly as PostgreSQL's `CancelRequest` is: the request
-races the query, so one that has already finished — or not yet reached the server — runs
-to completion anyway. `CancellationError` therefore does **not** prove the query didn't
-execute; a side-effecting statement may have committed. Don't rely on cancellation to undo
-writes — use explicit transaction control if you need that guarantee.
-
-`conn.cancelCurrentQuery()` sends the same request explicitly, without cancelling the task.
+Runnable, compile-checked examples live in [`Examples/`](Examples): `swift run Examples <scenario>`
+(e.g. `basic-query`, `transactions`, `streaming`, `copy`, `notifications`, `custom-type`).
 
 ## Architecture
 
@@ -321,7 +130,7 @@ layer imports Foundation for `UUID`/`Date`/`Data`/`Decimal`.
 
 ```
 Sources/
-  COpenSSL/            C-interop shim for libssl/libcrypto
+  COpenSSL/            C-interop shim for libssl/libcrypto (located via pkg-config)
   PerunPGSQL/
     Socket/            POSIX socket wrapper
     Wire/              ByteReader/Writer, frontend & backend messages
@@ -331,24 +140,25 @@ Sources/
     TLS/               OpenSSL-backed TLSConnection
     PostgresConnection.swift   the connection actor
     PostgresClient.swift       the pool
-  perun-demo/          runnable end-to-end showcase
+    PerunPGSQL.docc/           the documentation guides
+  perun-demo/          a small runnable program
+Examples/              runnable, compile-checked examples (swift run Examples <scenario>)
 Tests/PerunTests/      crypto vectors (RFC), SCRAM (RFC 7677), wire & type codecs, live integration
+Scripts/build-docs.sh  builds the DocC documentation
 ```
 
 ## Testing
 
+With OpenSSL on the `pkg-config` path (see [Requirements](#requirements)):
+
 ```bash
-swift test          # crypto/SCRAM/wire/type unit tests — no server needed
-swift run perun-demo   # full showcase against a live PostgreSQL
+swift test                      # unit tests (crypto vectors, SCRAM, wire, type codecs) — no server
+swift run Examples basic-query  # a runnable example against a live PostgreSQL
 ```
 
-The demo reads standard `PG*` environment variables
-(`PGHOST`/`PGPORT`/`PGUSER`/`PGDATABASE`/`PGPASSWORD`/`PGSSLMODE`).
-`PGSSLMODE` accepts `disable`, `prefer`, `require`, and `verify-full`; in Swift
-code the unsafe modes are named `.allowPlaintextFallback` and
-`.encryptWithoutVerification` so the risk is visible at the call site.
-
-To bring up a throwaway server:
+Integration tests run against a live server when `PERUN_PGSQL_INTEGRATION=1`; they and the
+examples read the standard `PG*` variables (`PGHOST` / `PGPORT` / `PGUSER` / `PGDATABASE` /
+`PGPASSWORD` / `PGSSLMODE`). To bring up a throwaway server:
 
 ```bash
 docker run -d --name pg -e POSTGRES_HOST_AUTH_METHOD=trust \

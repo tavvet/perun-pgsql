@@ -49,16 +49,36 @@ inside one ``PostgresClient/withConnection(_:)`` or a transaction.
 
 ## Pipelining
 
-Several autocommit queries issued concurrently on one connection are genuinely in flight together
-— the driver writes each request without waiting and matches responses back in order. This trims
-round-trip latency:
+Pipelining sends several statements before reading any reply, so `N` statements cost one round
+trip instead of `N` — a large win for bulk writes.
+
+Run one prepared statement over many parameter sets with `pipeline`, which is **atomic** (one
+implicit transaction: every set commits, or the batch rolls back and throws):
 
 ```swift
-async let users  = connection.query("SELECT count(*) AS c FROM users")
-async let orders = connection.query("SELECT count(*) AS c FROM orders")
-let (u, o) = try await (users, orders)
+let insert = try await connection.prepare("INSERT INTO t (a, b) VALUES ($1, $2)")
+try await connection.pipeline(insert, [[1, "one"], [2, "two"], [3, "three"]])
 ```
 
-Pipelining buys latency, not server-side parallelism — one backend still runs the queries
-serially, and responses arrive in order, so a slow query head-of-line-blocks the ones behind it
-on that connection. For real concurrency, use a <doc:ConnectionPool>.
+`pipelineIndependently` instead gives each set its own autocommit unit — one failing neither rolls
+back nor skips the others — and returns a per-set `Result`:
+
+```swift
+for outcome in try await connection.pipelineIndependently(insert, sets) {
+    if case .failure(let error) = outcome { /* this set failed; the others still ran */ }
+}
+```
+
+A batch can also mix different statements — pass an array of ``PostgresQuery``:
+
+```swift
+try await connection.pipeline([
+    PostgresQuery("INSERT INTO log (msg) VALUES ($1)", ["started"]),
+    PostgresQuery("UPDATE counters SET n = n + 1 WHERE k = $1", ["runs"]),
+])
+```
+
+Because every request is sent before any reply is read, a command can't depend on an earlier
+one's result, and the batch should have small per-command results — pipelining is for bulk
+`INSERT`/`UPDATE`, not for fetching large result sets. (Ordinary concurrent autocommit queries on
+one connection pipeline too; for real parallelism, use a <doc:ConnectionPool>.)
