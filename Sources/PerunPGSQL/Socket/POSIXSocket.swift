@@ -6,8 +6,10 @@ import Glibc
 import Musl
 #endif
 
-/// Errors thrown by the low-level socket layer.
-public enum SocketError: Error, CustomStringConvertible, Sendable {
+/// Errors thrown by the low-level socket layer. Internal — `connect` maps these to
+/// `PerunError.connectionFailed`, and steady-state I/O maps them to `PerunError.ioError`, so
+/// callers only ever see `PerunError`.
+enum SocketError: Error, CustomStringConvertible, Sendable {
     case resolutionFailed(host: String, port: UInt16, code: Int32)
     case connectionFailed(host: String, port: UInt16, reason: String)
     case sendFailed(errno: Int32)

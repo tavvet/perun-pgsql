@@ -7,7 +7,7 @@ public struct PostgresServerError: Error, Sendable, CustomStringConvertible {
     /// Raw fields keyed by their single-byte type code (e.g. `S`, `C`, `M`).
     public let fields: [UInt8: String]
 
-    public init(fields: [UInt8: String]) {
+    init(fields: [UInt8: String]) {
         self.fields = fields
     }
 
@@ -180,6 +180,9 @@ public enum PerunError: Error, CustomStringConvertible, Sendable {
     /// mid-message close it leaves the wire's state unknown, so a pooled connection that hits it
     /// is discarded rather than reused.
     case ioError(String)
+    /// The connection could not be established — host resolution or the TCP connect failed.
+    /// Thrown by `connect`, before any wire exists.
+    case connectionFailed(String)
     /// A structured error from the server.
     case server(PostgresServerError)
     /// The server asked for an authentication method we do not implement yet.
@@ -222,6 +225,8 @@ public enum PerunError: Error, CustomStringConvertible, Sendable {
             return "connection closed by server"
         case let .ioError(detail):
             return "I/O error: \(detail)"
+        case let .connectionFailed(detail):
+            return "could not connect: \(detail)"
         case let .server(error):
             return error.description
         case let .unsupportedAuthentication(detail):
@@ -266,8 +271,8 @@ extension PerunError {
     /// pooled connection that hit it must be discarded rather than reused.
     var mayHaveDesynchronizedWire: Bool {
         switch self {
-        case .connectionClosed, .ioError, .protocolViolation, .tlsHandshakeFailed, .tlsIO,
-             .tlsNotAvailable, .authenticationFailed, .unsupportedAuthentication:
+        case .connectionClosed, .ioError, .connectionFailed, .protocolViolation, .tlsHandshakeFailed,
+             .tlsIO, .tlsNotAvailable, .authenticationFailed, .unsupportedAuthentication:
             return true
         case .server, .unexpectedNull, .columnNotFound, .decodingFailed, .tooManyParameters,
              .clientShutdown, .preparedStatementConnectionMismatch, .copyMismatch, .timedOut:

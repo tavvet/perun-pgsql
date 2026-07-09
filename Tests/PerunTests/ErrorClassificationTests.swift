@@ -10,6 +10,7 @@ final class ErrorClassificationTests: XCTestCase {
         let errors: [PerunError] = [
             .connectionClosed,
             .ioError("recv() failed — errno 54"),
+            .connectionFailed("could not connect to db:5432"),
             .protocolViolation("bad frame"),
             .tlsHandshakeFailed("bad cert"),
             .tlsIO("read failed"),

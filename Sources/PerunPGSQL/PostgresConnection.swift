@@ -206,8 +206,13 @@ public actor PostgresConnection {
     /// server reports it is ready for queries.
     public static func connect(_ configuration: ConnectionConfiguration) async throws -> PostgresConnection {
         let ioQueue = DispatchQueue(label: "perun.connection.io")
-        let fd = try await withBlockingIO(on: ioQueue) {
-            try SystemSocket.makeConnected(host: configuration.host, port: configuration.port)
+        let fd: Int32
+        do {
+            fd = try await withBlockingIO(on: ioQueue) {
+                try SystemSocket.makeConnected(host: configuration.host, port: configuration.port)
+            }
+        } catch let error as SocketError {
+            throw PerunError.connectionFailed(error.description)   // one error type out of connect: PerunError
         }
         let connection = PostgresConnection(fd: fd, ioQueue: ioQueue,
                                             host: configuration.host, port: configuration.port,
