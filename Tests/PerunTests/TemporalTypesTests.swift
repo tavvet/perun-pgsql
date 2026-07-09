@@ -56,6 +56,24 @@ final class TemporalTypesTests: XCTestCase {
         XCTAssertEqual(text, PostgresTime(hour: 4, minute: 5, second: 6, microsecond: 789))
     }
 
+    func testTimeTzEncoding() {
+        let value = PostgresTimeTz(time: PostgresTime(hour: 12, minute: 34, second: 56), zoneOffsetSeconds: 18000)
+        XCTAssertEqual(value.postgresText, "12:34:56.000000+05:00")
+        XCTAssertEqual(value.postgresTypeOID, 1266)
+        // Binary: int64 microseconds, int32 zone (seconds *west* = negated offset).
+        XCTAssertEqual(PostgresTimeTz(time: PostgresTime(microseconds: 1), zoneOffsetSeconds: 18000).postgresBinary(),
+                       [0, 0, 0, 0, 0, 0, 0, 1, 0xFF, 0xFF, 0xB9, 0xB0])   // -18000 = 0xFFFFB9B0
+    }
+
+    func testTimeTzDecoding() throws {
+        let text = try PostgresTimeTz.decode(Array("12:34:56.789+05:30".utf8), oid: 1266, format: .text)
+        XCTAssertEqual(text, PostgresTimeTz(time: PostgresTime(hour: 12, minute: 34, second: 56, microsecond: 789_000),
+                                            zoneOffsetSeconds: 19800))
+        let binary = try PostgresTimeTz.decode(
+            [0, 0, 0, 0, 0, 0, 0, 1, 0xFF, 0xFF, 0xB9, 0xB0], oid: 1266, format: .binary)
+        XCTAssertEqual(binary, PostgresTimeTz(time: PostgresTime(microseconds: 1), zoneOffsetSeconds: 18000))
+    }
+
     // MARK: - Live round-trip
 
     func testTemporalRoundTripLive() async throws {
@@ -73,6 +91,14 @@ final class TemporalTypesTests: XCTestCase {
             let back: PostgresTime = try await connection.query(
                 "SELECT $1::time AS v", [time], resultFormat: format).rows[0].decode("v")
             XCTAssertEqual(back, time, "time round-trip (\(format))")
+        }
+
+        let timetz = PostgresTimeTz(time: PostgresTime(hour: 13, minute: 14, second: 15, microsecond: 678_900),
+                                    zoneOffsetSeconds: 19800)   // +05:30
+        for format in [PostgresFormat.text, .binary] {
+            let back: PostgresTimeTz = try await connection.query(
+                "SELECT $1::timetz AS v", [timetz], resultFormat: format).rows[0].decode("v")
+            XCTAssertEqual(back, timetz, "timetz round-trip (\(format))")
         }
 
         // Decode values PostgreSQL renders itself.

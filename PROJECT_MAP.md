@@ -536,8 +536,9 @@ Supported built-in type families:
 - bytea as `[UInt8]` and `Data`;
 - UUID;
 - date/timestamp/timestamptz as `Date`;
-- interval as `PostgresInterval` (months/days/microseconds) and time as `PostgresTime`
-  (microseconds since midnight) — `TemporalTypes.swift`, text and binary;
+- interval as `PostgresInterval` (months/days/microseconds), time as `PostgresTime`
+  (microseconds since midnight), and timetz as `PostgresTimeTz` (time + east-of-UTC offset) —
+  `TemporalTypes.swift`, text and binary;
 - numeric as `Decimal`;
 - arrays of any of the above (`decodeArray`, any number of dimensions).
 
@@ -952,9 +953,10 @@ header) — plus the `Bind` message layout when binary parameters are requested.
 
 ### `TemporalTypesTests`
 
-`PostgresInterval` and `PostgresTime`: text/binary encode and decode (byte-exact binary,
-the `intervalstyle=postgres` text parser, sub-second sign), plus a live round-trip in both
-result formats, decoding a server-produced interval, and an `interval[]` array.
+`PostgresInterval`, `PostgresTime`, and `PostgresTimeTz`: text/binary encode and decode
+(byte-exact binary, the `intervalstyle=postgres` text parser, sub-second sign, the timetz
+seconds-west zone), plus a live round-trip in both result formats, decoding a server-produced
+interval, and an `interval[]` array.
 
 ### `TimeoutTests`
 

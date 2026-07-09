@@ -159,6 +159,7 @@ private func arrayTypeOID(forElement oid: Int32) -> Int32 {
     case PostgresOID.float8:      return 1022
     case PostgresOID.date:        return 1182
     case PostgresOID.time:        return 1183
+    case PostgresOID.timetz:      return 1270
     case PostgresOID.interval:    return 1187
     case PostgresOID.timestamp:   return 1115
     case PostgresOID.timestamptz: return 1185

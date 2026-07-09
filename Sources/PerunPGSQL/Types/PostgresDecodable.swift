@@ -33,6 +33,7 @@ public enum PostgresOID {
     public static let timestamp: Int32 = 1114
     public static let timestamptz: Int32 = 1184
     public static let interval: Int32 = 1186
+    public static let timetz: Int32 = 1266
     public static let numeric: Int32 = 1700
     public static let uuid: Int32 = 2950
     public static let jsonb: Int32 = 3802

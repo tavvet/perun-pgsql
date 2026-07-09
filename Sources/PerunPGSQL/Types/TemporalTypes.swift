@@ -33,6 +33,19 @@ public struct PostgresTime: Sendable, Equatable {
     }
 }
 
+/// A PostgreSQL `timetz` (time of day with a UTC offset). `zoneOffsetSeconds` is east of UTC
+/// in the usual sense (`+05:00` → `18_000`), the negation of PostgreSQL's internal "seconds
+/// west" representation.
+public struct PostgresTimeTz: Sendable, Equatable {
+    public var time: PostgresTime
+    public var zoneOffsetSeconds: Int32
+
+    public init(time: PostgresTime, zoneOffsetSeconds: Int32) {
+        self.time = time
+        self.zoneOffsetSeconds = zoneOffsetSeconds
+    }
+}
+
 // MARK: - Decoding
 
 extension PostgresInterval: PostgresDecodable {
@@ -71,9 +84,29 @@ extension PostgresTime: PostgresDecodable {
     }
 }
 
-// Arrays of either type decode through the recursive `decodeArray` path.
+extension PostgresTimeTz: PostgresDecodable {
+    public static func decode(_ bytes: [UInt8], oid: Int32, format: PostgresFormat) throws -> PostgresTimeTz {
+        switch format {
+        case .binary:
+            // int64 microseconds, int32 zone (seconds *west* of UTC).
+            guard bytes.count == 12 else { throw postgresDecodeError("timetz", oid: oid, format: format, bytes) }
+            var reader = ByteReader(bytes)
+            let microseconds = try reader.readInt64()
+            let zoneWest = try reader.readInt32()
+            return PostgresTimeTz(time: PostgresTime(microseconds: microseconds), zoneOffsetSeconds: -zoneWest)
+        case .text:
+            guard let value = parsePostgresTimeTz(utf8String(bytes)) else {
+                throw postgresDecodeError("timetz", oid: oid, format: format, bytes)
+            }
+            return value
+        }
+    }
+}
+
+// Arrays of these types decode through the recursive `decodeArray` path.
 extension PostgresInterval: PostgresArrayDecodable { public typealias ArrayScalar = PostgresInterval }
 extension PostgresTime: PostgresArrayDecodable { public typealias ArrayScalar = PostgresTime }
+extension PostgresTimeTz: PostgresArrayDecodable { public typealias ArrayScalar = PostgresTimeTz }
 
 // MARK: - Encoding
 
@@ -104,6 +137,22 @@ extension PostgresTime: PostgresEncodable {
     public var postgresTypeOID: Int32 { PostgresOID.time }
 
     public func postgresBinary() -> [UInt8]? { bigEndianBytes(microseconds) }
+}
+
+extension PostgresTimeTz: PostgresEncodable {
+    public var postgresText: String? {
+        let magnitude = zoneOffsetSeconds.magnitude
+        let sign = zoneOffsetSeconds < 0 ? "-" : "+"
+        var zone = "\(sign)\(pad(magnitude / 3600, to: 2)):\(pad((magnitude % 3600) / 60, to: 2))"
+        if magnitude % 60 != 0 { zone += ":\(pad(magnitude % 60, to: 2))" }
+        return (time.postgresText ?? "") + zone
+    }
+
+    public var postgresTypeOID: Int32 { PostgresOID.timetz }
+
+    public func postgresBinary() -> [UInt8]? {
+        bigEndianBytes(time.microseconds) + bigEndianBytes(-zoneOffsetSeconds)   // zone is seconds west of UTC
+    }
 }
 
 // MARK: - Text parsing
@@ -162,6 +211,24 @@ private func parseClockToMicroseconds(_ token: Substring) -> Int64? {
         }
     }
     return negative ? -micros : micros
+}
+
+/// Parse `HH:MM:SS[.ffffff]±HH[:MM[:SS]]`, e.g. `12:34:56.789+05:30`. The time part never
+/// carries a sign, so the first `+`/`-` starts the zone.
+func parsePostgresTimeTz(_ text: String) -> PostgresTimeTz? {
+    guard let signIndex = text.firstIndex(where: { $0 == "+" || $0 == "-" }),
+          let micros = parseClockToMicroseconds(text[..<signIndex]) else { return nil }
+
+    var zone = text[signIndex...]
+    let negative = zone.first == "-"
+    zone = zone.dropFirst()
+    let parts = zone.split(separator: ":")
+    guard let hoursText = parts.first, let hours = Int32(hoursText) else { return nil }
+    let minutes = parts.count > 1 ? (Int32(parts[1]) ?? 0) : 0
+    let seconds = parts.count > 2 ? (Int32(parts[2]) ?? 0) : 0
+    let magnitude = hours * 3600 + minutes * 60 + seconds
+    return PostgresTimeTz(time: PostgresTime(microseconds: micros),
+                          zoneOffsetSeconds: negative ? -magnitude : magnitude)
 }
 
 /// Left-pad a non-negative integer with zeros to at least `width` digits.
