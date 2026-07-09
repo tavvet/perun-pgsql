@@ -34,6 +34,13 @@ query API is injection-safe by construction.
 - ``PostgresClient``
 - ``ConnectionConfiguration``
 
+### Working with data
+
+- <doc:Queries>
+- <doc:Transactions>
+- <doc:ConnectionPool>
+- ``PreparedStatement``
+
 ### Handling failure
 
 - <doc:ErrorsAndRecovery>

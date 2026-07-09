@@ -8,7 +8,9 @@ let scenario = CommandLine.arguments.dropFirst().first ?? ""
 switch scenario {
 case "basic-query":    try await runBasicQuery()
 case "error-handling": try await runErrorHandling()
+case "transactions":   try await runTransactions()
+case "pool":           try await runPool()
 default:
     print("usage: swift run Examples <scenario>")
-    print("scenarios: basic-query, error-handling")
+    print("scenarios: basic-query, error-handling, transactions, pool")
 }
