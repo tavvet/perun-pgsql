@@ -27,6 +27,9 @@ public struct ConnectionConfiguration: Sendable {
     public var password: String?
     /// How to negotiate TLS. Defaults to `.verifyFull`.
     public var tlsMode: TLSMode
+    /// How long to wait for the TCP connection to each resolved address before giving up.
+    /// Defaults to 10 seconds; set `nil` to wait indefinitely (the OS default, ~130 s on Linux).
+    public var connectTimeout: Duration?
     /// Reject any backend message whose payload exceeds this many bytes. Bounds
     /// memory against a malicious or buggy server that declares a huge length.
     /// Defaults to 256 MiB.
@@ -47,6 +50,7 @@ public struct ConnectionConfiguration: Sendable {
                 database: String,
                 password: String? = nil,
                 tlsMode: TLSMode = .verifyFull,
+                connectTimeout: Duration? = .seconds(10),
                 maxMessageSize: Int = 256 * 1024 * 1024,
                 notificationBufferLimit: Int = 1024,
                 runtimeParameters: [String: String] = [:]) {
@@ -57,6 +61,7 @@ public struct ConnectionConfiguration: Sendable {
         self.database = database
         self.password = password
         self.tlsMode = tlsMode
+        self.connectTimeout = connectTimeout
         self.maxMessageSize = maxMessageSize
         self.notificationBufferLimit = notificationBufferLimit
         self.runtimeParameters = runtimeParameters
@@ -130,6 +135,9 @@ public actor PostgresConnection {
     /// Remembered so `cancelCurrentQuery` can open a fresh connection.
     private let host: String
     private let port: UInt16
+    /// Connect timeout in milliseconds (nil = wait indefinitely), reused when a later
+    /// CancelRequest opens its own side socket to the same server.
+    private let connectTimeoutMillis: Int32?
     /// Reject backend messages whose payload exceeds this many bytes (DoS guard).
     private let maxMessageSize: Int
     /// Process-local identity used to keep prepared-statement handles scoped to
@@ -183,6 +191,7 @@ public actor PostgresConnection {
                  ioQueue: DispatchQueue,
                  host: String,
                  port: UInt16,
+                 connectTimeoutMillis: Int32?,
                  maxMessageSize: Int,
                  notificationBufferLimit: Int) {
         self.fd = fd
@@ -190,6 +199,7 @@ public actor PostgresConnection {
         self.readQueue = DispatchQueue(label: "perun.connection.read")
         self.host = host
         self.port = port
+        self.connectTimeoutMillis = connectTimeoutMillis
         self.maxMessageSize = maxMessageSize
         self.connectionID = UInt64.random(in: UInt64.min ... UInt64.max)
         self.createdAt = ContinuousClock().now
@@ -202,20 +212,33 @@ public actor PostgresConnection {
 
     // MARK: - Connecting
 
+    /// Convert a `Duration?` connect timeout to whole milliseconds for `poll`, clamped to a
+    /// non-negative `Int32`. `nil` stays `nil` (wait indefinitely).
+    private static func timeoutMilliseconds(_ duration: Duration?) -> Int32? {
+        guard let duration else { return nil }
+        let millis = duration.components.seconds * 1000
+                   + duration.components.attoseconds / 1_000_000_000_000_000
+        if millis <= 0 { return 0 }
+        return millis > Int64(Int32.max) ? Int32.max : Int32(millis)
+    }
+
     /// Open a TCP connection, perform the startup handshake, and return once the
     /// server reports it is ready for queries.
     public static func connect(_ configuration: ConnectionConfiguration) async throws -> PostgresConnection {
         let ioQueue = DispatchQueue(label: "perun.connection.io")
+        let connectTimeoutMillis = timeoutMilliseconds(configuration.connectTimeout)
         let fd: Int32
         do {
             fd = try await withBlockingIO(on: ioQueue) {
-                try SystemSocket.makeConnected(host: configuration.host, port: configuration.port)
+                try SystemSocket.makeConnected(host: configuration.host, port: configuration.port,
+                                               timeoutMilliseconds: connectTimeoutMillis)
             }
         } catch let error as SocketError {
             throw PerunError.connectionFailed(error.description)   // one error type out of connect: PerunError
         }
         let connection = PostgresConnection(fd: fd, ioQueue: ioQueue,
                                             host: configuration.host, port: configuration.port,
+                                            connectTimeoutMillis: connectTimeoutMillis,
                                             maxMessageSize: configuration.maxMessageSize,
                                             notificationBufferLimit: configuration.notificationBufferLimit)
         do {
@@ -672,11 +695,13 @@ public actor PostgresConnection {
         guard processID != 0 else { return }
         let host = self.host
         let port = self.port
+        let timeoutMillis = self.connectTimeoutMillis
         // A dedicated queue and a *separate* socket: this connection may be parked in a
         // blocking recv waiting for the very query we're trying to cancel.
         let cancelQueue = DispatchQueue(label: "perun.cancel")
         try await withBlockingIO(on: cancelQueue) {
-            let fd = try SystemSocket.makeConnected(host: host, port: port)
+            let fd = try SystemSocket.makeConnected(host: host, port: port,
+                                                    timeoutMilliseconds: timeoutMillis)
             defer { SystemSocket.disconnect(fd: fd) }
             try SystemSocket.sendAll(fd: fd,
                                      FrontendMessage.cancelRequest(processID: processID, secretKey: secretKey))

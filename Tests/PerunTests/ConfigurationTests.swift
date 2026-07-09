@@ -36,4 +36,27 @@ final class ConfigurationTests: XCTestCase {
             XCTFail("expected a PerunError, got \(type(of: error)): \(error)")
         }
     }
+
+    func testConnectTimeoutBoundsAConnectToABlackHole() async {
+        // 192.0.2.1 is TEST-NET-1 (RFC 5737) — a reserved address that black-holes the SYN, so a
+        // blocking connect would otherwise hang for the OS default (~130 s on Linux). With a short
+        // connectTimeout the attempt must fail quickly; whether it ends in a timeout or a fast
+        // "unreachable" doesn't matter — the guarantee under test is that it does NOT hang.
+        let configuration = ConnectionConfiguration(host: "192.0.2.1", port: 5432,
+                                                    user: "x", database: "x", tlsMode: .disable,
+                                                    connectTimeout: .milliseconds(500))
+        let clock = ContinuousClock()
+        let start = clock.now
+        do {
+            _ = try await PostgresConnection.connect(configuration)
+            XCTFail("expected the black-hole connect to fail")
+        } catch is PerunError {
+            // connectionFailed — the expected outcome.
+        } catch {
+            XCTFail("expected a PerunError, got \(type(of: error)): \(error)")
+        }
+        let elapsed = clock.now - start
+        XCTAssertLessThan(elapsed, .seconds(8),
+                          "connect should be bounded by connectTimeout, not the OS default")
+    }
 }

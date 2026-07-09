@@ -62,8 +62,9 @@ enum SystemSocket {
         _ = sigpipeIgnored
     }
 
-    /// Resolve `host`/`port` and open a connected TCP socket, returning its fd.
-    static func makeConnected(host: String, port: UInt16) throws -> Int32 {
+    /// Resolve `host`/`port` and open a connected TCP socket, returning its fd. `timeoutMilliseconds`
+    /// bounds each address's connect attempt (nil = wait indefinitely, the OS default).
+    static func makeConnected(host: String, port: UInt16, timeoutMilliseconds: Int32?) throws -> Int32 {
         ignoreSIGPIPE()          // a peer reset mid-write must never raise SIGPIPE and kill us
         var hints = addrinfo()
         hints.ai_family = AF_UNSPEC          // IPv4 or IPv6
@@ -101,14 +102,82 @@ enum SystemSocket {
                        socklen_t(MemoryLayout<Int32>.size))
             #endif
 
-            if connect(fd, info.pointee.ai_addr, info.pointee.ai_addrlen) == 0 {
+            if let failure = establish(fd: fd,
+                                       to: info.pointee.ai_addr,
+                                       length: info.pointee.ai_addrlen,
+                                       timeoutMilliseconds: timeoutMilliseconds) {
+                lastReason = failure          // try the next address, if any
+                close(fd)
+                candidate = info.pointee.ai_next
+            } else {
                 return fd
             }
-            lastReason = errnoString(errno)
-            close(fd)
-            candidate = info.pointee.ai_next
         }
         throw SocketError.connectionFailed(host: host, port: port, reason: lastReason)
+    }
+
+    /// Drive a single `connect` to completion with a bounded wait. The socket is switched to
+    /// non-blocking so a black-holed SYN can't park the I/O thread for the OS default (~130 s on
+    /// Linux); we then `poll` for writability up to `timeoutMilliseconds` (nil = wait indefinitely)
+    /// and read `SO_ERROR` for the real verdict. Returns `nil` on success (and restores blocking
+    /// mode, which the rest of the layer expects), or a human-readable reason on failure.
+    private static func establish(fd: Int32,
+                                  to address: UnsafeMutablePointer<sockaddr>?,
+                                  length: socklen_t,
+                                  timeoutMilliseconds: Int32?) -> String? {
+        let originalFlags = fcntl(fd, F_GETFL, 0)
+        if originalFlags >= 0 { _ = fcntl(fd, F_SETFL, originalFlags | O_NONBLOCK) }
+
+        if connect(fd, address, length) == 0 {
+            restoreBlocking(fd, originalFlags)
+            return nil                                  // connected at once (typically loopback)
+        }
+        guard errno == EINPROGRESS || errno == EINTR else {
+            return errnoString(errno)                   // immediate, hard failure (e.g. refused)
+        }
+
+        var pfd = pollfd()
+        pfd.fd = fd
+        pfd.events = Int16(POLLOUT)
+        let deadline = timeoutMilliseconds.map { monotonicMillis() + Int64($0) }
+        while true {
+            let waitMillis: Int32
+            if let deadline {
+                let remaining = deadline - monotonicMillis()
+                if remaining <= 0 { return "timed out after \(timeoutMilliseconds ?? 0) ms" }
+                waitMillis = remaining > Int64(Int32.max) ? Int32.max : Int32(remaining)
+            } else {
+                waitMillis = -1                         // no deadline: block until writable
+            }
+            let ready = poll(&pfd, nfds_t(1), waitMillis)
+            if ready < 0 {
+                if errno == EINTR { continue }          // interrupted — keep waiting
+                return errnoString(errno)
+            }
+            if ready == 0 { return "timed out after \(timeoutMilliseconds ?? 0) ms" }
+
+            // Writable now, but the async connect may still have failed — SO_ERROR is the verdict.
+            var soError: Int32 = 0
+            var soLength = socklen_t(MemoryLayout<Int32>.size)
+            if getsockopt(fd, SOL_SOCKET, SO_ERROR, &soError, &soLength) < 0 {
+                return errnoString(errno)
+            }
+            if soError != 0 { return errnoString(soError) }
+            restoreBlocking(fd, originalFlags)
+            return nil                                  // connected
+        }
+    }
+
+    /// Return `fd` to the blocking mode the rest of the socket layer assumes.
+    private static func restoreBlocking(_ fd: Int32, _ originalFlags: Int32) {
+        if originalFlags >= 0 { _ = fcntl(fd, F_SETFL, originalFlags) }
+    }
+
+    /// Milliseconds from a monotonic clock — safe for measuring elapsed time (never steps backwards).
+    private static func monotonicMillis() -> Int64 {
+        var now = timespec()
+        clock_gettime(CLOCK_MONOTONIC, &now)
+        return Int64(now.tv_sec) * 1000 + Int64(now.tv_nsec) / 1_000_000
     }
 
     /// Write every byte of `bytes`, looping over partial writes.
