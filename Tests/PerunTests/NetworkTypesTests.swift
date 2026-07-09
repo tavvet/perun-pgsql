@@ -34,6 +34,16 @@ final class NetworkTypesTests: XCTestCase {
         XCTAssertNil(parseIPv4("256.1.1.1"))                                                     // octet out of range
     }
 
+    func testRejectsMalformedBinary() {
+        func decode(_ bytes: [UInt8]) throws -> PostgresInet {
+            try PostgresInet.decode(bytes, oid: PostgresOID.inet, format: .binary)
+        }
+        XCTAssertThrowsError(try decode([3, 32, 0, 4, 192, 168, 1, 5]))   // family 3 (IPv6) with a 4-byte address
+        XCTAssertThrowsError(try decode([2, 200, 0, 4, 1, 2, 3, 4]))      // prefix 200 wider than 32
+        XCTAssertThrowsError(try decode([2, 32, 0, 4, 1, 2, 3, 4, 99]))   // a trailing byte past the address
+        XCTAssertThrowsError(try decode([2, 32, 0, 4, 1, 2, 3]))          // address too short
+    }
+
     func testNetworkRoundTripLive() async throws {
         let connection = try await PostgresConnection.connect(integrationConfiguration())
 

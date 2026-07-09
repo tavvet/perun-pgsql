@@ -222,10 +222,19 @@ func parsePostgresTimeTz(_ text: String) -> PostgresTimeTz? {
     var zone = text[signIndex...]
     let negative = zone.first == "-"
     zone = zone.dropFirst()
-    let parts = zone.split(separator: ":")
-    guard let hoursText = parts.first, let hours = Int32(hoursText) else { return nil }
-    let minutes = parts.count > 1 ? (Int32(parts[1]) ?? 0) : 0
-    let seconds = parts.count > 2 ? (Int32(parts[2]) ?? 0) : 0
+    // Strict `HH[:MM[:SS]]`: reject a malformed offset rather than silently zeroing a bad field.
+    let parts = zone.split(separator: ":", omittingEmptySubsequences: false)
+    guard (1 ... 3).contains(parts.count), let hours = Int32(parts[0]) else { return nil }
+    var minutes: Int32 = 0
+    if parts.count > 1 {
+        guard let value = Int32(parts[1]), (0 ... 59).contains(value) else { return nil }
+        minutes = value
+    }
+    var seconds: Int32 = 0
+    if parts.count > 2 {
+        guard let value = Int32(parts[2]), (0 ... 59).contains(value) else { return nil }
+        seconds = value
+    }
     let magnitude = hours * 3600 + minutes * 60 + seconds
     return PostgresTimeTz(time: PostgresTime(microseconds: micros),
                           zoneOffsetSeconds: negative ? -magnitude : magnitude)

@@ -74,6 +74,16 @@ final class TemporalTypesTests: XCTestCase {
         XCTAssertEqual(binary, PostgresTimeTz(time: PostgresTime(microseconds: 1), zoneOffsetSeconds: 18000))
     }
 
+    func testTimeTzRejectsMalformedOffset() {
+        func decode(_ text: String) throws -> PostgresTimeTz {
+            try PostgresTimeTz.decode(Array(text.utf8), oid: 1266, format: .text)
+        }
+        XCTAssertThrowsError(try decode("12:34:56+05:xx"))        // non-numeric minutes (not silently zeroed)
+        XCTAssertThrowsError(try decode("12:34:56+05:99"))        // minutes out of range
+        XCTAssertThrowsError(try decode("12:34:56+05:30:99"))     // seconds out of range
+        XCTAssertThrowsError(try decode("12:34:56+05:30:45:00"))  // too many offset parts
+    }
+
     // MARK: - Live round-trip
 
     func testTemporalRoundTripLive() async throws {

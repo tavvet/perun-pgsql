@@ -32,11 +32,18 @@ extension PostgresInet: PostgresDecodable {
         case .binary:
             // uint8 family, uint8 bits, uint8 is_cidr, uint8 address-length, then the address.
             var reader = ByteReader(bytes)
-            _ = try reader.readUInt8()                       // family — inferred from the length instead
+            let family = try reader.readUInt8()
             let bits = try reader.readUInt8()
             let isCIDR = try reader.readUInt8() != 0
             let length = Int(try reader.readUInt8())
-            guard length == 4 || length == 16 else { throw postgresDecodeError("inet", oid: oid, format: format, bytes) }
+            // Reject a malformed payload: an unknown length, a family that doesn't match it (2 =
+            // IPv4, 3 = IPv6), a prefix wider than the address, or bytes past the address.
+            guard length == 4 || length == 16,
+                  family == (length == 4 ? 2 : 3),
+                  Int(bits) <= length * 8,
+                  reader.remaining == length else {
+                throw postgresDecodeError("inet", oid: oid, format: format, bytes)
+            }
             let address = try reader.readBytes(length)
             return PostgresInet(address: address, prefixLength: bits, isCIDR: isCIDR)
         case .text:

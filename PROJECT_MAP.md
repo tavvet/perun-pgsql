@@ -958,14 +958,15 @@ header) — plus the `Bind` message layout when binary parameters are requested.
 
 `PostgresInterval`, `PostgresTime`, and `PostgresTimeTz`: text/binary encode and decode
 (byte-exact binary, the `intervalstyle=postgres` text parser, sub-second sign, the timetz
-seconds-west zone), plus a live round-trip in both result formats, decoding a server-produced
-interval, and an `interval[]` array.
+seconds-west zone, and rejection of a malformed timetz offset), plus a live round-trip in both
+result formats, decoding a server-produced interval, and an `interval[]` array.
 
 ### `NetworkTypesTests`
 
 `PostgresInet`: IPv4/IPv6 text parsing and formatting (`::` compression, embedded IPv4, invalid
-inputs), binary and text encode/decode, and a live round-trip of `inet`/`cidr` in both address
-families and result formats, plus a server-produced value and an `inet[]` array.
+inputs), binary and text encode/decode, rejection of a malformed binary payload (family/length
+mismatch, over-wide prefix, trailing bytes), and a live round-trip of `inet`/`cidr` in both
+address families and result formats, plus a server-produced value and an `inet[]` array.
 
 ### `TimeoutTests`
 
