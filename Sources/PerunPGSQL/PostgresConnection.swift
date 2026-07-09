@@ -1871,12 +1871,18 @@ public actor PostgresConnection {
         guard !isClosed else { throw PerunError.connectionClosed }
         let fd = self.fd
         let tls = self.tls
-        try await withBlockingIO(on: ioQueue) {
-            if let tls {
-                try tls.send(bytes)
-            } else {
-                try SystemSocket.sendAll(fd: fd, bytes)
+        do {
+            try await withBlockingIO(on: ioQueue) {
+                if let tls {
+                    try tls.send(bytes)
+                } else {
+                    try SystemSocket.sendAll(fd: fd, bytes)
+                }
             }
+        } catch let error as SocketError {
+            // A raw socket failure isn't a PerunError, so classify it as a wire desync — the pool
+            // must discard this connection, not reuse it (the TLS path throws .tlsIO likewise).
+            throw PerunError.ioError(error.description)
         }
     }
 
@@ -1884,12 +1890,16 @@ public actor PostgresConnection {
         guard !isClosed else { throw PerunError.connectionClosed }
         let fd = self.fd
         let tls = self.tls
-        return try await withBlockingIO(on: readQueue) {
-            if let tls {
-                return try tls.receive(maxLength: maxLength)
-            } else {
-                return try SystemSocket.receive(fd: fd, maxLength: maxLength)
+        do {
+            return try await withBlockingIO(on: readQueue) {
+                if let tls {
+                    return try tls.receive(maxLength: maxLength)
+                } else {
+                    return try SystemSocket.receive(fd: fd, maxLength: maxLength)
+                }
             }
+        } catch let error as SocketError {
+            throw PerunError.ioError(error.description)   // classify a raw socket failure as a wire desync
         }
     }
 

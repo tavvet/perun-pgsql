@@ -176,6 +176,10 @@ public enum PerunError: Error, CustomStringConvertible, Sendable {
     case protocolViolation(String)
     /// The connection was closed unexpectedly (EOF mid-message).
     case connectionClosed
+    /// A low-level socket read or write failed (e.g. the peer reset the connection). Like a
+    /// mid-message close it leaves the wire's state unknown, so a pooled connection that hits it
+    /// is discarded rather than reused.
+    case ioError(String)
     /// A structured error from the server.
     case server(PostgresServerError)
     /// The server asked for an authentication method we do not implement yet.
@@ -212,6 +216,8 @@ public enum PerunError: Error, CustomStringConvertible, Sendable {
             return "protocol violation: \(detail)"
         case .connectionClosed:
             return "connection closed by server"
+        case let .ioError(detail):
+            return "I/O error: \(detail)"
         case let .server(error):
             return error.description
         case let .unsupportedAuthentication(detail):
@@ -254,7 +260,7 @@ extension PerunError {
     /// pooled connection that hit it must be discarded rather than reused.
     var mayHaveDesynchronizedWire: Bool {
         switch self {
-        case .connectionClosed, .protocolViolation, .tlsHandshakeFailed, .tlsIO,
+        case .connectionClosed, .ioError, .protocolViolation, .tlsHandshakeFailed, .tlsIO,
              .tlsNotAvailable, .authenticationFailed, .unsupportedAuthentication:
             return true
         case .server, .unexpectedNull, .columnNotFound, .decodingFailed, .tooManyParameters,

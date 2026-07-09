@@ -9,6 +9,7 @@ final class ErrorClassificationTests: XCTestCase {
     func testWireDesynchronizingErrorsAreNotReusable() {
         let errors: [PerunError] = [
             .connectionClosed,
+            .ioError("recv() failed — errno 54"),
             .protocolViolation("bad frame"),
             .tlsHandshakeFailed("bad cert"),
             .tlsIO("read failed"),
