@@ -82,7 +82,7 @@ extension PostgresInet: PostgresEncodable {
 /// Parse `inet`/`cidr` text: `192.168.1.5`, `10.0.0.0/8`, `2001:db8::1`, `::ffff:1.2.3.4/120`.
 func parsePostgresInet(_ text: String, isCIDR: Bool) -> PostgresInet? {
     let parts = text.split(separator: "/", maxSplits: 1)
-    let addressText = parts[0]
+    guard let addressText = parts.first else { return nil }   // "" or "/" split to nothing — reject cleanly
     let address: [UInt8]? = addressText.contains(":") ? parseIPv6(addressText) : parseIPv4(addressText)
     guard let address else { return nil }
     let prefix: UInt8?

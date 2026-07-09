@@ -34,6 +34,16 @@ final class NetworkTypesTests: XCTestCase {
         XCTAssertNil(parseIPv4("256.1.1.1"))                                                     // octet out of range
     }
 
+    func testRejectsEmptyOrSlashOnlyText() {
+        // An empty or all-separator value splits to nothing; decoding must throw a clean
+        // decodingFailed, not trap on parts[0] (an uncatchable index-out-of-range crash).
+        func decode(_ text: String) throws -> PostgresInet {
+            try PostgresInet.decode(Array(text.utf8), oid: PostgresOID.inet, format: .text)
+        }
+        XCTAssertThrowsError(try decode(""))
+        XCTAssertThrowsError(try decode("/"))
+    }
+
     func testRejectsMalformedBinary() {
         func decode(_ bytes: [UInt8]) throws -> PostgresInet {
             try PostgresInet.decode(bytes, oid: PostgresOID.inet, format: .binary)
