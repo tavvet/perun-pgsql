@@ -37,6 +37,7 @@ final class ErrorClassificationTests: XCTestCase {
             .tooManyParameters(count: 65536),
             .clientShutdown,
             .preparedStatementConnectionMismatch,
+            .copyMismatch("wrong direction"),
         ]
 
         for error in errors {

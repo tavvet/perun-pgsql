@@ -218,6 +218,26 @@ final class CopyIntegrationTests: XCTestCase {
         XCTAssertEqual(ids, [1, 2])
     }
 
+    func testWrongDirectionCopyKeepsPooledConnection() async throws {
+        let pool = PostgresClient(configuration: try integrationConfiguration(), maxConnections: 1)
+        defer { Task { await pool.shutdown() } }
+
+        _ = try await pool.query("SELECT 1")            // open one connection, return it to the pool
+        let before = await pool.connectionCount
+        XCTAssertEqual(before, 1)
+
+        // copyOut on a non-COPY statement drains the wire to ReadyForQuery, so the connection stays
+        // in sync — the pool must keep it, not discard and reopen (which .protocolViolation forced).
+        do {
+            try await pool.withConnection { connection in _ = try await connection.copyOut("SELECT 1") }
+            XCTFail("expected copyOut to reject a non-COPY statement")
+        } catch {
+            // expected — a copyMismatch, which leaves the connection reusable
+        }
+        let after = await pool.connectionCount
+        XCTAssertEqual(after, before, "a wire-synced COPY misuse must not churn the pooled connection")
+    }
+
     // MARK: - Helpers
 
     private func integrationConfiguration() throws -> ConnectionConfiguration {

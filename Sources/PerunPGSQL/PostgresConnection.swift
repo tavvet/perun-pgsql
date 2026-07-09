@@ -1443,7 +1443,7 @@ public actor PostgresConnection {
                 // Wrong direction: a COPY … FROM STDIN. The server is now waiting for client
                 // data (so reading on would hang) — abort it with CopyFail, then surface it.
                 try await failCopyIn()
-                throw PerunError.protocolViolation("copyOut needs a COPY … TO STDOUT statement, not FROM STDIN")
+                throw PerunError.copyMismatch("copyOut needs a COPY … TO STDOUT statement, not FROM STDIN")
             case let .errorResponse(error):
                 pendingError = error             // e.g. bad SQL; drain to ReadyForQuery then throw
             case let .parameterStatus(name, value):
@@ -1456,7 +1456,7 @@ public actor PostgresConnection {
             case let .readyForQuery(status):
                 transactionStatus = status
                 if let pendingError { throw PerunError.server(pendingError) }
-                throw PerunError.protocolViolation("expected CopyOutResponse (is the statement a COPY … TO STDOUT?)")
+                throw PerunError.copyMismatch("expected CopyOutResponse (is the statement a COPY … TO STDOUT?)")
             default:
                 continue
             }
@@ -1595,7 +1595,7 @@ public actor PostgresConnection {
                 // could be the whole relation) — cancel it, drain, then surface the error.
                 try? await sendCancelRequest()
                 try await drainToReadyForQuery()
-                throw PerunError.protocolViolation("copyIn needs a COPY … FROM STDIN statement, not TO STDOUT")
+                throw PerunError.copyMismatch("copyIn needs a COPY … FROM STDIN statement, not TO STDOUT")
             case let .errorResponse(error):
                 pendingError = error
             case let .parameterStatus(name, value):
@@ -1608,7 +1608,7 @@ public actor PostgresConnection {
             case let .readyForQuery(status):
                 transactionStatus = status
                 if let pendingError { throw PerunError.server(pendingError) }
-                throw PerunError.protocolViolation("expected CopyInResponse (is the statement a COPY … FROM STDIN?)")
+                throw PerunError.copyMismatch("expected CopyInResponse (is the statement a COPY … FROM STDIN?)")
             default:
                 continue
             }
