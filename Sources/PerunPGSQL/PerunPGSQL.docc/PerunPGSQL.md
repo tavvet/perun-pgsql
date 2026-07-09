@@ -28,6 +28,7 @@ query API is injection-safe by construction.
 
 ### Essentials
 
+- <doc:GettingStarted>
 - <doc:Connecting>
 - ``PostgresConnection``
 - ``PostgresClient``
