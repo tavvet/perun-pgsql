@@ -141,7 +141,7 @@ enum SystemSocket {
         var byte: UInt8 = 0
         while true {
             let n = withUnsafeMutablePointer(to: &byte) {
-                recv(fd, $0, 1, MSG_PEEK | MSG_DONTWAIT)
+                recv(fd, $0, 1, Int32(MSG_PEEK) | Int32(MSG_DONTWAIT))
             }
             if n < 0 {
                 if errno == EINTR { continue }
