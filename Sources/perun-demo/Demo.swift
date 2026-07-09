@@ -10,7 +10,12 @@ import Glibc
 @main
 struct Demo {
     static func main() async {
-        setvbuf(stdout, nil, _IONBF, 0)   // unbuffered, so progress is visible live
+        // Unbuffer stdout so progress shows live even when the output is piped. Darwin only:
+        // Glibc surfaces `stdout` as a mutable global `var`, which Swift 6 strict concurrency
+        // forbids referencing; on Linux we keep the default buffering.
+        #if canImport(Darwin)
+        setvbuf(stdout, nil, _IONBF, 0)
+        #endif
         let environment = ProcessInfo.processInfo.environment
         let tlsMode: TLSMode
         switch environment["PGSSLMODE"] {
