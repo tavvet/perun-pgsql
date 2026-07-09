@@ -49,6 +49,13 @@ struct SCRAMClient {
         guard combinedNonce.hasPrefix(clientNonce) else {
             throw PerunError.authenticationFailed("server nonce does not extend the client nonce")
         }
+        // The iteration count is server-controlled and consumed here, before the server is
+        // authenticated in step 3, so validate it rather than trusting it. A value <= 0 would trip
+        // PBKDF2's `precondition` and abort the whole process; an absurdly large one is a
+        // CPU-exhaustion DoS (billions of HMAC rounds). PostgreSQL's default is 4096.
+        guard (1 ... 10_000_000).contains(iterations) else {
+            throw PerunError.protocolViolation("SCRAM iteration count out of range: \(iterations)")
+        }
 
         let saltedPassword = PBKDF2.deriveKey(password: password,
                                               salt: salt,

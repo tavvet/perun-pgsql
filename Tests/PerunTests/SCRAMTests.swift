@@ -54,4 +54,21 @@ final class SCRAMTests: XCTestCase {
             try client.clientFinalMessage(
                 serverFirst: "r=somethingElse,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096"))
     }
+
+    func testMaliciousIterationCountRejected() throws {
+        func attempt(_ iterations: String) throws {
+            var client = SCRAMClient(password: "pencil", clientNonce: "myClientNonce")
+            _ = client.clientFirstMessage()
+            _ = try client.clientFinalMessage(
+                serverFirst: "r=myClientNonceEXT,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=\(iterations)")
+        }
+        // The iteration count is server-controlled and reaches PBKDF2 before the server is
+        // authenticated. 0 and negatives would trip PBKDF2's precondition and abort the process;
+        // an absurdly large value is a CPU-exhaustion DoS. All must be rejected, not trusted.
+        XCTAssertThrowsError(try attempt("0"))
+        XCTAssertThrowsError(try attempt("-1"))
+        XCTAssertThrowsError(try attempt("2147483647"))
+        // A sane count is still accepted.
+        XCTAssertNoThrow(try attempt("4096"))
+    }
 }
