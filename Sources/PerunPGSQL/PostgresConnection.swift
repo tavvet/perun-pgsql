@@ -951,7 +951,6 @@ public actor PostgresConnection {
 
     private var pendingReads: [PendingRead] = []
     private var currentRead: PendingRead?               // the read the reader is running now (popped)
-    private var readerWaiter: CheckedContinuation<Void, Never>?
     private var readerStarted = false
 
     /// Send a request and let the background reader deliver its response: enqueue the
@@ -982,7 +981,6 @@ public actor PostgresConnection {
                         failAllPendingReads(PerunError.connectionClosed)
                         return
                     }
-                    wakeReader()
                     kickWrite(request)
                 })
             } catch {
@@ -1012,26 +1010,22 @@ public actor PostgresConnection {
     }
 
     private func startReaderIfNeeded() {
-        guard !readerStarted else { return }
+        guard !readerStarted, !isClosed else { return }
         readerStarted = true
-        Task { await self.readerLoop() }
+        // The reader exits when the queue drains (see readerLoop), so `[weak self]` lets a
+        // connection dropped without close() deallocate instead of being pinned forever; we
+        // restart on demand from here when the next request arrives.
+        Task { [weak self] in await self?.readerLoop() }
     }
 
-    /// Deliver responses in FIFO order. Pops each read *before* running it, so teardown
-    /// can never double-resume the one in flight. A wire-desync error tears the
-    /// connection down and fails everything still queued.
+    /// Deliver responses in FIFO order. Pops each read *before* running it, so teardown can
+    /// never double-resume the one in flight. A wire-desync error tears the connection down and
+    /// fails everything still queued. The loop exits once the queue drains rather than parking:
+    /// a parked continuation stored on the actor would retain it forever, so a connection dropped
+    /// without close() could never be reclaimed. `startReaderIfNeeded` restarts it on the next
+    /// request.
     private func readerLoop() async {
-        while !isClosed {
-            if pendingReads.isEmpty {
-                await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                    if pendingReads.isEmpty && !isClosed {
-                        readerWaiter = continuation
-                    } else {
-                        continuation.resume()
-                    }
-                }
-                continue
-            }
+        while !isClosed, !pendingReads.isEmpty {
             let op = pendingReads.removeFirst()
             currentRead = op                             // the request the backend is running now
             let inSync = await op.run()
@@ -1041,14 +1035,8 @@ public actor PostgresConnection {
                 break
             }
         }
-        failAllPendingReads(PerunError.connectionClosed)
-    }
-
-    private func wakeReader() {
-        if let waiter = readerWaiter {
-            readerWaiter = nil
-            waiter.resume()
-        }
+        readerStarted = false                            // idle or closed: a later request restarts us
+        if isClosed { failAllPendingReads(PerunError.connectionClosed) }
     }
 
     private func failAllPendingReads(_ error: Error) {
@@ -1926,12 +1914,26 @@ public actor PostgresConnection {
         notificationContinuation.finish()
         failAllPendingReads(PerunError.connectionClosed)   // fail everything the reader still owes
         failAllAccessWaiters(PerunError.connectionClosed)  // and everyone parked for wire access
-        wakeReader()                                        // and let a parked reader loop exit
         let fd = self.fd
         let tls = self.tls
         self.tls = nil
         // Shut the socket down from here so any recv parked on readQueue returns;
         // otherwise the teardown dispatched below would queue behind it forever.
+        SystemSocket.shutdownBoth(fd: fd)
+        readQueue.async {
+            tls?.close()
+            SystemSocket.disconnect(fd: fd)
+        }
+    }
+
+    deinit {
+        // Safety net for a connection dropped without close(): because the reader exits when idle
+        // rather than parking, it no longer pins this actor alive, so a forgotten connection
+        // reaches deinit — free its socket here instead of leaking the fd (and reader task/buffers).
+        guard !isClosed else { return }
+        notificationContinuation.finish()
+        let fd = self.fd
+        let tls = self.tls
         SystemSocket.shutdownBoth(fd: fd)
         readQueue.async {
             tls?.close()
