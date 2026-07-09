@@ -39,6 +39,9 @@ query API is injection-safe by construction.
 - <doc:Queries>
 - <doc:Transactions>
 - <doc:ConnectionPool>
+- <doc:Streaming>
+- <doc:Copy>
+- <doc:Notifications>
 - ``PreparedStatement``
 
 ### Handling failure

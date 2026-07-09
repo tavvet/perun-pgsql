@@ -22,8 +22,9 @@ connection directly.
 
 A transaction holds the connection's wire **exclusively** from `BEGIN` to `COMMIT`/`ROLLBACK`: no
 other task can pipeline a statement into it. That is what makes it atomic on the wire — and it is
-why you should not open a row stream on the *same* connection inside a transaction (it would wait
-on a wire the transaction already holds). Use a separate connection to stream concurrently.
+why you should not open a row stream (<doc:Streaming>) on the *same* connection inside a
+transaction (it would wait on a wire the transaction already holds). Use a separate connection to
+stream concurrently.
 
 ## Rollback, cancellation, and retries
 

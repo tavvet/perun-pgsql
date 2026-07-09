@@ -10,7 +10,10 @@ case "basic-query":    try await runBasicQuery()
 case "error-handling": try await runErrorHandling()
 case "transactions":   try await runTransactions()
 case "pool":           try await runPool()
+case "streaming":      try await runStreaming()
+case "copy":           try await runCopy()
+case "notifications":  try await runNotifications()
 default:
     print("usage: swift run Examples <scenario>")
-    print("scenarios: basic-query, error-handling, transactions, pool")
+    print("scenarios: basic-query, error-handling, transactions, pool, streaming, copy, notifications")
 }
