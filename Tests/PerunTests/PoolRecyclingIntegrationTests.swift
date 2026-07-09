@@ -35,6 +35,28 @@ final class PoolRecyclingIntegrationTests: XCTestCase {
         await pool.shutdown()
     }
 
+    func testLifetimeRecycledOnWaiterHandoff() async throws {
+        // maxConnections 1: one task holds the only connection until it is past its lifetime,
+        // while a second task waits for it. On release the expired connection must be recycled
+        // for the waiter (a fresh backend), not handed over directly.
+        let pool = PostgresClient(configuration: try integrationConfiguration(),
+                                  maxConnections: 1, maxConnectionLifetime: .seconds(1))
+
+        async let held: Int = pool.withConnection { connection in
+            let pid = try await connection.query("SELECT pg_backend_pid() AS p").rows[0].decode("p", as: Int.self)
+            try await Task.sleep(for: .seconds(1.5))          // age past the lifetime while holding it
+            return pid
+        }
+        try await Task.sleep(for: .milliseconds(200))         // let the holder check the connection out first
+
+        let waiterPID = try await pool.query("SELECT pg_backend_pid() AS p").rows[0].decode("p", as: Int.self)
+        let heldPID = try await held
+        XCTAssertNotEqual(waiterPID, heldPID,
+                          "an over-lifetime connection must be recycled even on a direct waiter handoff")
+
+        await pool.shutdown()
+    }
+
     func testNoRecyclingWithoutLimits() async throws {
         let pool = PostgresClient(configuration: try integrationConfiguration(), maxConnections: 1)
 

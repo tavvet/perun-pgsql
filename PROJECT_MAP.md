@@ -761,8 +761,10 @@ Acquire behavior:
 Release behavior:
 
 1. If shut down, close returned connection and decrement count.
-2. If waiters exist, resume the first waiter with the connection.
-3. Otherwise append to idle.
+2. If it came back mid-transaction, or is past `maxConnectionLifetime`, discard-and-replace it
+   instead of reusing it.
+3. If waiters exist, resume the first waiter with the connection.
+4. Otherwise append to idle (tagged with `idleSince`).
 
 Error behavior:
 
@@ -777,11 +779,17 @@ Error behavior:
 Age-based recycling (opt-in; both limits default to nil):
 
 - `maxConnectionLifetime` bounds how long a connection lives (since `createdAt`);
-  `maxIdleTime` closes one that has sat idle too long. Acquire enforces both on borrow, and a
-  background `reaperTask` — started lazily on first checkout when a limit is set, cancelled on
-  `shutdown` — scans `idle` every ~half the smallest limit (min 500 ms) and closes expired
-  ones. The pool is lazy (no minimum idle count), so it can shrink to zero and reopen on demand.
-  Timestamps use `ContinuousClock` (counts real elapsed time, matching the server's view).
+  `maxIdleTime` closes one that has sat idle too long. Enforced in three places: `acquire`
+  drops an expired connection on borrow; `release` recycles one past its lifetime rather than
+  reuse it — crucially *before* a direct handoff to a waiter, which would otherwise skip the age
+  check and let lifetime slip under sustained load (idle time doesn't apply there — the
+  connection wasn't idle); and a background `reaperTask` — started lazily on first checkout when
+  a limit is set, cancelled on `shutdown` — scans `idle` every ~half the smallest limit (min
+  500 ms) and closes expired ones. `release` routes an expired connection through
+  `discardAndReplaceIfNeeded` (close + open a replacement for a waiter, if any); the reaper just
+  closes them (idle connections have no waiters). The pool is lazy (no minimum idle count), so it
+  can shrink to zero and reopen on demand. Timestamps use `ContinuousClock` (counts real elapsed
+  time, matching the server's view).
 
 Transaction hygiene:
 
@@ -1012,7 +1020,8 @@ environment variables.
   on a fresh backend instead of failing.
 - `PoolRecyclingIntegrationTests`: an idle connection past `maxIdleTime` is reaped (the pool
   shrinks to zero and reopens on demand), a connection past `maxConnectionLifetime` is replaced
-  (new backend PID), and with no limits set a connection is reused indefinitely.
+  (new backend PID) — including when it's handed to a waiting task rather than pooled — and with
+  no limits set a connection is reused indefinitely.
 - `SessionParameterIntegrationTests`: the driver pins `client_encoding`/`DateStyle`/
   `IntervalStyle`, a caller can override a pinned key (including with a lowercase, case-different
   key), and the pin overrides a role's non-default `DateStyle` (a text date still decodes

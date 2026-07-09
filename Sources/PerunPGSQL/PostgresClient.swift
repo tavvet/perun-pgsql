@@ -212,6 +212,15 @@ public actor PostgresClient {
             await discardAndReplaceIfNeeded(connection)
             return
         }
+        // Recycle a connection past its lifetime instead of reusing it — including on a direct
+        // handoff to a waiter, which otherwise skips the on-borrow age check and would let
+        // `maxConnectionLifetime` be bypassed under sustained load. (Idle time doesn't apply
+        // here: the connection wasn't idle.)
+        if let maxLifetime = maxConnectionLifetime,
+           ContinuousClock().now - connection.createdAt > maxLifetime {
+            await discardAndReplaceIfNeeded(connection)
+            return
+        }
         if !waiters.isEmpty {
             waiters.removeFirst().continuation.resume(returning: connection)   // hand straight to a waiter
         } else {
