@@ -752,6 +752,9 @@ public actor PostgresConnection {
                 parameters[name] = value
             case let .noticeResponse(notice):
                 noticeHandler?(notice)
+            case let .notificationResponse(processID, channel, payload):
+                notificationContinuation.yield(
+                    PostgresNotification(processID: processID, channel: channel, payload: payload))
             case .parseComplete:
                 continue
             case let .errorResponse(error):
