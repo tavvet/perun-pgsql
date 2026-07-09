@@ -195,21 +195,32 @@ private func parseClockToMicroseconds(_ token: Substring) -> Int64? {
     if body.first == "-" { negative = true; body = body.dropFirst() }
     else if body.first == "+" { body = body.dropFirst() }
 
+    // Minutes and seconds are 0–59 in a valid clock (an interval carries the excess in hours),
+    // so bounding them here also caps their contribution below.
     let parts = body.split(separator: ":", omittingEmptySubsequences: false)
-    guard parts.count == 3, let hours = Int64(parts[0]), let minutes = Int64(parts[1]) else { return nil }
+    guard parts.count == 3, let hours = Int64(parts[0]),
+          let minutes = Int64(parts[1]), (0 ... 59).contains(minutes) else { return nil }
 
     let secondParts = parts[2].split(separator: ".", maxSplits: 1, omittingEmptySubsequences: false)
-    guard let seconds = Int64(secondParts[0]) else { return nil }
+    guard let seconds = Int64(secondParts[0]), (0 ... 59).contains(seconds) else { return nil }
 
-    var micros = ((hours * 60 + minutes) * 60 + seconds) * 1_000_000
+    var subSecond: Int64 = 0
     if secondParts.count == 2 {
         var scale: Int64 = 100_000
         for character in secondParts[1].prefix(6) {
             guard let digit = character.wholeNumberValue, (0 ... 9).contains(digit) else { return nil }
-            micros += Int64(digit) * scale
+            subSecond += Int64(digit) * scale
             scale /= 10
         }
     }
+
+    // Interval hours can be large, so guard the multiply and add rather than trap on overflow.
+    // (`minutes*60_000_000 + seconds*1_000_000 + subSecond` is ≤ ~3.6e9, well within Int64.)
+    let (hourMicros, mulOverflow) = hours.multipliedReportingOverflow(by: 3_600_000_000)
+    guard !mulOverflow else { return nil }
+    let (micros, addOverflow) = hourMicros.addingReportingOverflow(
+        minutes * 60_000_000 + seconds * 1_000_000 + subSecond)
+    guard !addOverflow else { return nil }
     return negative ? -micros : micros
 }
 
@@ -224,7 +235,8 @@ func parsePostgresTimeTz(_ text: String) -> PostgresTimeTz? {
     zone = zone.dropFirst()
     // Strict `HH[:MM[:SS]]`: reject a malformed offset rather than silently zeroing a bad field.
     let parts = zone.split(separator: ":", omittingEmptySubsequences: false)
-    guard (1 ... 3).contains(parts.count), let hours = Int32(parts[0]) else { return nil }
+    // hours bounded so `hours * 3600` below can't overflow (real offsets are ≤ 15 hours).
+    guard (1 ... 3).contains(parts.count), let hours = Int32(parts[0]), (0 ... 23).contains(hours) else { return nil }
     var minutes: Int32 = 0
     if parts.count > 1 {
         guard let value = Int32(parts[1]), (0 ... 59).contains(value) else { return nil }

@@ -82,6 +82,20 @@ final class TemporalTypesTests: XCTestCase {
         XCTAssertThrowsError(try decode("12:34:56+05:99"))        // minutes out of range
         XCTAssertThrowsError(try decode("12:34:56+05:30:99"))     // seconds out of range
         XCTAssertThrowsError(try decode("12:34:56+05:30:45:00"))  // too many offset parts
+        XCTAssertThrowsError(try decode("12:34:56+2147483647:00")) // offset hours overflow → error, not a trap
+        XCTAssertThrowsError(try decode("12:34:56+24:00"))         // offset hours out of range
+    }
+
+    func testClockRejectsOverflowAndOutOfRange() throws {
+        func time(_ text: String) throws -> PostgresTime {
+            try PostgresTime.decode(Array(text.utf8), oid: 1083, format: .text)
+        }
+        XCTAssertThrowsError(try time("99999999999999:00:00"))   // hours overflow → error, not a trap
+        XCTAssertThrowsError(try time("00:99:00"))               // minutes out of range
+        XCTAssertThrowsError(try time("00:00:99"))               // seconds out of range
+        // The same guard protects interval's time part.
+        XCTAssertThrowsError(try PostgresInterval.decode(
+            Array("99999999999999:00:00".utf8), oid: 1186, format: .text))
     }
 
     // MARK: - Live round-trip
