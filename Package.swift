@@ -59,6 +59,16 @@ let package = Package(
             linkerSettings: opensslLinkerSettings
         ),
 
+        // Runnable, compile-checked examples that back the documentation. `swift build` compiles
+        // them, so a doc example can't drift from the real API.
+        .executableTarget(
+            name: "Examples",
+            dependencies: ["PerunPGSQL"],
+            path: "Examples",
+            swiftSettings: opensslSwiftSettings,
+            linkerSettings: opensslLinkerSettings
+        ),
+
         // Unit tests for the crypto primitives, wire codecs and type decoders.
         .testTarget(
             name: "PerunTests",
