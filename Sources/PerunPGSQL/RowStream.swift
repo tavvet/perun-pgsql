@@ -19,9 +19,9 @@ public struct PostgresRowStream: AsyncSequence, Sendable {
     private let connection: PostgresConnection
     private let cleanup: StreamCleanup
 
-    init(connection: PostgresConnection) {
+    init(connection: PostgresConnection, generation: UInt64) {
         self.connection = connection
-        self.cleanup = StreamCleanup(connection: connection)
+        self.cleanup = StreamCleanup(connection: connection, generation: generation)
     }
 
     public func makeAsyncIterator() -> AsyncIterator {
@@ -46,13 +46,16 @@ public struct PostgresRowStream: AsyncSequence, Sendable {
 /// connection call is a no-op.
 final class StreamCleanup: @unchecked Sendable {
     private let connection: PostgresConnection
+    private let generation: UInt64      // the stream this cleanup belongs to; a stale deinit is a no-op
 
-    init(connection: PostgresConnection) {
+    init(connection: PostgresConnection, generation: UInt64) {
         self.connection = connection
+        self.generation = generation
     }
 
     deinit {
         let connection = self.connection
-        Task { await connection.finishStream() }
+        let generation = self.generation
+        Task { await connection.finishStream(generation: generation) }
     }
 }

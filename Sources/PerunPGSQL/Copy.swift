@@ -23,9 +23,9 @@ public struct PostgresCopyOutSequence: AsyncSequence, Sendable {
     private let connection: PostgresConnection
     private let cleanup: CopyOutCleanup
 
-    init(connection: PostgresConnection) {
+    init(connection: PostgresConnection, generation: UInt64) {
         self.connection = connection
-        self.cleanup = CopyOutCleanup(connection: connection)
+        self.cleanup = CopyOutCleanup(connection: connection, generation: generation)
     }
 
     public func makeAsyncIterator() -> AsyncIterator {
@@ -48,14 +48,17 @@ public struct PostgresCopyOutSequence: AsyncSequence, Sendable {
 /// the wire. A copy consumed to its end has already cleaned up, so this is a no-op.
 final class CopyOutCleanup: @unchecked Sendable {
     private let connection: PostgresConnection
+    private let generation: UInt64      // the copy this cleanup belongs to; a stale deinit is a no-op
 
-    init(connection: PostgresConnection) {
+    init(connection: PostgresConnection, generation: UInt64) {
         self.connection = connection
+        self.generation = generation
     }
 
     deinit {
         let connection = self.connection
-        Task { await connection.finishCopyOut() }
+        let generation = self.generation
+        Task { await connection.finishCopyOut(generation: generation) }
     }
 }
 

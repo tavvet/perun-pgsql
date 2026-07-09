@@ -137,6 +137,61 @@ final class StreamingIntegrationTests: XCTestCase {
         XCTAssertEqual(answer, 42)
     }
 
+    func testStaleStreamDeinitDoesNotDisturbANewerStream() async throws {
+        let connection = try await PostgresConnection.connect(integrationConfiguration())
+        defer { Task { try? await connection.close() } }
+
+        // Consume stream A to completion but keep its iterator alive, so A's StreamCleanup.deinit
+        // — which enqueues the stale finishStream — has not run yet.
+        var iteratorA: PostgresRowStream.AsyncIterator? =
+            try await connection.queryStream("SELECT g FROM generate_series(1, 10) g").makeAsyncIterator()
+        var aRows = 0
+        while let row = try await iteratorA!.next() { _ = try row.decode("g", as: Int.self); aRows += 1 }
+        XCTAssertEqual(aRows, 10)                       // A fully consumed; endStream freed the wire
+
+        // Start stream B on the same connection and pull one row so it owns the wire.
+        var iteratorB = try await connection.queryStream(
+            "SELECT g FROM generate_series(1, 10) g").makeAsyncIterator()
+        let firstB = try await iteratorB.next()         // B is active; the generation is now B's
+        XCTAssertNotNil(firstB)
+
+        // Drop A's iterator → StreamCleanup.deinit → finishStream(generation: A) while B is live.
+        // The generation guard must make it a no-op; without it, it closes B's portal and steals rows.
+        iteratorA = nil
+        try await Task.sleep(for: .milliseconds(50))    // give the deinit's Task time to run
+
+        // B must still deliver its remaining rows intact.
+        var bRows = 1
+        while let row = try await iteratorB.next() { _ = try row.decode("g", as: Int.self); bRows += 1 }
+        XCTAssertEqual(bRows, 10, "a stale deinit of stream A must not disturb the newer stream B")
+    }
+
+    func testCloseDuringActiveStreamDoesNotHangLaterQueries() async throws {
+        let connection = try await PostgresConnection.connect(integrationConfiguration())
+
+        // Open a stream and pull one row so it holds the wire exclusively (exclusiveHeld == true).
+        var iterator = try await connection.queryStream(
+            "SELECT g FROM generate_series(1, 1000) g", chunkSize: 10).makeAsyncIterator()
+        let firstRow = try await iterator.next()
+        XCTAssertNotNil(firstRow)
+
+        // Force-close while the stream still holds the exclusive lock: forceClose can't unlock it,
+        // so the lock state is frozen. A later acquirer must see `isClosed` and fail fast rather
+        // than park on a hold nothing will ever release.
+        try await connection.close()
+
+        // Wrap in a timeout so the old permanent-hang regression fails the test instead of stalling
+        // the whole suite: the fix yields a prompt .connectionClosed, a regression a .timedOut.
+        var thrown: Error?
+        do { _ = try await withTimeout(.seconds(5)) { try await connection.query("SELECT 1") } }
+        catch { thrown = error }
+        withExtendedLifetime(iterator) {}   // the stream held the wire across the close()+query() above
+
+        guard let perun = thrown as? PerunError, case .connectionClosed = perun else {
+            return XCTFail("expected a prompt .connectionClosed, got \(String(describing: thrown)) — a hang/timeout means the exclusive lock was stuck")
+        }
+    }
+
     // MARK: - Helpers
 
     private func integrationConfiguration() throws -> ConnectionConfiguration {

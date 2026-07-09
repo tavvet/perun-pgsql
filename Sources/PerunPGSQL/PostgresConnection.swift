@@ -345,7 +345,7 @@ public actor PostgresConnection {
             streamColumnIndex = [:]
             streamTerminating = false
             streamPendingError = nil
-            return PostgresRowStream(connection: self)
+            return PostgresRowStream(connection: self, generation: streamGeneration)
         } catch {
             unlock()
             throw error
@@ -367,7 +367,7 @@ public actor PostgresConnection {
             copyOutGeneration += 1
             copyOutTerminating = false
             copyOutPendingError = nil
-            return PostgresCopyOutSequence(connection: self)
+            return PostgresCopyOutSequence(connection: self, generation: copyOutGeneration)
         } catch {
             unlock()
             throw error
@@ -1091,6 +1091,9 @@ public actor PostgresConnection {
     /// Take shared access for a pipelined query. Blocks while an exclusive holder is
     /// active or waiting (writer priority, so exclusive access can't starve).
     private func acquireShared() async throws {
+        // A force-closed connection freezes the lock state (a stream/COPY torn down by a wire
+        // error never unlocks), so refuse up front rather than park a waiter nothing will resume.
+        guard !isClosed else { throw PerunError.connectionClosed }
         if !exclusiveHeld && exclusiveWaiters.isEmpty {
             inFlightShared += 1
             return
@@ -1131,6 +1134,7 @@ public actor PostgresConnection {
     /// Throws `CancellationError` if cancelled before it acquires — a parked waiter
     /// never touched the wire.
     private func lock() async throws {
+        guard !isClosed else { throw PerunError.connectionClosed }   // see acquireShared: never park on a dead wire
         if !exclusiveHeld && inFlightShared == 0 {
             exclusiveHeld = true
             return
@@ -1287,7 +1291,7 @@ public actor PostgresConnection {
             // Already cancelled before we read a byte: abort the running query too, so a
             // slow one (e.g. mid `pg_sleep`) doesn't stall the drain inside finishStream.
             await cancelStreamInFlight(generation: streamGeneration)
-            await finishStream()
+            await finishStream(generation: streamGeneration)
             throw CancellationError()
         }
         let generation = streamGeneration
@@ -1298,7 +1302,7 @@ public actor PostgresConnection {
             Task { await self.cancelStreamInFlight(generation: generation) }
         }
         if Task.isCancelled {
-            await finishStream()          // idempotent; cleans up even if a row raced the cancel
+            await finishStream(generation: streamGeneration)   // idempotent; cleans up if a row raced the cancel
             throw CancellationError()
         }
         return try outcome.get()
@@ -1372,9 +1376,11 @@ public actor PostgresConnection {
 
     /// The consumer abandoned the stream (its `deinit`). If it is still open, close the
     /// portal, drain the current chunk to ReadyForQuery, and free the wire. Idempotent — a
-    /// stream consumed to its end already finished, so this is a no-op.
-    func finishStream() async {
-        guard streamActive else { return }
+    /// stream consumed to its end already finished, so this is a no-op. The `generation` guard
+    /// makes a late `deinit` a no-op once *this* stream has ended, so a stale cleanup can never
+    /// tear down a newer stream that has since reused the connection.
+    func finishStream(generation: UInt64) async {
+        guard streamActive, streamGeneration == generation else { return }
         do {
             if !streamTerminating {
                 streamTerminating = true
@@ -1473,7 +1479,7 @@ public actor PostgresConnection {
     func nextCopyData() async throws -> [UInt8]? {
         guard copyOutActive else { return nil }
         if Task.isCancelled {
-            await finishCopyOut()                // fires the CancelRequest itself, then drains
+            await finishCopyOut(generation: copyOutGeneration)   // fires the CancelRequest itself, then drains
             throw CancellationError()
         }
         let generation = copyOutGeneration
@@ -1484,7 +1490,7 @@ public actor PostgresConnection {
             Task { await self.cancelCopyOutInFlight(generation: generation) }
         }
         if Task.isCancelled {
-            await finishCopyOut()                // idempotent; cleans up if a chunk raced the cancel
+            await finishCopyOut(generation: copyOutGeneration)   // idempotent; cleans up if a chunk raced the cancel
             throw CancellationError()
         }
         return try outcome.get()
@@ -1535,11 +1541,13 @@ public actor PostgresConnection {
 
     /// The consumer abandoned the copy (its `deinit`) or cancelled it. Stop the server with a
     /// `CancelRequest` — it would otherwise stream the whole relation — then drain to
-    /// ReadyForQuery and free the wire. Idempotent.
-    func finishCopyOut() async {
-        guard copyOutActive else { return }
+    /// ReadyForQuery and free the wire. Idempotent. The `generation` guard makes a late `deinit`
+    /// a no-op once *this* copy has ended, so a stale cleanup can never tear down a newer copy
+    /// that has since reused the connection.
+    func finishCopyOut(generation: UInt64) async {
+        guard copyOutActive, copyOutGeneration == generation else { return }
         copyOutTerminating = true
-        await cancelCopyOutInFlight(generation: copyOutGeneration)
+        await cancelCopyOutInFlight(generation: generation)
         do {
             while copyOutActive {
                 switch try await readMessage() {
