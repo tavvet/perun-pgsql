@@ -81,8 +81,10 @@ extension PostgresInet: PostgresEncodable {
 
 /// Parse `inet`/`cidr` text: `192.168.1.5`, `10.0.0.0/8`, `2001:db8::1`, `::ffff:1.2.3.4/120`.
 func parsePostgresInet(_ text: String, isCIDR: Bool) -> PostgresInet? {
-    let parts = text.split(separator: "/", maxSplits: 1)
-    guard let addressText = parts.first else { return nil }   // "" or "/" split to nothing — reject cleanly
+    // Keep empty subsequences so a trailing slash (`192.168.1.1/`) leaves an empty prefix that is
+    // rejected below, as PostgreSQL does — dropping empties would silently accept it as a bare host.
+    let parts = text.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false)
+    guard let addressText = parts.first, !addressText.isEmpty else { return nil }   // "" / "/" — no address
     let address: [UInt8]? = addressText.contains(":") ? parseIPv6(addressText) : parseIPv4(addressText)
     guard let address else { return nil }
     let prefix: UInt8?
