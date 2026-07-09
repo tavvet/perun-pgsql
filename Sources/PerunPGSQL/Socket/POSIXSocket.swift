@@ -34,6 +34,16 @@ private func errnoString(_ code: Int32) -> String {
     "errno \(code): \(String(cString: strerror(code)))"
 }
 
+/// SIGPIPE would otherwise terminate the entire process the moment we write to a socket whose peer
+/// has gone away. `sendAll` sets `MSG_NOSIGNAL` (Linux) and the socket carries `SO_NOSIGPIPE`
+/// (Darwin), but OpenSSL's `SSL_write` issues a plain `write()` we don't flag — so on Linux a peer
+/// reset mid-TLS-write would kill the host process (there is no `SO_NOSIGPIPE` there). Ignoring
+/// SIGPIPE once, process-wide, closes that gap on every write path: a broken write then fails with
+/// `EPIPE`, which surfaces as an ordinary I/O error. A global `let` initializer runs exactly once.
+private let sigpipeIgnored: Void = {
+    _ = signal(SIGPIPE, SIG_IGN)
+}()
+
 /// A thin, blocking wrapper over the POSIX socket API.
 ///
 /// Everything here is a plain synchronous syscall. The blocking is intentional:
@@ -45,8 +55,16 @@ private func errnoString(_ code: Int32) -> String {
 /// actor / continuation boundary.
 enum SystemSocket {
 
+    /// Ignore SIGPIPE process-wide so a write to a dead peer can never kill us (see
+    /// `sigpipeIgnored`). Idempotent and cheap: the work happens exactly once, however many
+    /// connections open. Exposed so the regression test can arm it without opening a connection.
+    static func ignoreSIGPIPE() {
+        _ = sigpipeIgnored
+    }
+
     /// Resolve `host`/`port` and open a connected TCP socket, returning its fd.
     static func makeConnected(host: String, port: UInt16) throws -> Int32 {
+        ignoreSIGPIPE()          // a peer reset mid-write must never raise SIGPIPE and kill us
         var hints = addrinfo()
         hints.ai_family = AF_UNSPEC          // IPv4 or IPv6
         #if canImport(Darwin)
