@@ -29,6 +29,19 @@ final class SessionParameterIntegrationTests: XCTestCase {
         XCTAssertEqual(intervalStyle, "iso_8601")
     }
 
+    func testCallerOverrideIsCaseInsensitive() async throws {
+        // GUC names are case-insensitive: a lowercase key must still replace the pinned
+        // `DateStyle`/`IntervalStyle`, not send both keys with an order-dependent winner.
+        let connection = try await PostgresConnection.connect(
+            integrationConfiguration(runtimeParameters: ["datestyle": "SQL, DMY", "intervalstyle": "iso_8601"]))
+        defer { Task { try? await connection.close() } }
+
+        let dateStyle = try await show(connection, "datestyle")
+        XCTAssertEqual(dateStyle.hasPrefix("SQL"), true, "lowercase datestyle override should win; got \(dateStyle)")
+        let intervalStyle = try await show(connection, "intervalstyle")
+        XCTAssertEqual(intervalStyle, "iso_8601")
+    }
+
     func testPinOverridesRoleDefault() async throws {
         let admin = try await PostgresConnection.connect(integrationConfiguration())
         _ = try await admin.query("DROP ROLE IF EXISTS perun_pin_test")

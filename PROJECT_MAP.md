@@ -173,10 +173,12 @@ Flow:
 2. Open a TCP socket through `SystemSocket.makeConnected`.
 3. If TLS mode is not `.disable`, send `SSLRequest`.
 4. If server replies `S`, wrap the fd in `TLSConnection`.
-5. Send the startup packet — with the caller's `runtimeParameters` merged **over** the
-   driver's pinned defaults `client_encoding=UTF8`, `DateStyle=ISO`, `IntervalStyle=postgres`.
-   The pins give the text decoders a known wire format regardless of the server / role /
-   database default; a caller can still override any key (a startup parameter overrides even an
+5. Send the startup packet. Each pinned default — `client_encoding=UTF8`, `DateStyle=ISO`,
+   `IntervalStyle=postgres` — is added only if the caller's `runtimeParameters` didn't already
+   set that GUC, matched **case-insensitively** (GUC names are), so `["datestyle": …]` replaces
+   the pin instead of both keys landing in the packet with an order-dependent winner. The pins
+   give the text decoders a known wire format regardless of the server / role / database
+   default; a caller override still wins (a startup parameter overrides even an
    `ALTER ROLE … SET` default). Binary results don't depend on `DateStyle`/`IntervalStyle`, but
    `client_encoding` still governs string bytes in both formats.
 6. Read backend messages until `ReadyForQuery`.
@@ -995,9 +997,9 @@ environment variables.
   (`pg_terminate_backend`) is detected on borrow, discarded, and replaced — the next query runs
   on a fresh backend instead of failing.
 - `SessionParameterIntegrationTests`: the driver pins `client_encoding`/`DateStyle`/
-  `IntervalStyle`, a caller can override a pinned key, and the pin overrides a role's non-default
-  `DateStyle` (a text date still decodes correctly) — proving the startup pin beats an
-  `ALTER ROLE … SET` default.
+  `IntervalStyle`, a caller can override a pinned key (including with a lowercase, case-different
+  key), and the pin overrides a role's non-default `DateStyle` (a text date still decodes
+  correctly) — proving the startup pin beats an `ALTER ROLE … SET` default.
 - `CopyIntegrationTests`: `copyOut` reproduces a table's data and a `COPY (query)`, an early
   `break` frees the connection, and a non-COPY statement is rejected; `copyIn` loads rows and
   reports the "COPY n" tag, round-trips with `copyOut`, rolls back and rethrows when the closure
