@@ -39,7 +39,17 @@ private func parseBinaryArray(_ bytes: [UInt8],
         dimensions.append(length)
     }
 
-    let total = ndim == 0 ? 0 : dimensions.reduce(1, *)
+    // Fold the dimension lengths into an element count, rejecting overflow, then bound it by
+    // what the message can hold: every element carries at least a 4-byte length prefix, so a
+    // total beyond `reader.remaining / 4` is a malformed/hostile header — refuse it before the
+    // trapping multiply aborts the process or `reserveCapacity` attempts a multi-GB allocation.
+    var total = ndim == 0 ? 0 : 1
+    for dimension in dimensions {
+        let (product, overflow) = total.multipliedReportingOverflow(by: dimension)
+        guard !overflow else { throw fail() }
+        total = product
+    }
+    guard total <= reader.remaining / 4 else { throw fail() }
     var elements: [[UInt8]?] = []
     elements.reserveCapacity(total)
     for _ in 0 ..< total {
@@ -85,7 +95,11 @@ private func parseTextArray(_ bytes: [UInt8],
     }
 
     indirect enum Node { case leaf([UInt8]?); case level([Node]) }
-    func parseLevel() throws -> [Node] {
+    // PostgreSQL caps arrays at 6 dimensions (MAXDIM), so brace nesting can't legitimately go
+    // deeper. Bounding the recursion rejects a hostile deeply-nested value before it overflows
+    // the stack (an uncatchable crash) — the text counterpart to the binary `ndim <= 6` guard.
+    func parseLevel(depth: Int = 0) throws -> [Node] {
+        guard depth < 6 else { throw fail() }
         guard index < bytes.count, bytes[index] == 0x7b else { throw fail() }   // '{'
         index += 1
         var nodes: [Node] = []
@@ -93,7 +107,7 @@ private func parseTextArray(_ bytes: [UInt8],
         if index < bytes.count, bytes[index] == 0x7d { index += 1; return nodes }   // '}' — empty
         while true {
             skipSpaces()
-            nodes.append(index < bytes.count && bytes[index] == 0x7b ? .level(try parseLevel())
+            nodes.append(index < bytes.count && bytes[index] == 0x7b ? .level(try parseLevel(depth: depth + 1))
                                                                      : .leaf(try parseElement()))
             skipSpaces()
             guard index < bytes.count else { throw fail() }

@@ -66,6 +66,16 @@ final class ArrayDecodingTests: XCTestCase {
         XCTAssertThrowsError(try textCell("{{1,2},{3,4}}", oid: 1007).decodeArray(of: Int.self) as [[[Int]]]) // 2-D as 3-D
     }
 
+    func testDeeplyNestedTextArrayRejectedInsteadOfOverflowingStack() throws {
+        // A hostile value nested far beyond PostgreSQL's 6-dimension limit must be rejected, not
+        // recurse until the stack overflows (an uncatchable crash a do/catch can't intercept).
+        let deep = String(repeating: "{", count: 10_000)
+        XCTAssertThrowsError(try textCell(deep, oid: 1007).decodeArray(of: Int.self) as [Int])
+        // A legitimate 6-dimensional array (the maximum) still parses.
+        let sixD: [[[[[[Int]]]]]] = try textCell("{{{{{{7}}}}}}", oid: 1007).decodeArray(of: Int.self)
+        XCTAssertEqual(sixD, [[[[[[7]]]]]])
+    }
+
     // MARK: - Binary (no server)
 
     func testDecodeOneDimensionalBinaryArray() throws {
@@ -99,6 +109,31 @@ final class ArrayDecodingTests: XCTestCase {
         ]
         let cube: [[[Int]]] = try cell(binary, oid: 1016, binary: true).decodeArray(of: Int.self)
         XCTAssertEqual(cube, [[[10, 20]], [[30, 40]]])
+    }
+
+    func testBinaryArrayRejectsHugeDimensionsInsteadOfCrashing() throws {
+        // ndim 3 with every dimension 0x7FFFFFFF: the element-count product overflows Int (a
+        // trapping multiply) — must be rejected as malformed, not abort the process.
+        let overflowing: [UInt8] = [
+            0, 0, 0, 3,        // ndim 3
+            0, 0, 0, 0,        // flags
+            0, 0, 0, 23,       // element OID int4
+            0x7F, 0xFF, 0xFF, 0xFF, 0, 0, 0, 1,   // dimension 0: length 2147483647
+            0x7F, 0xFF, 0xFF, 0xFF, 0, 0, 0, 1,   // dimension 1: length 2147483647
+            0x7F, 0xFF, 0xFF, 0xFF, 0, 0, 0, 1,   // dimension 2: length 2147483647
+        ]
+        XCTAssertThrowsError(try cell(overflowing, oid: 1007, binary: true).decodeArray(of: Int.self) as [Int])
+
+        // ndim 2 dims [0x7FFFFFFF, 4]: no overflow, but the count dwarfs the message — must be
+        // rejected before reserveCapacity attempts a multi-GB allocation.
+        let oversized: [UInt8] = [
+            0, 0, 0, 2,        // ndim 2
+            0, 0, 0, 0,        // flags
+            0, 0, 0, 23,       // element OID int4
+            0x7F, 0xFF, 0xFF, 0xFF, 0, 0, 0, 1,   // dimension 0: length 2147483647
+            0, 0, 0, 4, 0, 0, 0, 1,               // dimension 1: length 4
+        ]
+        XCTAssertThrowsError(try cell(oversized, oid: 1007, binary: true).decodeArray(of: Int.self) as [Int])
     }
 
     // MARK: - Live round-trip
