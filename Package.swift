@@ -2,34 +2,6 @@
 import PackageDescription
 import Foundation
 
-/// Locate the OpenSSL headers/libs. `pkg-config` is often absent (and Homebrew's
-/// openssl is keg-only), so we probe the usual spots. Override with the
-/// `OPENSSL_PREFIX` environment variable if yours lives elsewhere.
-func opensslPrefix() -> String {
-    if let override = ProcessInfo.processInfo.environment["OPENSSL_PREFIX"], !override.isEmpty {
-        return override
-    }
-    let candidates = [
-        "/opt/homebrew/opt/openssl@3",   // Apple Silicon Homebrew
-        "/usr/local/opt/openssl@3",      // Intel Homebrew
-        "/opt/homebrew/opt/openssl",
-        "/usr/local/opt/openssl",
-    ]
-    for path in candidates where FileManager.default.fileExists(atPath: path + "/include/openssl/ssl.h") {
-        return path
-    }
-    return "/usr"                         // Linux: /usr/include + /usr/lib
-}
-
-let ssl = opensslPrefix()
-
-// Every target that (transitively) loads the COpenSSL Clang module needs the
-// header search path so Clang can build that module; and the final link needs
-// the library search path. Apply both everywhere to keep the module build
-// flags consistent across targets.
-let opensslSwiftSettings: [SwiftSetting] = [.unsafeFlags(["-Xcc", "-I\(ssl)/include"])]
-let opensslLinkerSettings: [LinkerSetting] = [.unsafeFlags(["-L\(ssl)/lib"])]
-
 // swift-docc-plugin is pulled in only for documentation builds (set PERUN_BUILD_DOCS=1, as
 // Scripts/build-docs.sh does), so a normal build — and anyone depending on this package — never
 // carries a docs tool in its dependency graph.
@@ -49,23 +21,27 @@ let package = Package(
     ],
     dependencies: packageDependencies,
     targets: [
-        // C-interop shim exposing libssl/libcrypto to Swift.
-        .systemLibrary(name: "COpenSSL", path: "Sources/COpenSSL"),
+        // C-interop shim exposing libssl/libcrypto to Swift. OpenSSL is located through
+        // pkg-config, so this package carries no unsafe build flags and can be used as a normal
+        // dependency. Homebrew's openssl@3 is keg-only, so on macOS export its pkg-config path:
+        //   export PKG_CONFIG_PATH="$(brew --prefix openssl@3)/lib/pkgconfig"
+        .systemLibrary(
+            name: "COpenSSL",
+            path: "Sources/COpenSSL",
+            pkgConfig: "openssl",
+            providers: [.brew(["openssl@3"]), .apt(["libssl-dev"])]
+        ),
 
         // The driver itself — pure Swift + libc, plus OpenSSL for TLS.
         .target(
             name: "PerunPGSQL",
-            dependencies: ["COpenSSL"],
-            swiftSettings: opensslSwiftSettings,
-            linkerSettings: opensslLinkerSettings
+            dependencies: ["COpenSSL"]
         ),
 
         // A tiny runnable program that connects and runs queries.
         .executableTarget(
             name: "perun-demo",
-            dependencies: ["PerunPGSQL"],
-            swiftSettings: opensslSwiftSettings,
-            linkerSettings: opensslLinkerSettings
+            dependencies: ["PerunPGSQL"]
         ),
 
         // Runnable, compile-checked examples that back the documentation. `swift build` compiles
@@ -73,17 +49,13 @@ let package = Package(
         .executableTarget(
             name: "Examples",
             dependencies: ["PerunPGSQL"],
-            path: "Examples",
-            swiftSettings: opensslSwiftSettings,
-            linkerSettings: opensslLinkerSettings
+            path: "Examples"
         ),
 
         // Unit tests for the crypto primitives, wire codecs and type decoders.
         .testTarget(
             name: "PerunTests",
-            dependencies: ["PerunPGSQL"],
-            swiftSettings: opensslSwiftSettings,
-            linkerSettings: opensslLinkerSettings
+            dependencies: ["PerunPGSQL"]
         ),
     ]
 )

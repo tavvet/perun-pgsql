@@ -2,11 +2,10 @@
 #
 # Build the DocC documentation archive for PerunPGSQL.
 #
-# swift-docc-plugin drives `swift-symbolgraph-extract`, which does NOT inherit the target's
-# OpenSSL header search path (the `-Xcc -I<prefix>/include` in Package.swift is a target
-# `unsafeFlag`, and neither the target settings nor a global `-Xcc` reach the extract step).
-# So we inject the include path via CPATH, which clang honours for every compilation — the
-# same prefix Package.swift probes for.
+# OpenSSL is found through pkg-config, so we point PKG_CONFIG_PATH at Homebrew's keg-only
+# openssl@3. swift-docc-plugin also drives `swift-symbolgraph-extract`, which does not always
+# inherit those flags, so we additionally set CPATH (clang honours it for every compilation) as
+# a belt-and-suspenders fallback for the header search path.
 #
 # Usage: ./Scripts/build-docs.sh [extra generate-documentation args]
 #   OPENSSL_PREFIX=/path overrides the probe.
@@ -28,5 +27,7 @@ if [[ -z "$prefix" ]]; then
 fi
 [[ -n "$prefix" ]] || { echo "error: OpenSSL headers not found; set OPENSSL_PREFIX" >&2; exit 1; }
 
-CPATH="$prefix/include${CPATH:+:$CPATH}" PERUN_BUILD_DOCS=1 \
+PKG_CONFIG_PATH="$prefix/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}" \
+CPATH="$prefix/include${CPATH:+:$CPATH}" \
+PERUN_BUILD_DOCS=1 \
     swift package generate-documentation --target PerunPGSQL "$@"
