@@ -235,8 +235,9 @@ func parsePostgresTimeTz(_ text: String) -> PostgresTimeTz? {
     zone = zone.dropFirst()
     // Strict `HH[:MM[:SS]]`: reject a malformed offset rather than silently zeroing a bad field.
     let parts = zone.split(separator: ":", omittingEmptySubsequences: false)
-    // hours bounded so `hours * 3600` below can't overflow (real offsets are ≤ 15 hours).
-    guard (1 ... 3).contains(parts.count), let hours = Int32(parts[0]), (0 ... 23).contains(hours) else { return nil }
+    // PostgreSQL caps timetz offsets at 15:59:59 (`+16:00` is out of range), so reject a wider
+    // hours value; that also keeps `hours * 3600` below from overflowing.
+    guard (1 ... 3).contains(parts.count), let hours = Int32(parts[0]), (0 ... 15).contains(hours) else { return nil }
     var minutes: Int32 = 0
     if parts.count > 1 {
         guard let value = Int32(parts[1]), (0 ... 59).contains(value) else { return nil }

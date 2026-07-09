@@ -72,6 +72,10 @@ final class TemporalTypesTests: XCTestCase {
         let binary = try PostgresTimeTz.decode(
             [0, 0, 0, 0, 0, 0, 0, 1, 0xFF, 0xFF, 0xB9, 0xB0], oid: 1266, format: .binary)
         XCTAssertEqual(binary, PostgresTimeTz(time: PostgresTime(microseconds: 1), zoneOffsetSeconds: 18000))
+
+        // +15:59:59 is PostgreSQL's maximum offset — accepted (the positive boundary).
+        let maxOffset = try PostgresTimeTz.decode(Array("00:00:00+15:59:59".utf8), oid: 1266, format: .text)
+        XCTAssertEqual(maxOffset, PostgresTimeTz(time: PostgresTime(microseconds: 0), zoneOffsetSeconds: 57599))
     }
 
     func testTimeTzRejectsMalformedOffset() {
@@ -83,7 +87,7 @@ final class TemporalTypesTests: XCTestCase {
         XCTAssertThrowsError(try decode("12:34:56+05:30:99"))     // seconds out of range
         XCTAssertThrowsError(try decode("12:34:56+05:30:45:00"))  // too many offset parts
         XCTAssertThrowsError(try decode("12:34:56+2147483647:00")) // offset hours overflow → error, not a trap
-        XCTAssertThrowsError(try decode("12:34:56+24:00"))         // offset hours out of range
+        XCTAssertThrowsError(try decode("12:34:56+16:00"))         // just past PostgreSQL's +15:59:59 limit
     }
 
     func testClockRejectsOverflowAndOutOfRange() throws {
