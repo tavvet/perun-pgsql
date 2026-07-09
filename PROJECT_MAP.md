@@ -720,10 +720,12 @@ closed/recycled fd or freed TLS object.
 
 State:
 
-- `idle`: reusable connections;
+- `idle`: reusable connections, each tagged with an `idleSince` timestamp;
 - `openCount`: idle + checked out + connecting;
 - `waiters`: continuations waiting for a connection;
-- `isShutDown`.
+- `isShutDown`;
+- `maxConnectionLifetime` / `maxIdleTime` (optional recycling limits) and the `reaperTask`.
+  Connections carry a `nonisolated createdAt` so the pool can judge age without an actor hop.
 
 Public API:
 
@@ -735,9 +737,12 @@ Public API:
 Acquire behavior:
 
 1. Fail if shut down.
-2. Reuse an idle connection — but **validate it first** (`isProbablyAlive`): the server may
-   have closed it while it sat idle (a shutdown, `pg_terminate_backend`, or an idle timeout
-   leaves a termination `ErrorResponse` + socket close the parked reader never saw). The probe
+2. Reuse an idle connection — but **vet it first**. A cheap synchronous age check
+   (`isExpired`) drops one past `maxConnectionLifetime` (since `createdAt`) or `maxIdleTime`
+   (since `idleSince`) and tries the next. Otherwise **validate it's alive** (`isProbablyAlive`):
+   the server may have closed it while it sat idle (a shutdown, `pg_terminate_backend`, or an
+   idle timeout leaves a termination `ErrorResponse` + socket close the parked reader never saw).
+   The probe
    is a cheap non-blocking `MSG_PEEK` (`SystemSocket.isQuiescentOpen`, run on the read queue so
    it can't race the reader): a drained connection has nothing waiting, so `EWOULDBLOCK` means
    healthy, while EOF or unexpected pending bytes means dead. A dead one is discarded
@@ -768,6 +773,15 @@ Error behavior:
   discards it if it came back inside a transaction).
 - The split is `PerunError.mayHaveDesynchronizedWire`, an exhaustive switch over
   every error case (so a new case forces a decision).
+
+Age-based recycling (opt-in; both limits default to nil):
+
+- `maxConnectionLifetime` bounds how long a connection lives (since `createdAt`);
+  `maxIdleTime` closes one that has sat idle too long. Acquire enforces both on borrow, and a
+  background `reaperTask` — started lazily on first checkout when a limit is set, cancelled on
+  `shutdown` — scans `idle` every ~half the smallest limit (min 500 ms) and closes expired
+  ones. The pool is lazy (no minimum idle count), so it can shrink to zero and reopen on demand.
+  Timestamps use `ContinuousClock` (counts real elapsed time, matching the server's view).
 
 Transaction hygiene:
 
@@ -996,6 +1010,9 @@ environment variables.
   doesn't false-positive), and a connection the server terminates while idle
   (`pg_terminate_backend`) is detected on borrow, discarded, and replaced — the next query runs
   on a fresh backend instead of failing.
+- `PoolRecyclingIntegrationTests`: an idle connection past `maxIdleTime` is reaped (the pool
+  shrinks to zero and reopens on demand), a connection past `maxConnectionLifetime` is replaced
+  (new backend PID), and with no limits set a connection is reused indefinitely.
 - `SessionParameterIntegrationTests`: the driver pins `client_encoding`/`DateStyle`/
   `IntervalStyle`, a caller can override a pinned key (including with a lowercase, case-different
   key), and the pin overrides a role's non-default `DateStyle` (a text date still decodes

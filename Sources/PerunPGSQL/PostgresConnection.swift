@@ -140,6 +140,9 @@ public actor PostgresConnection {
     private var tls: TLSConnection?
 
     /// Stream of asynchronous LISTEN/NOTIFY notifications from the server.
+    /// When this connection was established (monotonic clock), so a pool can recycle it by
+    /// age. `nonisolated` so the pool reads it without an actor hop; immutable across checkouts.
+    nonisolated let createdAt: ContinuousClock.Instant
     public nonisolated let notifications: AsyncStream<PostgresNotification>
     private let notificationContinuation: AsyncStream<PostgresNotification>.Continuation
 
@@ -189,6 +192,7 @@ public actor PostgresConnection {
         self.port = port
         self.maxMessageSize = maxMessageSize
         self.connectionID = UInt64.random(in: UInt64.min ... UInt64.max)
+        self.createdAt = ContinuousClock().now
         var continuation: AsyncStream<PostgresNotification>.Continuation!
         self.notifications = AsyncStream(bufferingPolicy: .bufferingNewest(notificationBufferLimit)) {
             continuation = $0

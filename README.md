@@ -357,21 +357,16 @@ docker run -d --name pg -e POSTGRES_HOST_AUTH_METHOD=trust \
 ## Status & roadmap
 
 All seven milestones are complete and verified against PostgreSQL 17, including full
-SASLprep (RFC 4013) password preparation. The public surface is deliberately general:
-it speaks the protocol and returns rows. Query building, models and migrations are
-concerns for code built *on top* of the driver, not for the driver itself.
+SASLprep (RFC 4013) password preparation. Production hardening is in place too: query
+`withTimeout` deadlines, pooled-connection validate-on-borrow and age-based recycling
+(`maxConnectionLifetime` / `maxIdleTime`), and pinned session GUCs for reliable text
+decoding. The public surface is deliberately general: it speaks the protocol and returns
+rows. Query building, models and migrations are concerns for code built *on top* of the
+driver, not for the driver itself.
 
-Possible extensions (the driver is complete for its scope — these are additive, not gaps).
-
-Production hardening:
-
-- **Pool recycling by age** — the pool now validates a connection on borrow (a cheap
-  non-blocking liveness probe) and discards one the server closed while idle; still open is
-  proactive recycling by max lifetime / idle time to pre-empt server-side timeouts.
-
-More typed decoders (all already readable as `String` in text; these add a typed form):
-
-- **`timetz`, `inet`/`cidr`, range, and composite/enum types.**
+One additive extension is left (each type is already readable as `String` in text; this
+adds a typed form): typed decoders for **`timetz`, `inet`/`cidr`, range, and composite/enum
+types**.
 
 ## License
 

@@ -16,20 +16,37 @@
 public actor PostgresClient {
     private let configuration: ConnectionConfiguration
     private let maxConnections: Int
+    /// Recycle a connection older than this (nil = no limit): bounds connection age, useful for
+    /// rebalancing after a failover or picking up server-side changes.
+    private let maxConnectionLifetime: Duration?
+    /// Close a connection idle in the pool longer than this (nil = no limit): shrinks the pool
+    /// when demand drops and pre-empts a server or middlebox dropping a long-idle connection.
+    private let maxIdleTime: Duration?
 
-    /// Idle, ready-to-use connections.
-    private var idle: [PostgresConnection] = []
+    private struct IdleEntry {
+        let connection: PostgresConnection
+        let idleSince: ContinuousClock.Instant
+    }
+    /// Idle, ready-to-use connections, each tagged with when it was returned to the pool.
+    private var idle: [IdleEntry] = []
     /// How many connections currently exist (idle + checked out + connecting).
     private var openCount = 0
     /// Tasks parked waiting for a connection to free up.
     private var waiters: [(id: UInt64, continuation: CheckedContinuation<PostgresConnection, Error>)] = []
     private var nextWaiterID: UInt64 = 0
     private var isShutDown = false
+    /// Reaps expired idle connections; started lazily when age-based recycling is enabled.
+    private var reaperTask: Task<Void, Never>?
 
-    public init(configuration: ConnectionConfiguration, maxConnections: Int = 10) {
+    public init(configuration: ConnectionConfiguration,
+                maxConnections: Int = 10,
+                maxConnectionLifetime: Duration? = nil,
+                maxIdleTime: Duration? = nil) {
         precondition(maxConnections > 0, "maxConnections must be positive")
         self.configuration = configuration
         self.maxConnections = maxConnections
+        self.maxConnectionLifetime = maxConnectionLifetime
+        self.maxIdleTime = maxIdleTime
     }
 
     /// Number of connections currently open (idle plus in use).
@@ -85,10 +102,13 @@ public actor PostgresClient {
         guard !isShutDown else { return }
         isShutDown = true
 
+        reaperTask?.cancel()
+        reaperTask = nil
+
         let toClose = idle
         idle.removeAll()
-        for connection in toClose {
-            try? await connection.close()
+        for entry in toClose {
+            try? await entry.connection.close()
         }
         openCount -= toClose.count
 
@@ -104,20 +124,26 @@ public actor PostgresClient {
 
     private func acquire() async throws -> PostgresConnection {
         if isShutDown { throw PerunError.clientShutdown }
+        startReaperIfNeeded()
 
-        // Reuse an idle connection, but validate it first: the server may have closed it
-        // while it sat idle. Discard any dead one and try the next rather than handing a
-        // borrower a connection that fails on its first query.
-        while let reused = idle.popLast() {
-            let alive = await reused.isProbablyAlive()
+        // Reuse an idle connection, but vet it first: discard one past its age limit, or one the
+        // server closed while it sat idle, and try the next — rather than hand a borrower a
+        // connection we mean to recycle or that would fail on its first query.
+        while let entry = idle.popLast() {
+            if isExpired(entry, now: ContinuousClock().now) {   // cheap sync check before the probe
+                openCount -= 1
+                Task { try? await entry.connection.close() }
+                continue
+            }
+            let alive = await entry.connection.isProbablyAlive()
             if isShutDown {                        // shutdown raced in during the probe
                 openCount -= 1
-                Task { try? await reused.close() }
+                Task { try? await entry.connection.close() }
                 throw PerunError.clientShutdown
             }
-            if alive { return reused }
+            if alive { return entry.connection }
             openCount -= 1                          // dead: drop it and try another
-            Task { try? await reused.close() }
+            Task { try? await entry.connection.close() }
         }
 
         if openCount < maxConnections {
@@ -189,7 +215,7 @@ public actor PostgresClient {
         if !waiters.isEmpty {
             waiters.removeFirst().continuation.resume(returning: connection)   // hand straight to a waiter
         } else {
-            idle.append(connection)
+            idle.append(IdleEntry(connection: connection, idleSince: ContinuousClock().now))
         }
     }
 
@@ -230,5 +256,54 @@ public actor PostgresClient {
             openCount -= 1
             waiter.continuation.resume(throwing: error)
         }
+    }
+
+    // MARK: - Age-based recycling
+
+    /// Start the background reaper the first time a connection is checked out, when a lifetime
+    /// or idle limit is set. Idempotent; cancelled on `shutdown`.
+    private func startReaperIfNeeded() {
+        guard reaperTask == nil, !isShutDown, maxConnectionLifetime != nil || maxIdleTime != nil else { return }
+        let interval = reapInterval()
+        reaperTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: interval)
+                if Task.isCancelled { return }
+                guard let self else { return }
+                await self.reapExpiredIdleConnections()
+            }
+        }
+    }
+
+    /// Scan cadence: about half the smallest limit, but never busier than twice a second.
+    private func reapInterval() -> Duration {
+        let smallest = [maxIdleTime, maxConnectionLifetime].compactMap { $0 }.min() ?? .seconds(30)
+        return max(.milliseconds(500), smallest / 2)
+    }
+
+    /// Close every idle connection past a recycling limit and drop it from the pool. The lazy
+    /// pool reopens on demand, so there is no minimum idle count to preserve.
+    private func reapExpiredIdleConnections() {
+        guard !isShutDown else { return }
+        let now = ContinuousClock().now
+        var kept: [IdleEntry] = []
+        kept.reserveCapacity(idle.count)
+        for entry in idle {
+            if isExpired(entry, now: now) {
+                openCount -= 1
+                Task { try? await entry.connection.close() }
+            } else {
+                kept.append(entry)
+            }
+        }
+        idle = kept
+    }
+
+    /// Whether an idle connection is past its lifetime (since it was created) or idle limit
+    /// (since it was last returned to the pool).
+    private func isExpired(_ entry: IdleEntry, now: ContinuousClock.Instant) -> Bool {
+        if let maxLifetime = maxConnectionLifetime, now - entry.connection.createdAt > maxLifetime { return true }
+        if let maxIdle = maxIdleTime, now - entry.idleSince > maxIdle { return true }
+        return false
     }
 }
