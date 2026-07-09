@@ -29,8 +29,10 @@ public enum PostgresOID {
     public static let bpchar: Int32 = 1042
     public static let varchar: Int32 = 1043
     public static let date: Int32 = 1082
+    public static let time: Int32 = 1083
     public static let timestamp: Int32 = 1114
     public static let timestamptz: Int32 = 1184
+    public static let interval: Int32 = 1186
     public static let numeric: Int32 = 1700
     public static let uuid: Int32 = 2950
     public static let jsonb: Int32 = 3802

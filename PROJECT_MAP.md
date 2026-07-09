@@ -64,6 +64,7 @@ Sources/
       PostgresDecodable.swift
       ScalarTypes.swift
       FoundationTypes.swift
+      TemporalTypes.swift
   perun-demo/
     Demo.swift
 Tests/
@@ -510,6 +511,8 @@ Supported built-in type families:
 - bytea as `[UInt8]` and `Data`;
 - UUID;
 - date/timestamp/timestamptz as `Date`;
+- interval as `PostgresInterval` (months/days/microseconds) and time as `PostgresTime`
+  (microseconds since midnight) — `TemporalTypes.swift`, text and binary;
 - numeric as `Decimal`;
 - arrays of any of the above (`decodeArray`, any number of dimensions).
 
@@ -891,6 +894,12 @@ constraint name and leaves the connection usable (skipped unless `PERUN_PGSQL_IN
 Parameter encoding: byte-exact text and binary wire form for each encodable type —
 including multi-dimensional arrays (nested `{…}` braces and the multi-dimension binary
 header) — plus the `Bind` message layout when binary parameters are requested.
+
+### `TemporalTypesTests`
+
+`PostgresInterval` and `PostgresTime`: text/binary encode and decode (byte-exact binary,
+the `intervalstyle=postgres` text parser, sub-second sign), plus a live round-trip in both
+result formats, decoding a server-produced interval, and an `interval[]` array.
 
 ### `ArrayDecodingTests`
 

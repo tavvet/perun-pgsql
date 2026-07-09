@@ -119,6 +119,16 @@ struct ByteReader {
         return Int32(bitPattern: value)
     }
 
+    mutating func readInt64() throws -> Int64 {
+        try requireRemaining(8)
+        var value: UInt64 = 0
+        for _ in 0 ..< 8 {
+            value = (value << 8) | UInt64(bytes[offset])
+            offset += 1
+        }
+        return Int64(bitPattern: value)
+    }
+
     mutating func readBytes(_ count: Int) throws -> [UInt8] {
         try requireRemaining(count)
         let slice = Array(bytes[offset ..< offset + count])
