@@ -232,7 +232,8 @@ primitives:
 SCRAM server-final signatures are verified before authentication can complete.
 The signature comparison is constant-time for equal-length signatures. PBKDF2
 uses a reusable HMAC-SHA-256 context so the HMAC key schedule is not rebuilt on
-every iteration.
+every iteration; its server-controlled iteration count is range-checked first, so a hostile
+`i=0`/negative can't trip its `precondition` and an absurd value can't hang the client.
 
 Passwords are prepared with SASLprep (RFC 4013) in `Auth/SASLprep.swift` before the
 key derivation: map the RFC 3454 B.1/C.1.2 code points, apply Unicode NFKC (via
@@ -257,7 +258,7 @@ interleave protocol messages on one socket.
 - **Exclusive** (`lock`) — transactions, `waitForNotifications`, and row streaming. These
   read inline over multiple requests (a transaction spans several; a stream is consumed over
   time), so they take exclusive access: it drains the in-flight shared queries and blocks new
-  ones, owning the wire while the reader sits idle. Writer
+  ones, owning the wire while the background reader is stopped. Writer
   priority (shared waits while an exclusive holder is active or waiting) keeps exclusive
   access from starving. So `query`/`execute`/batches from other tasks wait for a BEGIN…COMMIT
   to finish rather than interleaving into it.
@@ -283,7 +284,16 @@ can never starve a concurrent write. Exactly-once delivery: the reader pops each
 the one in flight; a wire-desync error tears the connection down and fails everything
 still queued (plus everyone parked for access, via `failAllAccessWaiters`).
 
-Exclusive holders read inline, and the RW-lock guarantees the reader is idle whenever
+The reader is spun up on demand and **exits when its queue drains** rather than parking;
+`startReaderIfNeeded` restarts it on the next request. This is deliberate: a reader parked on a
+stored continuation would form a retain cycle (`self` → the parked continuation → its suspended
+frame → `self`), so a `PostgresConnection` dropped without `close()` could never be released.
+Exiting when idle breaks that, and a `deinit` shuts the socket down as a safety net — so a
+forgotten connection (or a pool dropped without `shutdown()`) still frees its fd, reader task and
+buffers instead of leaking them. A caller arriving on an already-closed connection is refused up
+front (`acquireShared`/`lock` guard on `isClosed`) rather than parking on a wire nothing will serve.
+
+Exclusive holders read inline, and the RW-lock guarantees no background reader is active whenever
 they run (shared drained, new shared blocked), so the two read paths never contend for the
 socket. What pipelining buys is latency (fewer round trips), not server-side parallelism —
 one backend still runs the queries serially — and responses come back in order, so a slow
@@ -352,8 +362,11 @@ next backend message. It then runs `finishStream` and throws `CancellationError`
 begins), so `finishStream`'s drain doesn't stall behind a still-running query either. A
 `streamGeneration` guard makes a late cancel a no-op once its stream has ended (so it can never
 cancel the query of a *later* stream that now holds the wire) — the streaming analogue of the
-shared path's `currentRead === op` check. Without this, a cancelled `for await` on a slow
-stream would keep the exclusive hold until the server replied.
+shared path's `currentRead === op` check. The same generation is captured by
+`StreamCleanup`/`CopyOutCleanup` and re-checked in `finishStream`/`finishCopyOut`, so a late
+`deinit` from a fully-consumed stream is a no-op too — it can't `Close`+`Sync` a *newer* stream's
+portal out from under it. Without the cancel guard, a cancelled `for await` on a slow stream would
+keep the exclusive hold until the server replied.
 
 ### COPY
 
@@ -745,7 +758,8 @@ Acquire behavior:
    (`isExpired`) drops one past `maxConnectionLifetime` (since `createdAt`) or `maxIdleTime`
    (since `idleSince`) and tries the next. Otherwise **validate it's alive** (`isProbablyAlive`):
    the server may have closed it while it sat idle (a shutdown, `pg_terminate_backend`, or an
-   idle timeout leaves a termination `ErrorResponse` + socket close the parked reader never saw).
+   idle timeout leaves a termination `ErrorResponse` + socket close that no background reader was
+   running to notice).
    The probe
    is a cheap non-blocking `MSG_PEEK` (`SystemSocket.isQuiescentOpen`, run on the read queue so
    it can't race the reader): a drained connection has nothing waiting, so `EWOULDBLOCK` means
@@ -772,11 +786,14 @@ Release behavior:
 
 Error behavior:
 
-- Only errors that may have desynchronized the wire (connection closed, protocol
-  violation, TLS failures) drop the connection and may open a replacement.
-- Server (SQL) errors, decode/local errors and errors from the caller's closure
-  leave the wire synchronized, so the connection is reused (release() still
-  discards it if it came back inside a transaction).
+- Only errors that may have desynchronized the wire — connection closed, a raw socket read/write
+  failure (`ioError`, mapped from `SocketError` at the send/receive boundary so a plaintext fault
+  is classified too, not just TLS), protocol violation, TLS failures — drop the connection and may
+  open a replacement.
+- Server (SQL) errors, decode/local errors, a wrong-direction or non-COPY `copyMismatch` (its
+  handshake drains to `ReadyForQuery` first, so the wire is in sync and the connection is kept),
+  and errors from the caller's closure leave the wire synchronized, so the connection is reused
+  (release() still discards it if it came back inside a transaction).
 - The split is `PerunError.mayHaveDesynchronizedWire`, an exhaustive switch over
   every error case (so a new case forces a decision).
 
