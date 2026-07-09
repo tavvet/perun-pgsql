@@ -1,0 +1,72 @@
+name: CI
+
+# Compile the whole package and run the tests on Linux, so a change that builds on
+# macOS but breaks on Linux — or breaks a test — is caught before it lands.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A newer push to the same branch or PR cancels an in-flight run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Proves the whole package compiles on Linux (library, demo and Examples) and that the
+  # unit tests pass. No database: the integration tests skip themselves unless
+  # PERUN_PGSQL_INTEGRATION=1, so this job needs nothing external.
+  build:
+    name: Build & unit tests
+    runs-on: ubuntu-latest
+    container: swift:6.0
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OpenSSL
+        run: apt-get update && apt-get install -y libssl-dev pkg-config
+
+      - name: Build everything (library, demo, examples, tests)
+        run: swift build --build-tests
+
+      - name: Run unit tests
+        run: swift test
+
+  # Runs the full suite — unit plus integration — against a real PostgreSQL 17, reachable
+  # inside the job container at the service's hostname (`postgres`), not localhost.
+  integration:
+    name: Integration tests (PostgreSQL 17)
+    runs-on: ubuntu-latest
+    container: swift:6.0
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: perun
+          POSTGRES_DB: perun
+          POSTGRES_HOST_AUTH_METHOD: trust
+        options: >-
+          --health-cmd "pg_isready -U perun -d perun"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OpenSSL
+        run: apt-get update && apt-get install -y libssl-dev pkg-config
+
+      - name: Run the full suite against live PostgreSQL
+        env:
+          PERUN_PGSQL_INTEGRATION: "1"
+          PGHOST: postgres
+          PGPORT: "5432"
+          PGUSER: perun
+          PGDATABASE: perun
+          PGSSLMODE: disable
+        run: swift test
