@@ -153,6 +153,71 @@ final class CopyIntegrationTests: XCTestCase {
         XCTAssertEqual(answer, 3)
     }
 
+    // MARK: - Wrong-direction and stale-writer rejection
+
+    func testCopyOutRejectsFromStdinWithoutHanging() async throws {
+        let connection = try await PostgresConnection.connect(integrationConfiguration())
+        defer { Task { try? await connection.close() } }
+
+        _ = try await connection.query("CREATE TEMP TABLE copy_wrong_dir (id int)")
+        // COPY FROM STDIN makes the server wait for client data; copyOut must abort it (CopyFail)
+        // and throw rather than read on forever.
+        do {
+            _ = try await connection.copyOut("COPY copy_wrong_dir FROM STDIN")
+            XCTFail("expected copyOut to reject a FROM STDIN statement")
+        } catch {
+            // expected
+        }
+        let answer = try await connection.query("SELECT 1 AS a").rows[0].decode("a", as: Int.self)
+        XCTAssertEqual(answer, 1)
+    }
+
+    func testCopyInRejectsToStdout() async throws {
+        let connection = try await PostgresConnection.connect(integrationConfiguration())
+        defer { Task { try? await connection.close() } }
+
+        // COPY TO STDOUT makes the server stream to us; copyIn must cancel/drain it and throw
+        // without running the writer closure.
+        do {
+            try await connection.copyIn("COPY (SELECT 1) TO STDOUT") { _ in
+                XCTFail("the writer closure should not run for a wrong-direction copyIn")
+            }
+            XCTFail("expected copyIn to reject a TO STDOUT statement")
+        } catch {
+            // expected
+        }
+        let answer = try await connection.query("SELECT 2 AS a").rows[0].decode("a", as: Int.self)
+        XCTAssertEqual(answer, 2)
+    }
+
+    func testCopyInWriterRejectedDuringLaterCopy() async throws {
+        let connection = try await PostgresConnection.connect(integrationConfiguration())
+        defer { Task { try? await connection.close() } }
+
+        _ = try await connection.query("CREATE TEMP TABLE copy_gen (id int)")
+        final class Box: @unchecked Sendable { var writer: PostgresCopyInWriter? }
+        let box = Box()
+
+        try await connection.copyIn("COPY copy_gen FROM STDIN") { writer in
+            box.writer = writer                    // leak the first copy's writer
+            try await writer.write("1\n")
+        }
+        try await connection.copyIn("COPY copy_gen FROM STDIN") { writer in
+            do {
+                try await box.writer?.write("999\n")   // stale writer, different generation
+                XCTFail("a stale writer must be rejected during a later copy")
+            } catch {
+                // expected — the generation guard rejects it
+            }
+            try await writer.write("2\n")          // the real writer still works
+        }
+
+        // Only 1 and 2 landed; the stale writer's 999 never reached the wire.
+        let ids = try await connection.query("SELECT id FROM copy_gen ORDER BY id")
+            .rows.map { try $0.decode("id", as: Int.self) }
+        XCTAssertEqual(ids, [1, 2])
+    }
+
     // MARK: - Helpers
 
     private func integrationConfiguration() throws -> ConnectionConfiguration {

@@ -346,9 +346,17 @@ driver — row formatting/parsing belongs to a higher layer. `Copy.swift` holds 
   `CopyInResponse`, hand the closure a `PostgresCopyInWriter` whose `write`s are framed as
   `CopyData`, then `CopyDone` and read the result (`CommandComplete` "COPY n"). Throwing from
   the closure sends `CopyFail` (the server rolls the copy back) and rethrows the cause; the
-  echoed error is drained and discarded. The writer guards on `copyInActive`, so a leaked
-  writer used after the closure throws rather than corrupting the wire. No cancellation wrapper
-  is needed — the caller drives the writes, so cancelling means throwing from the closure.
+  echoed error is drained and discarded. The writer carries a `copyInGeneration` token that
+  `sendCopyData` checks against the connection's, so a writer used after its closure — or
+  during a *later* `copyIn` on the same connection — is rejected rather than injecting bytes.
+  No cancellation wrapper is needed — the caller drives the writes, so cancelling means
+  throwing from the closure.
+
+Each handshake reader rejects a **wrong-direction** statement instead of misbehaving: `copyOut`
+of a `FROM STDIN` (the server would then wait for client data and the read would hang) aborts
+the copy with `CopyFail`, drains, and throws; `copyIn` of a `TO STDOUT` (the server streams to
+us — potentially the whole relation) fires a `CancelRequest`, drains, and throws. Both use a
+shared `drainToReadyForQuery`.
 
 ### Simple Query
 
@@ -937,7 +945,10 @@ environment variables.
 - `CopyIntegrationTests`: `copyOut` reproduces a table's data and a `COPY (query)`, an early
   `break` frees the connection, and a non-COPY statement is rejected; `copyIn` loads rows and
   reports the "COPY n" tag, round-trips with `copyOut`, rolls back and rethrows when the closure
-  throws (`CopyFail`), and rejects a writer used after its closure.
+  throws (`CopyFail`), and rejects a writer used after its closure. Wrong-direction guards:
+  `copyOut` of a `FROM STDIN` is rejected without hanging, `copyIn` of a `TO STDOUT` is rejected
+  without running the closure, and a stale writer is rejected mid-way through a later `copyIn`
+  (its bytes never land).
 
 ## Local Verification
 

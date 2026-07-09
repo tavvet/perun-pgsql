@@ -64,15 +64,16 @@ final class CopyOutCleanup: @unchecked Sendable {
 /// format (text/CSV/binary). Valid only inside that closure — a write afterwards throws.
 public struct PostgresCopyInWriter: Sendable {
     let connection: PostgresConnection
+    let generation: UInt64          // ties this writer to one copyIn; a later copy rejects it
 
     /// Send one chunk of COPY payload. Batch rows into reasonably sized chunks; an empty
     /// chunk is a no-op.
     public func write(_ bytes: [UInt8]) async throws {
-        try await connection.sendCopyData(bytes)
+        try await connection.sendCopyData(bytes, generation: generation)
     }
 
     /// Send `text`'s UTF-8 bytes as COPY payload — convenient for text/CSV COPY.
     public func write(_ text: String) async throws {
-        try await connection.sendCopyData(Array(text.utf8))
+        try await connection.sendCopyData(Array(text.utf8), generation: generation)
     }
 }

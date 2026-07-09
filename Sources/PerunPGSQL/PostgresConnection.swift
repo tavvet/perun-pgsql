@@ -389,8 +389,9 @@ public actor PostgresConnection {
         try await readCopyInResponse()           // consume the CopyInResponse handshake (or error)
 
         copyInActive = true
+        copyInGeneration += 1
         do {
-            try await write(PostgresCopyInWriter(connection: self))
+            try await write(PostgresCopyInWriter(connection: self, generation: copyInGeneration))
         } catch {
             copyInActive = false
             try await failCopyIn()               // CopyFail + drain; we rethrow the closure's error
@@ -1402,6 +1403,11 @@ public actor PostgresConnection {
             switch try await readMessage() {
             case .copyOutResponse:
                 return                           // the server will now stream CopyData
+            case .copyInResponse:
+                // Wrong direction: a COPY … FROM STDIN. The server is now waiting for client
+                // data (so reading on would hang) — abort it with CopyFail, then surface it.
+                try await failCopyIn()
+                throw PerunError.protocolViolation("copyOut needs a COPY … TO STDOUT statement, not FROM STDIN")
             case let .errorResponse(error):
                 pendingError = error             // e.g. bad SQL; drain to ReadyForQuery then throw
             case let .parameterStatus(name, value):
@@ -1536,6 +1542,7 @@ public actor PostgresConnection {
     // The writer only works while `copyInActive`, so a leaked writer can't corrupt the wire.
 
     private var copyInActive = false
+    private var copyInGeneration: UInt64 = 0          // identifies the current copyIn for its writer
 
     /// Consume the `CopyInResponse` handshake after a `COPY … FROM STDIN` query. Drains to
     /// ReadyForQuery and throws if the statement errored or wasn't a COPY FROM STDIN.
@@ -1545,6 +1552,12 @@ public actor PostgresConnection {
             switch try await readMessage() {
             case .copyInResponse:
                 return                           // the server is ready to receive CopyData
+            case .copyOutResponse:
+                // Wrong direction: a COPY … TO STDOUT. The server is now streaming to us (it
+                // could be the whole relation) — cancel it, drain, then surface the error.
+                try? await sendCancelRequest()
+                try await drainToReadyForQuery()
+                throw PerunError.protocolViolation("copyIn needs a COPY … FROM STDIN statement, not TO STDOUT")
             case let .errorResponse(error):
                 pendingError = error
             case let .parameterStatus(name, value):
@@ -1564,11 +1577,12 @@ public actor PostgresConnection {
         }
     }
 
-    /// Send one `CopyData` chunk for the active `copyIn`. Guards on `copyInActive` so a
-    /// writer used outside its closure can't inject bytes into the wire.
-    func sendCopyData(_ bytes: [UInt8]) async throws {
-        guard copyInActive else {
-            throw PerunError.protocolViolation("COPY data written outside an active copyIn")
+    /// Send one `CopyData` chunk for the active `copyIn`. Guards on `copyInActive` *and* the
+    /// writer's `generation`, so a writer used outside its own closure — including during a
+    /// later `copyIn` on the same connection — is rejected rather than injecting bytes.
+    func sendCopyData(_ bytes: [UInt8], generation: UInt64) async throws {
+        guard copyInActive, copyInGeneration == generation else {
+            throw PerunError.protocolViolation("COPY data written outside its copyIn")
         }
         guard !bytes.isEmpty else { return }
         try await send(FrontendMessage.copyData(bytes))
@@ -1579,6 +1593,12 @@ public actor PostgresConnection {
     /// rethrows the original cause instead.
     private func failCopyIn() async throws {
         try await send(FrontendMessage.copyFail(message: "client aborted COPY"))
+        try await drainToReadyForQuery()
+    }
+
+    /// Read and discard messages until ReadyForQuery, keeping session parameters and
+    /// notifications current. Resynchronises the wire after aborting a COPY.
+    private func drainToReadyForQuery() async throws {
         while true {
             switch try await readMessage() {
             case let .readyForQuery(status):
@@ -1592,7 +1612,7 @@ public actor PostgresConnection {
                 notificationContinuation.yield(
                     PostgresNotification(processID: processID, channel: channel, payload: payload))
             default:
-                continue                         // discard the CopyFail echo and anything else
+                continue
             }
         }
     }
