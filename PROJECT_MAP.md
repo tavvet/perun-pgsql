@@ -35,6 +35,7 @@ Sources/
     PostgresConnection.swift
     PostgresClient.swift
     RowStream.swift
+    Copy.swift
     Result.swift
     Statement.swift
     Encoding.swift
@@ -326,6 +327,28 @@ begins), so `finishStream`'s drain doesn't stall behind a still-running query ei
 cancel the query of a *later* stream that now holds the wire) — the streaming analogue of the
 shared path's `currentRead === op` check. Without this, a cancelled `for await` on a slow
 stream would keep the exclusive hold until the server replied.
+
+### COPY
+
+The COPY sub-protocol moves raw `CopyData` payloads in either direction under **exclusive**
+access; the bytes are in the COPY statement's format (text/CSV/binary) and are opaque to the
+driver — row formatting/parsing belongs to a higher layer. `Copy.swift` holds the public types.
+
+- **COPY OUT** (`copyOut` → `PostgresCopyOutSequence`, an `AsyncSequence` of `[UInt8]`): send
+  the `COPY … TO STDOUT` as a Simple Query, consume the `CopyOutResponse` handshake, then pull
+  `CopyData` chunks (`nextCopyData`) until `CopyDone` → `CommandComplete` → `ReadyForQuery`
+  (no `Sync` — it's Simple Query). It mirrors row streaming exactly: pull-based backpressure,
+  cancellation-aware (`withTaskCancellationHandler` + `CancelRequest`), and a `CopyOutCleanup`
+  `deinit` that stops an abandoned copy. Because COPY has no chunked pause, early termination
+  and cancel both fire a `CancelRequest` (the server would otherwise stream the whole relation)
+  and drain to `ReadyForQuery`.
+- **COPY IN** (`copyIn(_:_:)`, closure-driven): send the `COPY … FROM STDIN`, consume the
+  `CopyInResponse`, hand the closure a `PostgresCopyInWriter` whose `write`s are framed as
+  `CopyData`, then `CopyDone` and read the result (`CommandComplete` "COPY n"). Throwing from
+  the closure sends `CopyFail` (the server rolls the copy back) and rethrows the cause; the
+  echoed error is drained and discarded. The writer guards on `copyInActive`, so a leaked
+  writer used after the closure throws rather than corrupting the wire. No cancellation wrapper
+  is needed — the caller drives the writes, so cancelling means throwing from the closure.
 
 ### Simple Query
 
@@ -911,6 +934,10 @@ environment variables.
   sync; and cancelling a task on a slow stream (`pg_sleep`) — both while blocked mid-read and
   before the first read — returns promptly (via `CancelRequest`) and frees the connection
   rather than waiting for the query.
+- `CopyIntegrationTests`: `copyOut` reproduces a table's data and a `COPY (query)`, an early
+  `break` frees the connection, and a non-COPY statement is rejected; `copyIn` loads rows and
+  reports the "COPY n" tag, round-trips with `copyOut`, rolls back and rethrows when the closure
+  throws (`CopyFail`), and rejects a writer used after its closure.
 
 ## Local Verification
 

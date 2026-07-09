@@ -103,4 +103,46 @@ final class WireTests: XCTestCase {
         XCTAssertEqual(FrontendMessage.closeAndSync(.statement, name: name),
                        FrontendMessage.close(.statement, name: name) + FrontendMessage.sync())
     }
+
+    func testFlushFraming() {
+        // Flush is a bare tag ('H') plus a 4-byte length.
+        XCTAssertEqual(FrontendMessage.flush(), [0x48, 0x00, 0x00, 0x00, 0x04])
+    }
+
+    func testCopyFrontendFraming() {
+        // CopyData: 'd', length (4 + body), then the payload.
+        XCTAssertEqual(FrontendMessage.copyData([0x41, 0x42]),
+                       [0x64, 0x00, 0x00, 0x00, 0x06, 0x41, 0x42])
+        // CopyDone: bare 'c' + length 4.
+        XCTAssertEqual(FrontendMessage.copyDone(), [0x63, 0x00, 0x00, 0x00, 0x04])
+        // CopyFail: 'f' + length + NUL-terminated message.
+        XCTAssertEqual(FrontendMessage.copyFail(message: "x"),
+                       [0x66, 0x00, 0x00, 0x00, 0x06, 0x78, 0x00])
+    }
+
+    func testCopyBackendDecoding() throws {
+        // CopyOutResponse: Int8 format (0 = text), Int16 column count, then per-column formats.
+        guard case let .copyOutResponse(format, columnFormats) =
+            try BackendMessage.decode(tag: UInt8(ascii: "H"), payload: [0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00]) else {
+            return XCTFail("expected copyOutResponse")
+        }
+        XCTAssertEqual(format, 0)
+        XCTAssertEqual(columnFormats, [0, 0])
+
+        guard case let .copyInResponse(inFormat, _) =
+            try BackendMessage.decode(tag: UInt8(ascii: "G"), payload: [0x01, 0x00, 0x00]) else {
+            return XCTFail("expected copyInResponse")
+        }
+        XCTAssertEqual(inFormat, 1)   // binary
+
+        guard case let .copyData(bytes) =
+            try BackendMessage.decode(tag: UInt8(ascii: "d"), payload: [0x41, 0x42, 0x43]) else {
+            return XCTFail("expected copyData")
+        }
+        XCTAssertEqual(bytes, [0x41, 0x42, 0x43])
+
+        guard case .copyDone = try BackendMessage.decode(tag: UInt8(ascii: "c"), payload: []) else {
+            return XCTFail("expected copyDone")
+        }
+    }
 }

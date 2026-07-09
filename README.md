@@ -64,7 +64,7 @@ lines the ORM can rely on and reshape, not an opaque dependency.
 | **Sockets** | Raw POSIX (`Darwin`/`Glibc`), blocking calls bridged to async/await off the cooperative pool |
 | **Wire protocol** | v3 framing, all frontend/backend messages, simple + extended query |
 | **Authentication** | `trust`, cleartext, **MD5**, **SCRAM-SHA-256** — with SHA-256/HMAC/PBKDF2/MD5/Base64 written from scratch |
-| **Queries** | Simple Query, and the extended protocol: `Parse`/`Bind`/`Describe`/`Execute`/`Sync`, prepared statements, `$1` parameters (text or binary), pipelined bulk execution (atomic / independent), and row **streaming** for large results |
+| **Queries** | Simple Query, and the extended protocol: `Parse`/`Bind`/`Describe`/`Execute`/`Sync`, prepared statements, `$1` parameters (text or binary), pipelined bulk execution (atomic / independent), row **streaming** for large results, and **COPY** in/out for bulk load and dump |
 | **Types** | `Int*`, `Float`/`Double`, `Bool`, `String`, `Data`/`[UInt8]` (bytea), `UUID`, `Date` (timestamp/timestamptz/date), `Decimal` (numeric), `PostgresJSON` (json/jsonb) — in **both text and binary** formats |
 | **Arrays** | Multi-dimensional array **parameters** (`int8[]`, `text[]`, `uuid[]`, …) via `PostgresArray`, and **decoding** columns into `[T]`, `[[T]]`, `[[[T]]]` and deeper via `decodeArray` — text or binary |
 | **TLS** | `SSLRequest` negotiation + OpenSSL channel; modes = disable / allow plaintext fallback / encrypt without verification / verify full |
@@ -152,6 +152,29 @@ closes the server-side portal and frees the connection, which stays usable:
 ```swift
 for try await row in try await conn.queryStream("SELECT * FROM events", chunkSize: 1000) {
     if try row.decode("kind", as: String.self) == "target" { return row }   // break → connection reusable
+}
+```
+
+### Bulk load and dump with COPY
+
+`COPY` is PostgreSQL's fast bulk path. The driver moves the raw `CopyData` bytes in the COPY
+statement's format (text, CSV, or binary) — formatting and parsing rows is left to you.
+
+`copyIn` bulk-loads from a `write` closure; returning finishes the copy, throwing aborts and
+rolls it back:
+
+```swift
+try await conn.copyIn("COPY people (id, name) FROM STDIN") { writer in
+    for person in people { try await writer.write("\(person.id)\t\(person.name)\n") }
+}
+```
+
+`copyOut` streams `COPY … TO STDOUT` as an `AsyncSequence` of byte chunks (the same
+exclusive-hold, early-stop semantics as `queryStream`):
+
+```swift
+for try await chunk in try await conn.copyOut("COPY people TO STDOUT") {
+    try file.write(contentsOf: chunk)
 }
 ```
 
@@ -328,7 +351,6 @@ concerns for code built *on top* of the driver, not for the driver itself.
 
 Possible extensions (the driver is complete for its scope — these are additive, not gaps):
 
-- **COPY protocol** (`COPY … TO/FROM STDIN`) for bulk load and dump.
 - **More scalar types** — `interval`, `time`/`timetz`, `inet`/`cidr`, range and composite
   types.
 

@@ -367,6 +367,40 @@ public actor PostgresConnection {
         }
     }
 
+    /// Bulk-load rows with `COPY … FROM STDIN`. The `write` closure receives a
+    /// `PostgresCopyInWriter` and pushes payload chunks in the COPY statement's format
+    /// (text/CSV/binary); returning normally finishes the copy (`CopyDone`) and the result's
+    /// command tag reports the row count. Throwing from the closure aborts the copy
+    /// (`CopyFail`, so the server rolls it back) and rethrows. Holds the connection
+    /// exclusively for the duration.
+    ///
+    /// ```swift
+    /// try await connection.copyIn("COPY people (id, name) FROM STDIN") { writer in
+    ///     for person in people { try await writer.write("\(person.id)\t\(person.name)\n") }
+    /// }
+    /// ```
+    @discardableResult
+    public func copyIn(_ sql: String,
+                       _ write: @Sendable (PostgresCopyInWriter) async throws -> Void) async throws -> QueryResult {
+        try await lock()
+        defer { unlock() }
+        guard !isClosed else { throw PerunError.connectionClosed }
+        try await send(FrontendMessage.query(sql))
+        try await readCopyInResponse()           // consume the CopyInResponse handshake (or error)
+
+        copyInActive = true
+        do {
+            try await write(PostgresCopyInWriter(connection: self))
+        } catch {
+            copyInActive = false
+            try await failCopyIn()               // CopyFail + drain; we rethrow the closure's error
+            throw error
+        }
+        copyInActive = false
+        try await send(FrontendMessage.copyDone())
+        return try await collectResults()        // CommandComplete ("COPY n") + ReadyForQuery
+    }
+
     /// Parse a statement once so it can be executed repeatedly with different
     /// parameters. The server reports the parameter and result types up front.
     public func prepare(_ sql: String) async throws -> PreparedStatement {
@@ -1492,6 +1526,75 @@ public actor PostgresConnection {
     private func cancelCopyOutInFlight(generation: UInt64) async {
         guard !isClosed, copyOutActive, copyOutGeneration == generation else { return }
         try? await sendCancelRequest()
+    }
+
+    // MARK: - COPY IN (client → server)
+    //
+    // `copyIn` holds the wire exclusively and reads inline: send the `COPY … FROM STDIN`
+    // query, consume the CopyInResponse, hand the caller a writer whose writes are framed as
+    // `CopyData`, then `CopyDone` (or `CopyFail` if the closure threw) and read the result.
+    // The writer only works while `copyInActive`, so a leaked writer can't corrupt the wire.
+
+    private var copyInActive = false
+
+    /// Consume the `CopyInResponse` handshake after a `COPY … FROM STDIN` query. Drains to
+    /// ReadyForQuery and throws if the statement errored or wasn't a COPY FROM STDIN.
+    private func readCopyInResponse() async throws {
+        var pendingError: PostgresServerError?
+        while true {
+            switch try await readMessage() {
+            case .copyInResponse:
+                return                           // the server is ready to receive CopyData
+            case let .errorResponse(error):
+                pendingError = error
+            case let .parameterStatus(name, value):
+                parameters[name] = value
+            case let .noticeResponse(notice):
+                noticeHandler?(notice)
+            case let .notificationResponse(processID, channel, payload):
+                notificationContinuation.yield(
+                    PostgresNotification(processID: processID, channel: channel, payload: payload))
+            case let .readyForQuery(status):
+                transactionStatus = status
+                if let pendingError { throw PerunError.server(pendingError) }
+                throw PerunError.protocolViolation("expected CopyInResponse (is the statement a COPY … FROM STDIN?)")
+            default:
+                continue
+            }
+        }
+    }
+
+    /// Send one `CopyData` chunk for the active `copyIn`. Guards on `copyInActive` so a
+    /// writer used outside its closure can't inject bytes into the wire.
+    func sendCopyData(_ bytes: [UInt8]) async throws {
+        guard copyInActive else {
+            throw PerunError.protocolViolation("COPY data written outside an active copyIn")
+        }
+        guard !bytes.isEmpty else { return }
+        try await send(FrontendMessage.copyData(bytes))
+    }
+
+    /// Abort an in-progress `COPY … FROM STDIN` and drain to ReadyForQuery. The resulting
+    /// ErrorResponse is the echo of our own `CopyFail`, so it is discarded — `copyIn`
+    /// rethrows the original cause instead.
+    private func failCopyIn() async throws {
+        try await send(FrontendMessage.copyFail(message: "client aborted COPY"))
+        while true {
+            switch try await readMessage() {
+            case let .readyForQuery(status):
+                transactionStatus = status
+                return
+            case let .parameterStatus(name, value):
+                parameters[name] = value
+            case let .noticeResponse(notice):
+                noticeHandler?(notice)
+            case let .notificationResponse(processID, channel, payload):
+                notificationContinuation.yield(
+                    PostgresNotification(processID: processID, channel: channel, payload: payload))
+            default:
+                continue                         // discard the CopyFail echo and anything else
+            }
+        }
     }
 
     /// Close the connection and release its socket. Also interrupts any in-flight

@@ -70,6 +70,89 @@ final class CopyIntegrationTests: XCTestCase {
         XCTAssertEqual(answer, 5)
     }
 
+    // MARK: - COPY IN
+
+    func testCopyInLoadsRows() async throws {
+        let connection = try await PostgresConnection.connect(integrationConfiguration())
+        defer { Task { try? await connection.close() } }
+
+        _ = try await connection.query("CREATE TEMP TABLE copy_in_test (id int, name text)")
+        let result = try await connection.copyIn("COPY copy_in_test FROM STDIN") { writer in
+            try await writer.write("1\talice\n")
+            try await writer.write("2\tbob\n3\tcarol\n")   // several rows in one chunk
+        }
+        XCTAssertEqual(result.commandTag, "COPY 3")
+
+        let count = try await connection.query("SELECT count(*)::int AS c FROM copy_in_test")
+            .rows[0].decode("c", as: Int.self)
+        XCTAssertEqual(count, 3)
+        let name = try await connection.query("SELECT name FROM copy_in_test WHERE id = 2")
+            .rows[0].decode("name", as: String.self)
+        XCTAssertEqual(name, "bob")
+    }
+
+    func testCopyInThenOutRoundTrip() async throws {
+        let connection = try await PostgresConnection.connect(integrationConfiguration())
+        defer { Task { try? await connection.close() } }
+
+        _ = try await connection.query("CREATE TEMP TABLE copy_round (id int, name text)")
+        try await connection.copyIn("COPY copy_round FROM STDIN") { writer in
+            try await writer.write("10\tx\n20\ty\n")
+        }
+        var out: [UInt8] = []
+        for try await chunk in try await connection.copyOut("COPY copy_round TO STDOUT") {
+            out.append(contentsOf: chunk)
+        }
+        XCTAssertEqual(String(decoding: out, as: UTF8.self), "10\tx\n20\ty\n")
+    }
+
+    func testCopyInAbortRollsBackAndConnectionUsable() async throws {
+        let connection = try await PostgresConnection.connect(integrationConfiguration())
+        defer { Task { try? await connection.close() } }
+
+        _ = try await connection.query("CREATE TEMP TABLE copy_in_abort (id int)")
+        struct Boom: Error {}
+        do {
+            try await connection.copyIn("COPY copy_in_abort FROM STDIN") { writer in
+                try await writer.write("1\n")
+                throw Boom()                       // abort after writing a row
+            }
+            XCTFail("expected the aborted copy to rethrow")
+        } catch is Boom {
+            // expected
+        }
+
+        // CopyFail rolled the copy back, so no rows landed…
+        let count = try await connection.query("SELECT count(*)::int AS c FROM copy_in_abort")
+            .rows[0].decode("c", as: Int.self)
+        XCTAssertEqual(count, 0)
+        // …and the connection is back in sync.
+        let answer = try await connection.query("SELECT 9 AS a").rows[0].decode("a", as: Int.self)
+        XCTAssertEqual(answer, 9)
+    }
+
+    func testCopyInWriterRejectedOutsideClosure() async throws {
+        let connection = try await PostgresConnection.connect(integrationConfiguration())
+        defer { Task { try? await connection.close() } }
+
+        _ = try await connection.query("CREATE TEMP TABLE copy_in_leak (id int)")
+        final class Box: @unchecked Sendable { var writer: PostgresCopyInWriter? }
+        let box = Box()
+        try await connection.copyIn("COPY copy_in_leak FROM STDIN") { writer in
+            box.writer = writer
+            try await writer.write("1\n")
+        }
+        // Using the writer after the copy finished is rejected, not silently corrupting the wire.
+        do {
+            try await box.writer?.write("2\n")
+            XCTFail("expected a leaked writer to be rejected")
+        } catch {
+            // expected
+        }
+        let answer = try await connection.query("SELECT 3 AS a").rows[0].decode("a", as: Int.self)
+        XCTAssertEqual(answer, 3)
+    }
+
     // MARK: - Helpers
 
     private func integrationConfiguration() throws -> ConnectionConfiguration {

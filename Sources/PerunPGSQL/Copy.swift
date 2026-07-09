@@ -58,3 +58,21 @@ final class CopyOutCleanup: @unchecked Sendable {
         Task { await connection.finishCopyOut() }
     }
 }
+
+/// Writes `CopyData` to a `COPY … FROM STDIN` in progress. Passed to the `copyIn` closure;
+/// each `write` sends one `CopyData` message with the caller's bytes in the COPY statement's
+/// format (text/CSV/binary). Valid only inside that closure — a write afterwards throws.
+public struct PostgresCopyInWriter: Sendable {
+    let connection: PostgresConnection
+
+    /// Send one chunk of COPY payload. Batch rows into reasonably sized chunks; an empty
+    /// chunk is a no-op.
+    public func write(_ bytes: [UInt8]) async throws {
+        try await connection.sendCopyData(bytes)
+    }
+
+    /// Send `text`'s UTF-8 bytes as COPY payload — convenient for text/CSV COPY.
+    public func write(_ text: String) async throws {
+        try await connection.sendCopyData(Array(text.utf8))
+    }
+}
