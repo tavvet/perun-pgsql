@@ -35,7 +35,9 @@ public struct ConnectionConfiguration: Sendable {
     /// slower than the socket pump. Newer notifications replace older buffered
     /// ones once this limit is reached. Defaults to 1024.
     public var notificationBufferLimit: Int
-    /// Extra startup parameters (e.g. `["application_name": "perun"]`).
+    /// Extra startup parameters (e.g. `["application_name": "perun"]`). The driver also pins
+    /// `client_encoding=UTF8`, `DateStyle=ISO` and `IntervalStyle=postgres` so its text
+    /// decoders read a known format; set any of those keys here to override that default.
     public var runtimeParameters: [String: String]
 
     public init(host: String = "localhost",
@@ -1661,11 +1663,25 @@ public actor PostgresConnection {
 
     // MARK: - Handshake
 
+    /// Session GUCs the driver pins so its **text** decoders read a known wire format: UTF-8
+    /// strings, ISO dates/timestamps, and `postgres`-style intervals. Without these the
+    /// output format follows the server / role / database default, which a text parser can't
+    /// know. They are merged *under* the caller's `runtimeParameters`, so any one can still be
+    /// overridden per key — at the cost of that type's text decoding (binary is unaffected,
+    /// except that `client_encoding` still governs string bytes in both formats).
+    private static let pinnedParameters = [
+        "client_encoding": "UTF8",
+        "DateStyle": "ISO",
+        "IntervalStyle": "postgres",
+    ]
+
     private func startup(_ configuration: ConnectionConfiguration) async throws {
+        // The caller's parameters win per key, so a deliberate override still takes effect.
+        let startupParameters = Self.pinnedParameters.merging(configuration.runtimeParameters) { _, caller in caller }
         let startupMessage = FrontendMessage.startup(
             user: configuration.user,
             database: configuration.database,
-            parameters: configuration.runtimeParameters
+            parameters: startupParameters
         )
         try await send(startupMessage)
 

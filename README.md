@@ -368,8 +368,6 @@ Production hardening:
 - **Pool recycling by age** — the pool now validates a connection on borrow (a cheap
   non-blocking liveness probe) and discards one the server closed while idle; still open is
   proactive recycling by max lifetime / idle time to pre-empt server-side timeouts.
-- **Non-default `DateStyle`** — text date/time parsing assumes the `ISO` default (and
-  `integer_datetimes`); worth asserting on connect or handling other styles.
 
 More typed decoders (all already readable as `String` in text; these add a typed form):
 
