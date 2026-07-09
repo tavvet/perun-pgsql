@@ -175,6 +175,27 @@ enum FrontendMessage {
         frame(tag: "H", body: [])
     }
 
+    // MARK: - COPY sub-protocol
+
+    /// `CopyData`: one chunk of COPY payload, in either direction. The bytes are the
+    /// caller's data in the COPY statement's format (text/CSV/binary), opaque here.
+    static func copyData(_ bytes: [UInt8]) -> [UInt8] {
+        frame(tag: "d", body: bytes)
+    }
+
+    /// `CopyDone`: the sender has no more COPY data.
+    static func copyDone() -> [UInt8] {
+        frame(tag: "c", body: [])
+    }
+
+    /// `CopyFail`: abort an in-progress `COPY FROM STDIN`; the server rolls it back and
+    /// replies with an `ErrorResponse` carrying `message`.
+    static func copyFail(message: String) -> [UInt8] {
+        var body = ByteWriter()
+        body.writeCString(message)
+        return frame(tag: "f", body: body.bytes)
+    }
+
     static func parameterizedQuery(query: String,
                                    parameters: [(any PostgresEncodable)?],
                                    parameterFormat: PostgresFormat = .text,

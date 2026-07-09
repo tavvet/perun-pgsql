@@ -345,6 +345,28 @@ public actor PostgresConnection {
         }
     }
 
+    /// Stream the payload of a `COPY … TO STDOUT` as raw `CopyData` chunks — an
+    /// `AsyncSequence` of `[UInt8]` in the COPY statement's format (text/CSV/binary),
+    /// opaque to the driver. Like `queryStream` it holds the connection exclusively until
+    /// consumed and frees it on early stop (`break`, error, or cancellation), which
+    /// cancels the COPY server-side. `COPY (SELECT …) TO STDOUT` works too.
+    public func copyOut(_ sql: String) async throws -> PostgresCopyOutSequence {
+        try await lock()                         // exclusive; released when the copy ends
+        do {
+            guard !isClosed else { throw PerunError.connectionClosed }
+            try await send(FrontendMessage.query(sql))
+            try await readCopyOutResponse()      // consume the CopyOutResponse handshake (or error)
+            copyOutActive = true
+            copyOutGeneration += 1
+            copyOutTerminating = false
+            copyOutPendingError = nil
+            return PostgresCopyOutSequence(connection: self)
+        } catch {
+            unlock()
+            throw error
+        }
+    }
+
     /// Parse a statement once so it can be executed repeatedly with different
     /// parameters. The server reports the parameter and result types up front.
     public func prepare(_ sql: String) async throws -> PreparedStatement {
@@ -1323,6 +1345,152 @@ public actor PostgresConnection {
     /// query that isn't the one this stream started.
     private func cancelStreamInFlight(generation: UInt64) async {
         guard !isClosed, streamActive, streamGeneration == generation else { return }
+        try? await sendCancelRequest()
+    }
+
+    // MARK: - COPY OUT (server → client)
+    //
+    // A `COPY … TO STDOUT` streams `CopyData` under exclusive access, read inline like a
+    // stream — but with no chunk requests: the server sends CopyData until CopyDone, then
+    // CommandComplete and ReadyForQuery (Simple Query, so no Sync). The same cancellation
+    // and abandon handling as row streaming, using a `CancelRequest` to stop the server.
+
+    private var copyOutActive = false
+    private var copyOutTerminating = false
+    private var copyOutPendingError: PostgresServerError?
+    private var copyOutGeneration: UInt64 = 0
+
+    /// Consume the `CopyOutResponse` handshake after a `COPY … TO STDOUT` query. Drains to
+    /// ReadyForQuery and throws if the statement errored or wasn't a COPY TO STDOUT.
+    private func readCopyOutResponse() async throws {
+        var pendingError: PostgresServerError?
+        while true {
+            switch try await readMessage() {
+            case .copyOutResponse:
+                return                           // the server will now stream CopyData
+            case let .errorResponse(error):
+                pendingError = error             // e.g. bad SQL; drain to ReadyForQuery then throw
+            case let .parameterStatus(name, value):
+                parameters[name] = value
+            case let .noticeResponse(notice):
+                noticeHandler?(notice)
+            case let .notificationResponse(processID, channel, payload):
+                notificationContinuation.yield(
+                    PostgresNotification(processID: processID, channel: channel, payload: payload))
+            case let .readyForQuery(status):
+                transactionStatus = status
+                if let pendingError { throw PerunError.server(pendingError) }
+                throw PerunError.protocolViolation("expected CopyOutResponse (is the statement a COPY … TO STDOUT?)")
+            default:
+                continue
+            }
+        }
+    }
+
+    /// The consumer pulled the next COPY chunk. Cancellation-aware like `nextStreamRow`.
+    func nextCopyData() async throws -> [UInt8]? {
+        guard copyOutActive else { return nil }
+        if Task.isCancelled {
+            await finishCopyOut()                // fires the CancelRequest itself, then drains
+            throw CancellationError()
+        }
+        let generation = copyOutGeneration
+        let outcome: Result<[UInt8]?, Error> = await withTaskCancellationHandler {
+            do { return .success(try await readNextCopyData()) }
+            catch { return .failure(error) }
+        } onCancel: {
+            Task { await self.cancelCopyOutInFlight(generation: generation) }
+        }
+        if Task.isCancelled {
+            await finishCopyOut()                // idempotent; cleans up if a chunk raced the cancel
+            throw CancellationError()
+        }
+        return try outcome.get()
+    }
+
+    /// Read the wire until one `CopyData` (return it) or the end (ReadyForQuery → nil),
+    /// assuming an active copy.
+    private func readNextCopyData() async throws -> [UInt8]? {
+        do {
+            while true {
+                switch try await readMessage() {
+                case let .copyData(bytes) where !copyOutTerminating:
+                    return bytes
+
+                case let .errorResponse(error):
+                    if copyOutPendingError == nil { copyOutPendingError = error }
+                    copyOutTerminating = true    // ignore any trailing CopyData; drain to ReadyForQuery
+
+                case let .parameterStatus(name, value):
+                    parameters[name] = value
+
+                case let .noticeResponse(notice):
+                    noticeHandler?(notice)
+
+                case let .notificationResponse(processID, channel, payload):
+                    notificationContinuation.yield(
+                        PostgresNotification(processID: processID, channel: channel, payload: payload))
+
+                case let .readyForQuery(status):
+                    transactionStatus = status
+                    let error = copyOutPendingError
+                    endCopyOut()
+                    if let error { throw PerunError.server(error) }
+                    return nil
+
+                default:
+                    continue                     // CopyDone, CommandComplete, drained CopyData, acks
+                }
+            }
+        } catch {
+            if copyOutActive {
+                if !isClosed { forceClose() }
+                copyOutActive = false
+            }
+            throw error
+        }
+    }
+
+    /// The consumer abandoned the copy (its `deinit`) or cancelled it. Stop the server with a
+    /// `CancelRequest` — it would otherwise stream the whole relation — then drain to
+    /// ReadyForQuery and free the wire. Idempotent.
+    func finishCopyOut() async {
+        guard copyOutActive else { return }
+        copyOutTerminating = true
+        await cancelCopyOutInFlight(generation: copyOutGeneration)
+        do {
+            while copyOutActive {
+                switch try await readMessage() {
+                case let .readyForQuery(status):
+                    transactionStatus = status
+                    endCopyOut()
+                case let .parameterStatus(name, value):
+                    parameters[name] = value
+                case let .noticeResponse(notice):
+                    noticeHandler?(notice)
+                case let .notificationResponse(processID, channel, payload):
+                    notificationContinuation.yield(
+                        PostgresNotification(processID: processID, channel: channel, payload: payload))
+                default:
+                    continue                     // discard remaining CopyData / CopyDone / CommandComplete / error
+                }
+            }
+        } catch {
+            if !isClosed { forceClose() }
+            copyOutActive = false
+        }
+    }
+
+    private func endCopyOut() {
+        guard copyOutActive else { return }
+        copyOutActive = false
+        copyOutTerminating = false
+        copyOutPendingError = nil
+        unlock()
+    }
+
+    private func cancelCopyOutInFlight(generation: UInt64) async {
+        guard !isClosed, copyOutActive, copyOutGeneration == generation else { return }
         try? await sendCancelRequest()
     }
 

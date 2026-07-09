@@ -56,6 +56,10 @@ enum BackendMessage: Sendable {
     case parameterDescription([Int32])
     case portalSuspended
     case notificationResponse(processID: Int32, channel: String, payload: String)
+    case copyInResponse(format: Int8, columnFormats: [Int16])    // 'G' — ready to receive COPY data
+    case copyOutResponse(format: Int8, columnFormats: [Int16])   // 'H' — COPY data follows
+    case copyData([UInt8])                                       // 'd' — one COPY payload chunk
+    case copyDone                                                // 'c' — end of COPY data
     /// A message type we don't handle yet — kept so the read loop can skip it.
     case unknown(tag: UInt8, payload: [UInt8])
 
@@ -114,6 +118,17 @@ enum BackendMessage: Sendable {
         case UInt8(ascii: "s"):
             return .portalSuspended
 
+        case UInt8(ascii: "G"):
+            let (format, columnFormats) = try decodeCopyResponse(&reader)
+            return .copyInResponse(format: format, columnFormats: columnFormats)
+        case UInt8(ascii: "H"):
+            let (format, columnFormats) = try decodeCopyResponse(&reader)
+            return .copyOutResponse(format: format, columnFormats: columnFormats)
+        case UInt8(ascii: "d"):
+            return .copyData(try reader.readBytes(reader.remaining))
+        case UInt8(ascii: "c"):
+            return .copyDone
+
         case UInt8(ascii: "t"):
             let count = try reader.readInt16()
             var oids: [Int32] = []
@@ -162,6 +177,19 @@ enum BackendMessage: Sendable {
         default:
             return .other(code)
         }
+    }
+
+    /// `CopyInResponse`/`CopyOutResponse` body: `Int8 overall format` (0 text, 1 binary),
+    /// `Int16 column count`, then one `Int16` format code per column.
+    private static func decodeCopyResponse(_ reader: inout ByteReader) throws -> (format: Int8, columnFormats: [Int16]) {
+        let format = Int8(bitPattern: try reader.readUInt8())
+        let count = try reader.readInt16()
+        var columnFormats: [Int16] = []
+        columnFormats.reserveCapacity(max(0, Int(count)))
+        for _ in 0 ..< max(0, Int(count)) {
+            columnFormats.append(try reader.readInt16())
+        }
+        return (format, columnFormats)
     }
 
     private static func decodeRowDescription(
