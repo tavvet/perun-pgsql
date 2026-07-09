@@ -305,6 +305,15 @@ group awaits its children, that drain completes before `withTimeout` throws `Per
 So the connection is left in sync (the pool keeps it; `timedOut` is not a wire-desync error). It
 is generic, composing over a bare query, a pool `query`, or a whole `withTransaction`.
 
+For that last case the transaction path needs the same cancellation treatment as `runReadOp`,
+because its body reads **inline** under exclusive access, not through the background reader.
+`runInlineCancellable` wraps each transaction-*body* query (`runTransaction*`): a cancel fires a
+`CancelRequest` (`cancelInlineInFlight`, `exclusiveHeld` + generation guarded), the inline read
+drains, and the caller sees `CancellationError`. BEGIN/COMMIT/ROLLBACK are **not** wrapped, so
+transaction control always completes — a timed-out transaction rolls back rather than committing.
+Without this the inline read would ignore the cancel, wait out the query, and `withTransaction`
+would `COMMIT`.
+
 ### Row streaming
 
 `queryStream` returns a `PostgresRowStream` (an `AsyncSequence` of `PostgresRow`) that reads
@@ -922,7 +931,9 @@ result formats, decoding a server-produced interval, and an `interval[]` array.
 
 `withTimeout`: the wrapper fires on a slow operation and a fast one returns without waiting out
 the deadline (offline); live, a timed-out query is cancelled server-side promptly (well under
-`pg_sleep`) and the connection — direct or pooled — is left in sync and reusable.
+`pg_sleep`) and the connection — direct or pooled — is left in sync and reusable. A timed-out
+`withTransaction` is cancelled promptly too and **rolls back** (its INSERT does not persist),
+guarding against the inline-read path silently committing.
 
 ### `ArrayDecodingTests`
 

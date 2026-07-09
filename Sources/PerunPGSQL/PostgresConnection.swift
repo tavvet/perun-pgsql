@@ -530,9 +530,40 @@ public actor PostgresConnection {
         }
     }
 
+    private var inlineReadGeneration: UInt64 = 0
+
+    /// Run one inline (exclusive-path) request/response as a cancellable operation — the
+    /// `runReadOp` treatment for a transaction-body query, which reads inline instead of
+    /// through the background reader. A cancel fires a `CancelRequest`
+    /// (`cancelInlineInFlight`) so the blocked inline read unblocks; the response still
+    /// drains to `ReadyForQuery` (the wire stays in sync), and the outcome is reported as
+    /// `CancellationError`. The `generation` guard stops a late cancel from hitting a later
+    /// inline op. Only the transaction *body* is wrapped — BEGIN/COMMIT/ROLLBACK run
+    /// uncancellable, so a timed-out transaction still rolls back cleanly.
+    private func runInlineCancellable<T: Sendable>(_ body: () async throws -> T) async throws -> T {
+        inlineReadGeneration += 1
+        let generation = inlineReadGeneration
+        let outcome: Result<T, Error> = await withTaskCancellationHandler {
+            do { return .success(try await body()) }
+            catch { return .failure(error) }
+        } onCancel: {
+            Task { await self.cancelInlineInFlight(generation: generation) }
+        }
+        if Task.isCancelled { throw CancellationError() }
+        return try outcome.get()
+    }
+
+    /// A task awaiting a transaction-body query was cancelled: under exclusive access the
+    /// running query is this one, so ask the server to cancel it. Best-effort, like
+    /// `cancelInFlightRead`; the response still drains and the caller sees `CancellationError`.
+    private func cancelInlineInFlight(generation: UInt64) async {
+        guard !isClosed, exclusiveHeld, inlineReadGeneration == generation else { return }
+        try? await sendCancelRequest()
+    }
+
     private func runTransactionSimpleQuery(_ sql: String, contextID: Int) async throws -> QueryResult {
         try validateTransactionContext(contextID)
-        return try await runSimpleQuery(sql)
+        return try await runInlineCancellable { try await self.runSimpleQuery(sql) }
     }
 
     private func runTransactionParameterizedQuery(_ sql: String,
@@ -541,14 +572,16 @@ public actor PostgresConnection {
                                                   resultFormat: PostgresFormat,
                                                   contextID: Int) async throws -> QueryResult {
         try validateTransactionContext(contextID)
-        return try await runParameterizedQuery(sql, parameters,
-                                               parameterFormat: parameterFormat,
-                                               resultFormat: resultFormat)
+        return try await runInlineCancellable {
+            try await self.runParameterizedQuery(sql, parameters,
+                                                 parameterFormat: parameterFormat,
+                                                 resultFormat: resultFormat)
+        }
     }
 
     private func runTransactionPrepare(_ sql: String, contextID: Int) async throws -> PreparedStatement {
         try validateTransactionContext(contextID)
-        return try await runPrepare(sql)
+        return try await runInlineCancellable { try await self.runPrepare(sql) }
     }
 
     private func runTransactionExecute(_ statement: PreparedStatement,
@@ -557,15 +590,17 @@ public actor PostgresConnection {
                                        resultFormat: PostgresFormat,
                                        contextID: Int) async throws -> QueryResult {
         try validateTransactionContext(contextID)
-        return try await runExecute(statement, parameters,
-                                    parameterFormat: parameterFormat,
-                                    resultFormat: resultFormat)
+        return try await runInlineCancellable {
+            try await self.runExecute(statement, parameters,
+                                      parameterFormat: parameterFormat,
+                                      resultFormat: resultFormat)
+        }
     }
 
     private func runTransactionClosePrepared(_ statement: PreparedStatement,
                                              contextID: Int) async throws {
         try validateTransactionContext(contextID)
-        try await runClosePrepared(statement)
+        try await runInlineCancellable { try await self.runClosePrepared(statement) }
     }
 
     // MARK: - Notices, LISTEN/NOTIFY, cancellation

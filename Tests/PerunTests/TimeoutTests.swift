@@ -82,6 +82,35 @@ final class TimeoutTests: XCTestCase {
         await pool.shutdown()
     }
 
+    func testTransactionTimeoutRollsBackAndConnectionUsable() async throws {
+        let connection = try await PostgresConnection.connect(integrationConfiguration())
+        defer { Task { try? await connection.close() } }
+        _ = try await connection.query("CREATE TEMP TABLE timeout_txn (id int)")
+
+        let clock = ContinuousClock()
+        let start = clock.now
+        do {
+            try await withTimeout(.milliseconds(300)) {
+                try await connection.withTransaction { txn in
+                    try await txn.query("INSERT INTO timeout_txn VALUES (1)")
+                    try await txn.query("SELECT pg_sleep(5)")     // slow — should be cancelled
+                }
+            }
+            XCTFail("expected the transaction to time out")
+        } catch let error as PerunError {
+            guard case .timedOut = error else { return XCTFail("expected .timedOut, got \(error)") }
+        }
+        XCTAssertLessThan(clock.now - start, .seconds(3), "the transaction timeout must not wait for pg_sleep")
+
+        // The transaction must have rolled back (the INSERT did not persist)…
+        let count = try await connection.query("SELECT count(*)::int AS c FROM timeout_txn")
+            .rows[0].decode("c", as: Int.self)
+        XCTAssertEqual(count, 0, "a timed-out transaction must roll back")
+        // …and the connection is reusable.
+        let answer = try await connection.query("SELECT 42 AS a").rows[0].decode("a", as: Int.self)
+        XCTAssertEqual(answer, 42)
+    }
+
     // MARK: - Helpers
 
     private func integrationConfiguration() throws -> ConnectionConfiguration {
