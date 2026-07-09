@@ -710,7 +710,15 @@ Public API:
 Acquire behavior:
 
 1. Fail if shut down.
-2. Reuse idle connection if available.
+2. Reuse an idle connection — but **validate it first** (`isProbablyAlive`): the server may
+   have closed it while it sat idle (a shutdown, `pg_terminate_backend`, or an idle timeout
+   leaves a termination `ErrorResponse` + socket close the parked reader never saw). The probe
+   is a cheap non-blocking `MSG_PEEK` (`SystemSocket.isQuiescentOpen`, run on the read queue so
+   it can't race the reader): a drained connection has nothing waiting, so `EWOULDBLOCK` means
+   healthy, while EOF or unexpected pending bytes means dead. A dead one is discarded
+   (`openCount -= 1`, closed) and the next idle connection is tried, so a borrower never gets a
+   connection whose first query would fail. Best-effort — it can still die right after — with
+   the borrower's own error path as the backstop; TLS is probed at the TCP level.
 3. Open a new connection if under capacity.
 4. Otherwise enqueue a waiter. An enqueued waiter is cancellation-aware — the same
    pattern as the wire lock: if its task is cancelled it leaves the queue and
@@ -951,6 +959,10 @@ environment variables.
   sync; and cancelling a task on a slow stream (`pg_sleep`) — both while blocked mid-read and
   before the first read — returns promptly (via `CancelRequest`) and frees the connection
   rather than waiting for the query.
+- `PoolValidationIntegrationTests`: a healthy idle connection is reused (the liveness probe
+  doesn't false-positive), and a connection the server terminates while idle
+  (`pg_terminate_backend`) is detected on borrow, discarded, and replaced — the next query runs
+  on a fresh backend instead of failing.
 - `CopyIntegrationTests`: `copyOut` reproduces a table's data and a `COPY (query)`, an early
   `break` frees the connection, and a non-COPY statement is rejected; `copyIn` loads rows and
   reports the "COPY n" tag, round-trips with `copyOut`, rolls back and rethrows when the closure

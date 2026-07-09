@@ -105,8 +105,19 @@ public actor PostgresClient {
     private func acquire() async throws -> PostgresConnection {
         if isShutDown { throw PerunError.clientShutdown }
 
-        if let reused = idle.popLast() {
-            return reused
+        // Reuse an idle connection, but validate it first: the server may have closed it
+        // while it sat idle. Discard any dead one and try the next rather than handing a
+        // borrower a connection that fails on its first query.
+        while let reused = idle.popLast() {
+            let alive = await reused.isProbablyAlive()
+            if isShutDown {                        // shutdown raced in during the probe
+                openCount -= 1
+                Task { try? await reused.close() }
+                throw PerunError.clientShutdown
+            }
+            if alive { return reused }
+            openCount -= 1                          // dead: drop it and try another
+            Task { try? await reused.close() }
         }
 
         if openCount < maxConnections {

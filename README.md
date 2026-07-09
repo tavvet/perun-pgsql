@@ -353,9 +353,9 @@ Possible extensions (the driver is complete for its scope — these are additive
 
 Production hardening:
 
-- **Pool connection validation** — validate (or transparently retry) a pooled connection the
-  server may have closed while idle, and recycle by max age / idle time. Today a dead idle
-  connection is discovered by its borrower and discarded, not proactively.
+- **Pool recycling by age** — the pool now validates a connection on borrow (a cheap
+  non-blocking liveness probe) and discards one the server closed while idle; still open is
+  proactive recycling by max lifetime / idle time to pre-empt server-side timeouts.
 - **Query timeouts** — a `deadline:` convenience over the existing cancellation.
 - **Non-default `DateStyle`** — text date/time parsing assumes the `ISO` default (and
   `integer_datetimes`); worth asserting on connect or handling other styles.

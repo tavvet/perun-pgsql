@@ -131,6 +131,26 @@ enum SystemSocket {
         return buffer
     }
 
+    /// Non-blocking liveness probe: peek one byte without consuming it. A fully-drained,
+    /// quiescent connection has nothing waiting, so `EWOULDBLOCK`/`EAGAIN` (no data) means
+    /// it is still open and healthy. `0` bytes is EOF (the peer closed); any waiting bytes
+    /// (the server sent something unsolicited — typically a termination `ErrorResponse`) or
+    /// any other error means it should not be reused. For TLS this reads the raw socket,
+    /// which still detects a closed peer and unexpected traffic at the TCP level.
+    static func isQuiescentOpen(fd: Int32) -> Bool {
+        var byte: UInt8 = 0
+        while true {
+            let n = withUnsafeMutablePointer(to: &byte) {
+                recv(fd, $0, 1, MSG_PEEK | MSG_DONTWAIT)
+            }
+            if n < 0 {
+                if errno == EINTR { continue }
+                return errno == EWOULDBLOCK || errno == EAGAIN
+            }
+            return false                        // 0 = EOF; >0 = unexpected pending data
+        }
+    }
+
     static func disconnect(fd: Int32) {
         close(fd)
     }

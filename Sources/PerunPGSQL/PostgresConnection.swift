@@ -1821,6 +1821,23 @@ public actor PostgresConnection {
         }
     }
 
+    /// A cheap, non-blocking liveness probe for a pooled connection between uses — returns
+    /// false if it is closed, the peer closed the socket, or unsolicited data is already
+    /// waiting (a fully-drained connection should have none; a server that closed the
+    /// backend while it sat idle typically leaves a termination `ErrorResponse` the parked
+    /// reader never saw). Best-effort — the connection could still die right after — but it
+    /// catches the common stale-idle case without a round trip. Peeks on the read queue so
+    /// it cannot race the background reader.
+    func isProbablyAlive() async -> Bool {
+        guard !isClosed else { return false }
+        let fd = self.fd
+        return await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+            readQueue.async {
+                continuation.resume(returning: SystemSocket.isQuiescentOpen(fd: fd))
+            }
+        }
+    }
+
     private func forceClose() {
         guard !isClosed else { return }
         isClosed = true
