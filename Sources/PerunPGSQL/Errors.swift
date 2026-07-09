@@ -202,6 +202,9 @@ public enum PerunError: Error, CustomStringConvertible, Sendable {
     /// A prepared-statement handle was used on a different connection than the
     /// one that created it.
     case preparedStatementConnectionMismatch
+    /// An operation wrapped in `withTimeout` did not finish before its deadline. The
+    /// underlying query was cancelled (a `CancelRequest`), so the connection stays usable.
+    case timedOut
 
     public var description: String {
         switch self {
@@ -233,6 +236,8 @@ public enum PerunError: Error, CustomStringConvertible, Sendable {
             return "too many parameters: \(count) (PostgreSQL allows at most 65535 per statement)"
         case .preparedStatementConnectionMismatch:
             return "prepared statement belongs to a different connection"
+        case .timedOut:
+            return "operation timed out"
         }
     }
 }
@@ -253,7 +258,7 @@ extension PerunError {
              .tlsNotAvailable, .authenticationFailed, .unsupportedAuthentication:
             return true
         case .server, .unexpectedNull, .columnNotFound, .decodingFailed, .tooManyParameters,
-             .clientShutdown, .preparedStatementConnectionMismatch:
+             .clientShutdown, .preparedStatementConnectionMismatch, .timedOut:
             return false
         }
     }

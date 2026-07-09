@@ -70,7 +70,7 @@ lines the ORM can rely on and reshape, not an opaque dependency.
 | **TLS** | `SSLRequest` negotiation + OpenSSL channel; modes = disable / allow plaintext fallback / encrypt without verification / verify full |
 | **Pool** | `PostgresClient` — lazy, bounded, `withConnection {}`, reuse/replace, graceful shutdown |
 | **Concurrency** | Readers-writer wire access (cancellation-aware): concurrent autocommit queries, `prepare`s, `execute`s and pipelined batches **pipeline** on one connection via a background reader; transactions take it exclusively. Cancelling a parked task fails it cleanly |
-| **Extras** | `NoticeResponse` handler, **LISTEN/NOTIFY** via `AsyncStream`, query **cancellation** (`CancelRequest`) |
+| **Extras** | `NoticeResponse` handler, **LISTEN/NOTIFY** via `AsyncStream`, query **cancellation** (`CancelRequest`), `withTimeout` **deadlines**, connection-pool validate-on-borrow |
 
 ## Requirements
 
@@ -176,6 +176,18 @@ exclusive-hold, early-stop semantics as `queryStream`):
 for try await chunk in try await conn.copyOut("COPY people TO STDOUT") {
     try file.write(contentsOf: chunk)
 }
+```
+
+### Timeouts
+
+`withTimeout` bounds any operation. On a timeout the query is cancelled server-side (a
+`CancelRequest`) and its connection is drained and left reusable — it composes with a single
+query, a pool `query`, or a whole `withTransaction`:
+
+```swift
+let rows = try await withTimeout(.seconds(5)) {
+    try await pool.query("SELECT * FROM big_report").rows
+}   // throws PerunError.timedOut if it overruns; the connection stays usable
 ```
 
 ### Typed decoding (text or binary)
@@ -356,7 +368,6 @@ Production hardening:
 - **Pool recycling by age** — the pool now validates a connection on borrow (a cheap
   non-blocking liveness probe) and discards one the server closed while idle; still open is
   proactive recycling by max lifetime / idle time to pre-empt server-side timeouts.
-- **Query timeouts** — a `deadline:` convenience over the existing cancellation.
 - **Non-default `DateStyle`** — text date/time parsing assumes the `ISO` default (and
   `integer_datetimes`); worth asserting on connect or handling other styles.
 

@@ -36,6 +36,7 @@ Sources/
     PostgresClient.swift
     RowStream.swift
     Copy.swift
+    Timeout.swift
     Result.swift
     Statement.swift
     Encoding.swift
@@ -295,6 +296,14 @@ means "we asked to cancel", not "the query did not execute" — so a side-effect
 may have committed. (Gating `CancelRequest` on the write having landed, or skipping the
 write on a late cancel, would only narrow the window at the cost of an actor hop per query
 or a new off-actor race — not a real guarantee, so it is documented rather than chased.)
+
+`withTimeout(_:_:)` (`Timeout.swift`) builds on that cancellation: it races the operation
+against a `Task.sleep` in a task group and cancels the loser (a `defer group.cancelAll()`, so
+a fast operation doesn't wait out the deadline). On a timeout the operation task is cancelled —
+for a query that fires the `CancelRequest` and drains to `ReadyForQuery` — and, because the
+group awaits its children, that drain completes before `withTimeout` throws `PerunError.timedOut`.
+So the connection is left in sync (the pool keeps it; `timedOut` is not a wire-desync error). It
+is generic, composing over a bare query, a pool `query`, or a whole `withTransaction`.
 
 ### Row streaming
 
@@ -908,6 +917,12 @@ header) — plus the `Bind` message layout when binary parameters are requested.
 `PostgresInterval` and `PostgresTime`: text/binary encode and decode (byte-exact binary,
 the `intervalstyle=postgres` text parser, sub-second sign), plus a live round-trip in both
 result formats, decoding a server-produced interval, and an `interval[]` array.
+
+### `TimeoutTests`
+
+`withTimeout`: the wrapper fires on a slow operation and a fast one returns without waiting out
+the deadline (offline); live, a timed-out query is cancelled server-side promptly (well under
+`pg_sleep`) and the connection — direct or pooled — is left in sync and reusable.
 
 ### `ArrayDecodingTests`
 
