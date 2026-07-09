@@ -20,6 +20,8 @@ public enum PostgresOID {
     public static let bytea: Int32 = 17
     public static let name: Int32 = 19
     public static let int8: Int32 = 20
+    public static let cidr: Int32 = 650
+    public static let inet: Int32 = 869
     public static let int2: Int32 = 21
     public static let int4: Int32 = 23
     public static let text: Int32 = 25

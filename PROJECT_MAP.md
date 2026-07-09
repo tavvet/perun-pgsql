@@ -66,6 +66,7 @@ Sources/
       ScalarTypes.swift
       FoundationTypes.swift
       TemporalTypes.swift
+      NetworkTypes.swift
   perun-demo/
     Demo.swift
 Tests/
@@ -539,6 +540,8 @@ Supported built-in type families:
 - interval as `PostgresInterval` (months/days/microseconds), time as `PostgresTime`
   (microseconds since midnight), and timetz as `PostgresTimeTz` (time + east-of-UTC offset) —
   `TemporalTypes.swift`, text and binary;
+- inet/cidr as `PostgresInet` (address bytes + prefix + `isCIDR`) — `NetworkTypes.swift`, text
+  (an IPv6 parser handles `::` compression and embedded IPv4) and binary;
 - numeric as `Decimal`;
 - arrays of any of the above (`decodeArray`, any number of dimensions).
 
@@ -957,6 +960,12 @@ header) — plus the `Bind` message layout when binary parameters are requested.
 (byte-exact binary, the `intervalstyle=postgres` text parser, sub-second sign, the timetz
 seconds-west zone), plus a live round-trip in both result formats, decoding a server-produced
 interval, and an `interval[]` array.
+
+### `NetworkTypesTests`
+
+`PostgresInet`: IPv4/IPv6 text parsing and formatting (`::` compression, embedded IPv4, invalid
+inputs), binary and text encode/decode, and a live round-trip of `inet`/`cidr` in both address
+families and result formats, plus a server-produced value and an `inet[]` array.
 
 ### `TimeoutTests`
 

@@ -146,6 +146,8 @@ func elementTypeOID(forArray oid: Int32) -> Int32 {
     switch oid {
     case 1000: return PostgresOID.bool
     case 1001: return PostgresOID.bytea
+    case 651:  return PostgresOID.cidr
+    case 1041: return PostgresOID.inet
     case 1005: return PostgresOID.int2
     case 1007: return PostgresOID.int4
     case 1016: return PostgresOID.int8
