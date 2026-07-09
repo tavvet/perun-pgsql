@@ -86,14 +86,11 @@ System library target exposing OpenSSL symbols to Swift.
 
 - `shim.h` wraps OpenSSL macros/functions that are awkward from Swift.
 - `module.modulemap` defines the Clang module.
-- `Package.swift` adds OpenSSL include/lib paths through unsafe flags.
-
-OpenSSL prefix detection order:
-
-1. `OPENSSL_PREFIX`
-2. Apple Silicon Homebrew paths.
-3. Intel Homebrew paths.
-4. `/usr` for Linux-style installs.
+- `Package.swift` locates OpenSSL through `pkgConfig: "openssl"` (plus `.brew`/`.apt`
+  providers) — **no unsafe build flags**, so the package is usable as a normal SwiftPM
+  dependency. Homebrew's `openssl@3` is keg-only, so on macOS export its pkg-config path:
+  `export PKG_CONFIG_PATH="$(brew --prefix openssl@3)/lib/pkgconfig"`. Linux `libssl-dev`
+  needs no extra configuration.
 
 ### `PerunPGSQL`
 

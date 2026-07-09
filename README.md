@@ -75,9 +75,10 @@ lines the ORM can rely on and reshape, not an opaque dependency.
 ## Requirements
 
 - Swift 6.0+
-- OpenSSL 3 (only for TLS). On macOS: `brew install openssl@3`. On Debian/Ubuntu:
-  `apt install libssl-dev`. `Package.swift` locates it automatically; override the
-  path with the `OPENSSL_PREFIX` environment variable if needed.
+- OpenSSL 3 (only for TLS), located via `pkg-config`. On macOS:
+  `brew install openssl@3 pkg-config`, then — `openssl@3` is keg-only —
+  `export PKG_CONFIG_PATH="$(brew --prefix openssl@3)/lib/pkgconfig"`. On Debian/Ubuntu:
+  `apt install libssl-dev pkg-config` (no further configuration needed).
 
 ## Usage
 
