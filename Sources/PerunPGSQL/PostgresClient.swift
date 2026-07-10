@@ -238,8 +238,11 @@ public actor PostgresClient {
         // connection. A server (SQL) error, a decode/local error, or an error from
         // the caller's own closure all surface after the query drained to
         // ReadyForQuery, so the connection is reusable — release() still discards
-        // it if it came back mid-transaction.
-        if let perun = error as? PerunError, perun.mayHaveDesynchronizedWire {
+        // it if it came back mid-transaction. A connection closed outright (e.g. a
+        // bounded copyIn resync gave up on a huge COPY … TO STDOUT) can never be reused.
+        let desync = (error as? PerunError)?.mayHaveDesynchronizedWire == true
+        let closed = await connection.isConnectionClosed
+        if desync || closed {
             await discardAndReplaceIfNeeded(connection)
         } else {
             await release(connection)

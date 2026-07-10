@@ -262,6 +262,46 @@ final class CopyIntegrationTests: XCTestCase {
         }
     }
 
+    func testWrongDirectionCopyInGivesUpAndClosesOnAnUnboundedCopy() async throws {
+        var configuration = try integrationConfiguration()
+        configuration.copyResyncTimeout = .milliseconds(200)   // bound the resync tightly for the test
+        let connection = try await PostgresConnection.connect(configuration)
+        defer { Task { try? await connection.close() } }
+
+        // A physical table streams `CopyOutResponse` immediately and then a long run of rows (a
+        // subquery like `generate_series` would instead be materialised *before* CopyOutResponse, so
+        // its wait wouldn't exercise the drain). Far more rows than the tiny resync timeout can drain.
+        _ = try await connection.query(
+            "CREATE TEMP TABLE perun_copy_stress AS SELECT g FROM generate_series(1, 50000000) g")
+
+        // The wrong-direction copyIn must give up on the drain within ~copyResyncTimeout and close
+        // the connection, not hold the wire (and its exclusive lock) for the whole 50M-row stream.
+        let clock = ContinuousClock()
+        let start = clock.now
+        do {
+            try await connection.copyIn("COPY perun_copy_stress TO STDOUT") { _ in
+                XCTFail("the writer closure must not run for a wrong-direction copyIn")
+            }
+            XCTFail("expected copyIn to reject a TO STDOUT statement")
+        } catch let error as PerunError {
+            guard case .copyMismatch = error else {
+                return XCTFail("expected .copyMismatch, got \(error)")
+            }
+        }
+        XCTAssertLessThan(clock.now - start, .seconds(5),
+                          "the bounded resync must give up quickly, not drain the whole COPY")
+
+        // Escaping the unbounded drain meant closing the connection — it must not be reusable.
+        do {
+            _ = try await connection.query("SELECT 1")
+            XCTFail("expected the connection to be closed after the bounded resync gave up")
+        } catch let error as PerunError {
+            guard case .connectionClosed = error else {
+                return XCTFail("expected .connectionClosed, got \(error)")
+            }
+        }
+    }
+
     // MARK: - Helpers
 
     private func integrationConfiguration() throws -> ConnectionConfiguration {

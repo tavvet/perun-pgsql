@@ -30,6 +30,11 @@ public struct ConnectionConfiguration: Sendable {
     /// How long to wait for the TCP connection to each resolved address before giving up.
     /// Defaults to 10 seconds; set `nil` to wait indefinitely (the OS default, ~130 s on Linux).
     public var connectTimeout: Duration?
+    /// How long to keep draining a wrong-direction `copyIn` (a `COPY … TO STDOUT`) to resync the
+    /// wire before giving up and closing the connection. There is no client-side abort for COPY OUT,
+    /// so a bound keeps this caller error from holding the connection (and its exclusive lock) for
+    /// the length of a large or slow COPY. Defaults to 5 seconds.
+    public var copyResyncTimeout: Duration
     /// Reject any backend message whose payload exceeds this many bytes. Bounds
     /// memory against a malicious or buggy server that declares a huge length.
     /// Defaults to 256 MiB.
@@ -51,6 +56,7 @@ public struct ConnectionConfiguration: Sendable {
                 password: String? = nil,
                 tlsMode: TLSMode = .verifyFull,
                 connectTimeout: Duration? = .seconds(10),
+                copyResyncTimeout: Duration = .seconds(5),
                 maxMessageSize: Int = 256 * 1024 * 1024,
                 notificationBufferLimit: Int = 1024,
                 runtimeParameters: [String: String] = [:]) {
@@ -62,6 +68,7 @@ public struct ConnectionConfiguration: Sendable {
         self.password = password
         self.tlsMode = tlsMode
         self.connectTimeout = connectTimeout
+        self.copyResyncTimeout = copyResyncTimeout
         self.maxMessageSize = maxMessageSize
         self.notificationBufferLimit = notificationBufferLimit
         self.runtimeParameters = runtimeParameters
@@ -138,6 +145,9 @@ public actor PostgresConnection {
     /// Connect timeout in milliseconds (nil = wait indefinitely), reused when a later
     /// CancelRequest opens its own side socket to the same server.
     private let connectTimeoutMillis: Int32?
+    /// How long to drain a wrong-direction `copyIn` before closing the connection (see
+    /// `drainWrongDirectionCopyOut`).
+    private let copyResyncTimeout: Duration
     /// Reject backend messages whose payload exceeds this many bytes (DoS guard).
     private let maxMessageSize: Int
     /// Process-local identity used to keep prepared-statement handles scoped to
@@ -192,6 +202,7 @@ public actor PostgresConnection {
                  host: String,
                  port: UInt16,
                  connectTimeoutMillis: Int32?,
+                 copyResyncTimeout: Duration,
                  maxMessageSize: Int,
                  notificationBufferLimit: Int) {
         self.fd = fd
@@ -200,6 +211,7 @@ public actor PostgresConnection {
         self.host = host
         self.port = port
         self.connectTimeoutMillis = connectTimeoutMillis
+        self.copyResyncTimeout = copyResyncTimeout
         self.maxMessageSize = maxMessageSize
         self.connectionID = UInt64.random(in: UInt64.min ... UInt64.max)
         self.createdAt = ContinuousClock().now
@@ -239,6 +251,7 @@ public actor PostgresConnection {
         let connection = PostgresConnection(fd: fd, ioQueue: ioQueue,
                                             host: configuration.host, port: configuration.port,
                                             connectTimeoutMillis: connectTimeoutMillis,
+                                            copyResyncTimeout: configuration.copyResyncTimeout,
                                             maxMessageSize: configuration.maxMessageSize,
                                             notificationBufferLimit: configuration.notificationBufferLimit)
         do {
@@ -1624,13 +1637,11 @@ public actor PostgresConnection {
             case .copyInResponse:
                 return                           // the server is ready to receive CopyData
             case .copyOutResponse:
-                // Wrong direction: a COPY … TO STDOUT streams the server's output to us. Drain it to
-                // ReadyForQuery and surface the mismatch. We deliberately do NOT send a CancelRequest:
-                // it is asynchronous and per-backend, so a short COPY that finishes before the cancel
-                // lands would leave the cancel to strike the NEXT statement on this connection (a
-                // stray SQLSTATE 57014). Draining is always correct and leaves the connection usable;
-                // a wrong-direction copyIn is a caller error, so paying to drain its output is fine.
-                try await drainToReadyForQuery()
+                // Wrong direction: a COPY … TO STDOUT streams the server's output to us. There is no
+                // client-side abort for COPY OUT, and an async CancelRequest could strike the *next*
+                // statement (a stray SQLSTATE 57014), so we resync by draining — bounded, so a large
+                // or slow COPY closes the connection instead of holding the wire indefinitely.
+                await drainWrongDirectionCopyOut()
                 throw PerunError.copyMismatch("copyIn needs a COPY … FROM STDIN statement, not TO STDOUT")
             case let .errorResponse(error):
                 pendingError = error
@@ -1650,6 +1661,45 @@ public actor PostgresConnection {
             }
         }
     }
+
+    /// Resync after a wrong-direction `copyIn` (the server is streaming a `COPY … TO STDOUT`) by
+    /// draining to ReadyForQuery — but only for up to `copyResyncTimeout`. If a large or slow COPY
+    /// outruns that, we shut the socket to interrupt the parked read and give up on reuse, rather
+    /// than hold the wire and its exclusive lock indefinitely. There is no alternative that is both
+    /// instant and reusable here (an async CancelRequest could cancel the next statement), so the
+    /// choice is drain-and-reuse when quick, close-and-discard when not.
+    private func drainWrongDirectionCopyOut() async {
+        let fd = self.fd
+        // Two bounds are needed, because neither alone stops both shapes of an over-long COPY:
+        //  • a real-timer `shutdownBoth` interrupts a STALLED read — the server is mid `pg_sleep`,
+        //    the recv is parked, and shutdown wakes it (as close() does elsewhere);
+        //  • an in-loop deadline bounds a fast, continuously STREAMING drain — on Linux
+        //    shutdown(SHUT_RD) does NOT stop a socket that keeps delivering data, so the loop must
+        //    check the clock between messages and bail itself.
+        let shutdownTimer = DispatchWorkItem {
+            SystemSocket.shutdownBoth(fd: fd)
+        }
+        let millis = copyResyncTimeout.components.seconds * 1000
+                   + copyResyncTimeout.components.attoseconds / 1_000_000_000_000_000
+        DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(Int(max(0, millis))),
+                                          execute: shutdownTimer)
+        var resynced = false
+        do {
+            try await drainToReadyForQuery(deadline: ContinuousClock().now + copyResyncTimeout)
+            resynced = true
+        } catch {
+            // Deadline hit (the in-loop check threw, or the shut socket failed a read) or a transport
+            // error — either way the wire isn't cleanly resynced.
+        }
+        shutdownTimer.cancel()
+        if !resynced, !isClosed {
+            forceClose()                        // large/slow COPY: discard rather than hold the wire
+        }
+    }
+
+    /// Whether this connection's wire has been closed. Read by the pool so it never re-idles or
+    /// hands a closed connection to a waiter (e.g. after a bounded copyIn resync gave up on it).
+    var isConnectionClosed: Bool { isClosed }
 
     /// Send one `CopyData` chunk for the active `copyIn`. Guards on `copyInActive` *and* the
     /// writer's `generation`, so a writer used outside its own closure — including during a
@@ -1672,8 +1722,11 @@ public actor PostgresConnection {
 
     /// Read and discard messages until ReadyForQuery, keeping session parameters and
     /// notifications current. Resynchronises the wire after aborting a COPY.
-    private func drainToReadyForQuery() async throws {
+    private func drainToReadyForQuery(deadline: ContinuousClock.Instant? = nil) async throws {
         while true {
+            if let deadline, ContinuousClock().now >= deadline {
+                throw PerunError.timedOut   // caller (a bounded resync) decides what to do
+            }
             switch try await readMessage() {
             case let .readyForQuery(status):
                 transactionStatus = status
