@@ -46,7 +46,7 @@ final class TLSConnection: @unchecked Sendable {
             _ = hostname.withCString { SSL_set1_host(ssl, $0) }
         }
 
-        let handshake = SSL_connect(ssl)
+        let handshake = withSIGPIPEBlocked { SSL_connect(ssl) }   // handshake writes; guard SIGPIPE
         if handshake != 1 {
             let code = SSL_get_error(ssl, handshake)
             let detail = opensslErrors()
@@ -69,15 +69,19 @@ final class TLSConnection: @unchecked Sendable {
 
     func send(_ bytes: [UInt8]) throws {
         guard !bytes.isEmpty else { return }
-        try bytes.withUnsafeBytes { raw in
-            let base = raw.baseAddress!
-            var sent = 0
-            while sent < bytes.count {
-                let written = SSL_write(ssl, base + sent, Int32(bytes.count - sent))
-                if written <= 0 {
-                    throw PerunError.tlsIO("SSL_write failed (error \(SSL_get_error(ssl, written)))")
+        // OpenSSL's write() carries no MSG_NOSIGNAL and Linux has no SO_NOSIGPIPE, so a peer reset
+        // here would raise SIGPIPE. Block it on this thread for the whole send (a no-op on Darwin).
+        try withSIGPIPEBlocked {
+            try bytes.withUnsafeBytes { raw in
+                let base = raw.baseAddress!
+                var sent = 0
+                while sent < bytes.count {
+                    let written = SSL_write(ssl, base + sent, Int32(bytes.count - sent))
+                    if written <= 0 {
+                        throw PerunError.tlsIO("SSL_write failed (error \(SSL_get_error(ssl, written)))")
+                    }
+                    sent += Int(written)
                 }
-                sent += Int(written)
             }
         }
     }
@@ -85,6 +89,8 @@ final class TLSConnection: @unchecked Sendable {
     func receive(maxLength: Int) throws -> [UInt8] {
         var read: Int32 = 0
         let buffer = [UInt8](unsafeUninitializedCapacity: maxLength) { raw, initializedCount in
+            // Not wrapped in withSIGPIPEBlocked: SSL_read only writes to the socket during a
+            // renegotiation, which PostgreSQL never initiates (and TLS 1.3 removes) — so no SIGPIPE.
             read = SSL_read(ssl, raw.baseAddress, Int32(maxLength))
             initializedCount = read > 0 ? Int(read) : 0
         }
@@ -98,7 +104,7 @@ final class TLSConnection: @unchecked Sendable {
     }
 
     func close() {
-        SSL_shutdown(ssl)
+        _ = withSIGPIPEBlocked { SSL_shutdown(ssl) }   // writes close_notify — same SIGPIPE risk
         SSL_free(ssl)
         SSL_CTX_free(ctx)
     }
@@ -117,3 +123,43 @@ func opensslErrors() -> String {
     }
     return messages.isEmpty ? "(no OpenSSL error detail)" : messages.joined(separator: "; ")
 }
+
+/// Run `body` with SIGPIPE blocked on the current thread, draining a SIGPIPE it raises so the signal
+/// can't fire when the mask is restored. OpenSSL's socket writes (`SSL_connect` / `SSL_write` /
+/// `SSL_shutdown`) do a plain `write()`; on Linux there is no `SO_NOSIGPIPE`, so without this a peer
+/// reset would kill the whole process. This shields the TLS write paths WITHOUT changing the
+/// process-wide SIGPIPE disposition the host application owns (the approach libpq uses). On Darwin it
+/// is a no-op: the socket already carries `SO_NOSIGPIPE`, which covers OpenSSL's writes too.
+#if canImport(Glibc) || canImport(Musl)
+func withSIGPIPEBlocked<T>(_ body: () throws -> T) rethrows -> T {
+    var sigpipeOnly = sigset_t()
+    sigemptyset(&sigpipeOnly)
+    sigaddset(&sigpipeOnly, SIGPIPE)
+
+    var pending = sigset_t()
+    sigemptyset(&pending)
+    sigpending(&pending)
+    let alreadyPending = sigismember(&pending, SIGPIPE) == 1     // someone else's — never drain it
+
+    var previousMask = sigset_t()
+    pthread_sigmask(SIG_BLOCK, &sigpipeOnly, &previousMask)
+    defer {
+        if !alreadyPending {                                    // drain a SIGPIPE *we* raised…
+            var nowPending = sigset_t()
+            sigemptyset(&nowPending)
+            sigpending(&nowPending)
+            if sigismember(&nowPending, SIGPIPE) == 1 {
+                var caught: Int32 = 0
+                _ = sigwait(&sigpipeOnly, &caught)              // …returns at once: SIGPIPE is pending
+            }
+        }
+        pthread_sigmask(SIG_SETMASK, &previousMask, nil)        // …then restore the thread's mask
+    }
+    return try body()
+}
+#else
+@inline(__always)
+func withSIGPIPEBlocked<T>(_ body: () throws -> T) rethrows -> T {
+    try body()          // Darwin: SO_NOSIGPIPE on the fd already suppresses SIGPIPE for every write
+}
+#endif

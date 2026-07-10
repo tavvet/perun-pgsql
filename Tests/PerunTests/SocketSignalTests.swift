@@ -1,42 +1,41 @@
+#if canImport(Glibc) || canImport(Musl)
 import XCTest
 @testable import PerunPGSQL
 
-#if canImport(Darwin)
-import Darwin
-#elseif canImport(Glibc)
+#if canImport(Glibc)
 import Glibc
 #elseif canImport(Musl)
 import Musl
 #endif
 
-/// Regression guard for the Linux-only SIGPIPE process-kill: OpenSSL's `SSL_write` does a plain
-/// `write()` with no `MSG_NOSIGNAL`, and Linux has no `SO_NOSIGPIPE`, so a peer reset mid-write
-/// used to terminate the whole process. `SystemSocket.ignoreSIGPIPE()` neutralises that. If the
-/// protection ever regresses, the `write` below raises SIGPIPE and takes this test *runner* down —
-/// a hard, unmissable failure rather than a silent one.
+/// Linux has no `SO_NOSIGPIPE`, so OpenSSL's writing calls (SSL_connect / SSL_write / SSL_shutdown)
+/// are shielded by a thread-scoped SIGPIPE block (`withSIGPIPEBlocked`) instead of a process-wide
+/// `signal()`. This proves the write is protected (EPIPE, not a process kill) and — crucially for a
+/// library — that the thread's signal mask is left exactly as it was, leaking no global signal state.
+/// (Darwin needs no equivalent: `SO_NOSIGPIPE` on the fd covers OpenSSL's writes, so the helper there
+/// is a plain passthrough and this test is Linux-only.)
 final class SocketSignalTests: XCTestCase {
 
-    func testWriteToClosedPeerReturnsEPIPEInsteadOfKillingTheProcess() {
-        SystemSocket.ignoreSIGPIPE()          // normally armed by makeConnected on first connect
-
-        #if canImport(Darwin)
-        let streamType = SOCK_STREAM
-        #else
-        let streamType = Int32(SOCK_STREAM.rawValue)
-        #endif
-
+    func testThreadScopedBlockShieldsWriteWithoutLeakingSignalState() {
         var fds = [Int32](repeating: 0, count: 2)
-        XCTAssertEqual(socketpair(AF_UNIX, streamType, 0, &fds), 0, "socketpair failed")
-        close(fds[1])                          // the peer is gone
+        XCTAssertEqual(socketpair(AF_UNIX, Int32(SOCK_STREAM.rawValue), 0, &fds), 0, "socketpair failed")
+        close(fds[1])                       // peer gone: a raw write here would raise SIGPIPE and kill us
 
         let payload = [UInt8](repeating: 0x41, count: 1024)
-        let written = payload.withUnsafeBytes { write(fds[0], $0.baseAddress, $0.count) }
+        let written = withSIGPIPEBlocked {
+            payload.withUnsafeBytes { write(fds[0], $0.baseAddress, $0.count) }
+        }
+        close(fds[0])
 
-        // Merely reaching this line proves SIGPIPE did not kill us. The write itself must fail
-        // with EPIPE rather than pretending to succeed.
-        XCTAssertEqual(written, -1, "write to a closed peer should fail, not succeed")
+        // Reaching this line at all means SIGPIPE did not kill the test runner.
+        XCTAssertEqual(written, -1, "write to a closed peer should fail with EPIPE")
         XCTAssertEqual(errno, EPIPE, "expected EPIPE (\(EPIPE)), got errno \(errno)")
 
-        close(fds[0])
+        // The helper must restore the thread's signal mask — SIGPIPE must not be left blocked.
+        var mask = sigset_t()
+        sigemptyset(&mask)
+        pthread_sigmask(SIG_BLOCK, nil, &mask)
+        XCTAssertEqual(sigismember(&mask, SIGPIPE), 0, "SIGPIPE mask leaked — helper did not restore it")
     }
 }
+#endif
