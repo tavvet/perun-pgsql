@@ -90,6 +90,34 @@ final class CopyIntegrationTests: XCTestCase {
                           "abandoning a huge COPY OUT must close quickly, not drain the whole stream")
     }
 
+    func testCopyOutTaskCancellationClosesPromptlyWithoutCancelRequest() async throws {
+        let connection = try await PostgresConnection.connect(integrationConfiguration())
+        defer { Task { try? await connection.close() } }
+
+        _ = try await connection.query(
+            "CREATE TEMP TABLE copy_out_cancel AS SELECT g FROM generate_series(1, 20000000) g")
+
+        // Consume in a child task, then cancel it mid-stream. Cancellation interrupts the read with a
+        // socket shutdown (no CancelRequest), so it must stop promptly — not drain 20M rows — and the
+        // connection must be closed (so no stray cancel can ever reach a later statement).
+        let consumer = Task {
+            var seen = 0
+            for try await _ in try await connection.copyOut("COPY copy_out_cancel TO STDOUT") { seen += 1 }
+            return seen
+        }
+        try await Task.sleep(nanoseconds: 100_000_000)   // let the stream get going
+        let clock = ContinuousClock()
+        let start = clock.now
+        consumer.cancel()
+        let result = await consumer.result
+        XCTAssertLessThan(clock.now - start, .seconds(5), "a cancelled copyOut must stop promptly")
+        if case .success = result {
+            XCTFail("expected the cancelled copyOut to throw, not run to completion")
+        }
+        let closed = await connection.isConnectionClosed
+        XCTAssertTrue(closed, "a cancelled copyOut must close the connection")
+    }
+
     func testCopyOutRejectsNonCopyStatement() async throws {
         let connection = try await PostgresConnection.connect(integrationConfiguration())
         defer { Task { try? await connection.close() } }

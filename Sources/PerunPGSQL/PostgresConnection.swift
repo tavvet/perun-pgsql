@@ -1513,18 +1513,20 @@ public actor PostgresConnection {
     func nextCopyData() async throws -> [UInt8]? {
         guard copyOutActive else { return nil }
         if Task.isCancelled {
-            await finishCopyOut(generation: copyOutGeneration)   // fires the CancelRequest itself, then drains
+            abandonCopyOutOnCancellation()          // consumer aborted: close+discard, promptly
             throw CancellationError()
         }
-        let generation = copyOutGeneration
+        let fd = self.fd
         let outcome: Result<[UInt8]?, Error> = await withTaskCancellationHandler {
             do { return .success(try await readNextCopyData()) }
             catch { return .failure(error) }
         } onCancel: {
-            Task { await self.cancelCopyOutInFlight(generation: generation) }
+            // Cancelled mid-read: interrupt the parked read directly with a socket shutdown — NOT a
+            // CancelRequest, which is async and per-backend and could strike the next statement.
+            SystemSocket.shutdownBoth(fd: fd)
         }
         if Task.isCancelled {
-            await finishCopyOut(generation: copyOutGeneration)   // idempotent; cleans up if a chunk raced the cancel
+            abandonCopyOutOnCancellation()
             throw CancellationError()
         }
         return try outcome.get()
@@ -1611,9 +1613,14 @@ public actor PostgresConnection {
         unlock()
     }
 
-    private func cancelCopyOutInFlight(generation: UInt64) async {
-        guard !isClosed, copyOutActive, copyOutGeneration == generation else { return }
-        try? await sendCancelRequest()
+    /// Abandon an in-flight copyOut because the consuming task was cancelled: close the connection
+    /// and discard it — promptly, with no drain and no CancelRequest. (A plain early `break` / a
+    /// dropped iterator goes through the bounded `finishCopyOut` instead, which tries to keep the
+    /// connection reusable when the remainder is cheap.)
+    private func abandonCopyOutOnCancellation() {
+        guard copyOutActive else { return }
+        if !isClosed { forceClose() }
+        copyOutActive = false
     }
 
     // MARK: - COPY IN (client → server)
