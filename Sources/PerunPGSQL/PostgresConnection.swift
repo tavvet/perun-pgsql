@@ -1624,9 +1624,12 @@ public actor PostgresConnection {
             case .copyInResponse:
                 return                           // the server is ready to receive CopyData
             case .copyOutResponse:
-                // Wrong direction: a COPY … TO STDOUT. The server is now streaming to us (it
-                // could be the whole relation) — cancel it, drain, then surface the error.
-                try? await sendCancelRequest()
+                // Wrong direction: a COPY … TO STDOUT streams the server's output to us. Drain it to
+                // ReadyForQuery and surface the mismatch. We deliberately do NOT send a CancelRequest:
+                // it is asynchronous and per-backend, so a short COPY that finishes before the cancel
+                // lands would leave the cancel to strike the NEXT statement on this connection (a
+                // stray SQLSTATE 57014). Draining is always correct and leaves the connection usable;
+                // a wrong-direction copyIn is a caller error, so paying to drain its output is fine.
                 try await drainToReadyForQuery()
                 throw PerunError.copyMismatch("copyIn needs a COPY … FROM STDIN statement, not TO STDOUT")
             case let .errorResponse(error):

@@ -238,6 +238,30 @@ final class CopyIntegrationTests: XCTestCase {
         XCTAssertEqual(after, before, "a wire-synced COPY misuse must not churn the pooled connection")
     }
 
+    func testCopyInWrongDirectionDoesNotLeakCancelToTheNextQuery() async throws {
+        let connection = try await PostgresConnection.connect(integrationConfiguration())
+        defer { Task { try? await connection.close() } }
+
+        // A wrong-direction copyIn (a COPY … TO STDOUT) must reject WITHOUT firing a stray
+        // CancelRequest: an async cancel can outlive a short COPY and then cancel the *next*
+        // statement on this connection (SQLSTATE 57014). Loop to stress the timing the old
+        // cancel-based path raced on — every follow-up query must succeed.
+        for i in 1 ... 25 {
+            do {
+                try await connection.copyIn("COPY (SELECT \(i)) TO STDOUT") { _ in
+                    XCTFail("the writer closure must not run for a wrong-direction copyIn")
+                }
+                XCTFail("expected copyIn to reject a TO STDOUT statement")
+            } catch let error as PerunError {
+                guard case .copyMismatch = error else {
+                    return XCTFail("expected .copyMismatch, got \(error)")
+                }
+            }
+            let value = try await connection.query("SELECT \(i) AS a").rows[0].decode("a", as: Int.self)
+            XCTAssertEqual(value, i, "the query after a rejected copyIn must not be hit by a stray cancel")
+        }
+    }
+
     // MARK: - Helpers
 
     private func integrationConfiguration() throws -> ConnectionConfiguration {
