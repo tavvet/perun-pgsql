@@ -77,10 +77,16 @@ final class TLSConnection: @unchecked Sendable {
                 var sent = 0
                 while sent < bytes.count {
                     let written = SSL_write(ssl, base + sent, Int32(bytes.count - sent))
-                    if written <= 0 {
-                        throw PerunError.tlsIO("SSL_write failed (error \(SSL_get_error(ssl, written)))")
+                    if written > 0 { sent += Int(written); continue }
+                    let savedErrno = errno
+                    switch SSL_get_error(ssl, written) {
+                    case SSL_ERROR_WANT_READ, SSL_ERROR_WANT_WRITE:
+                        continue                    // blocking fd: retry (e.g. mid-renegotiation)
+                    case SSL_ERROR_SYSCALL where savedErrno == EINTR:
+                        continue                    // interrupted syscall — retry, like the raw path
+                    case let code:
+                        throw PerunError.tlsIO("SSL_write failed (error \(code)): \(opensslErrors())")
                     }
-                    sent += Int(written)
                 }
             }
         }
@@ -88,20 +94,33 @@ final class TLSConnection: @unchecked Sendable {
 
     func receive(maxLength: Int) throws -> [UInt8] {
         var read: Int32 = 0
+        var failure: PerunError?
         let buffer = [UInt8](unsafeUninitializedCapacity: maxLength) { raw, initializedCount in
             // Not wrapped in withSIGPIPEBlocked: SSL_read only writes to the socket during a
             // renegotiation, which PostgreSQL never initiates (and TLS 1.3 removes) — so no SIGPIPE.
-            read = SSL_read(ssl, raw.baseAddress, Int32(maxLength))
+            while true {
+                let n = SSL_read(ssl, raw.baseAddress, Int32(maxLength))
+                if n > 0 { read = n; break }
+                if n == 0 { read = 0; break }                       // EOF (clean, or peer TCP close)
+                let savedErrno = errno
+                let code = SSL_get_error(ssl, n)
+                if code == SSL_ERROR_ZERO_RETURN { read = 0; break } // peer closed TLS cleanly
+                if code == SSL_ERROR_WANT_READ || code == SSL_ERROR_WANT_WRITE { continue }
+                if code == SSL_ERROR_SYSCALL, savedErrno == EINTR { continue }   // retry, like raw recv
+                failure = PerunError.tlsIO("SSL_read failed (error \(code)): \(opensslErrors())")
+                read = -1
+                break
+            }
             initializedCount = read > 0 ? Int(read) : 0
         }
-        if read > 0 {
-            return buffer
-        }
-        if read == 0 { return [] }                                  // clean EOF
-        let code = SSL_get_error(ssl, read)
-        if code == SSL_ERROR_ZERO_RETURN { return [] }              // peer closed TLS
-        throw PerunError.tlsIO("SSL_read failed (error \(code)): \(opensslErrors())")
+        if let failure { throw failure }
+        return read > 0 ? buffer : []                               // 0 / clean close → empty (EOF)
     }
+
+    /// Bytes OpenSSL has already decrypted and buffered for reading but that we haven't consumed. A
+    /// drained, idle connection has none; any here are unexpected server data the raw TCP peek in
+    /// `SystemSocket.isQuiescentOpen` cannot see.
+    func pendingBytes() -> Int { Int(SSL_pending(ssl)) }
 
     func close() {
         _ = withSIGPIPEBlocked { SSL_shutdown(ssl) }   // writes close_notify — same SIGPIPE risk

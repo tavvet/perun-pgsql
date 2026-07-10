@@ -1934,9 +1934,17 @@ public actor PostgresConnection {
     func isProbablyAlive() async -> Bool {
         guard !isClosed else { return false }
         let fd = self.fd
+        let tls = self.tls
         return await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
             readQueue.async {
-                continuation.resume(returning: SystemSocket.isQuiescentOpen(fd: fd))
+                // Over TLS the raw peek can't see bytes OpenSSL already decrypted and buffered; a
+                // healthy drained connection has none. Checked on readQueue, same as SSL_read, so it
+                // can't race the reader.
+                if let tls, tls.pendingBytes() != 0 {
+                    continuation.resume(returning: false)
+                } else {
+                    continuation.resume(returning: SystemSocket.isQuiescentOpen(fd: fd))
+                }
             }
         }
     }

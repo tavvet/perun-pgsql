@@ -114,6 +114,9 @@ enum SystemSocket {
             restoreBlocking(fd, originalFlags)
             return nil                                  // connected at once (typically loopback)
         }
+        // EINPROGRESS: the async connect is underway. EINTR: the call was interrupted before
+        // returning, but per POSIX the attempt still proceeds asynchronously — both mean "wait for
+        // writability", handled by the poll below (which itself retries EINTR).
         guard errno == EINPROGRESS || errno == EINTR else {
             return errnoString(errno)                   // immediate, hard failure (e.g. refused)
         }
@@ -230,7 +233,6 @@ enum SystemSocket {
     /// call from a *different* thread to interrupt a `recv` currently blocked on
     /// this fd — the blocked read returns instead of hanging forever.
     static func shutdownBoth(fd: Int32) {
-        let shutRDWR: Int32 = 2     // SHUT_RDWR — the same value on every POSIX platform
-        _ = shutdown(fd, shutRDWR)
+        _ = shutdown(fd, Int32(SHUT_RDWR))   // Glibc types SHUT_RDWR as Int; shutdown() wants Int32
     }
 }
