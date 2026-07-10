@@ -49,9 +49,45 @@ final class CopyIntegrationTests: XCTestCase {
         }
         XCTAssertEqual(chunks, 3)
 
-        // The abandon path cancelled the COPY server-side and freed the wire.
+        // The abandon path drained the small remainder and freed the wire — connection reusable.
         let answer = try await connection.query("SELECT 42 AS a").rows[0].decode("a", as: Int.self)
         XCTAssertEqual(answer, 42)
+    }
+
+    func testCopyOutEarlyBreakOnHugeStreamClosesRatherThanHangs() async throws {
+        var configuration = try integrationConfiguration()
+        configuration.copyResyncTimeout = .milliseconds(200)   // bound the abandon-drain tightly
+        let connection = try await PostgresConnection.connect(configuration)
+        defer { Task { try? await connection.close() } }
+
+        _ = try await connection.query(
+            "CREATE TEMP TABLE copy_out_huge AS SELECT g AS id FROM generate_series(1, 50000000) g")
+
+        // Break early on a huge stream: the abandon path (finishCopyOut) can't drain the ~50M-row
+        // remainder within the tiny resync timeout, so it must close the connection — NOT fire an
+        // async CancelRequest (which could hit the next statement) and NOT hold the wire for the
+        // whole dump.
+        var chunks = 0
+        for try await _ in try await connection.copyOut("COPY copy_out_huge TO STDOUT") {
+            chunks += 1
+            if chunks == 3 { break }
+        }
+        XCTAssertEqual(chunks, 3)
+
+        // The next query waits on the wire lock the abandon path holds, then fails fast when it
+        // closes — it must not hang for the whole 50M-row stream.
+        let clock = ContinuousClock()
+        let start = clock.now
+        do {
+            _ = try await connection.query("SELECT 1")
+            XCTFail("expected the connection to be closed after abandoning a huge COPY OUT")
+        } catch let error as PerunError {
+            guard case .connectionClosed = error else {
+                return XCTFail("expected .connectionClosed, got \(error)")
+            }
+        }
+        XCTAssertLessThan(clock.now - start, .seconds(5),
+                          "abandoning a huge COPY OUT must close quickly, not drain the whole stream")
     }
 
     func testCopyOutRejectsNonCopyStatement() async throws {

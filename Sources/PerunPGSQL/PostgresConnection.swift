@@ -1581,26 +1581,24 @@ public actor PostgresConnection {
     func finishCopyOut(generation: UInt64) async {
         guard copyOutActive, copyOutGeneration == generation else { return }
         copyOutTerminating = true
-        await cancelCopyOutInFlight(generation: generation)
+        // Resync by draining the abandoned COPY OUT, bounded by `copyResyncTimeout` — NOT a
+        // `CancelRequest`, which is async and per-backend and could strike the *next* statement (the
+        // 57014 leak fixed in the copyIn path). A small remainder drains fast and the connection stays
+        // reusable; a large or slow one hits the deadline and we close+discard. Two bounds as in
+        // `drainWrongDirectionCopyOut`: a real-timer `shutdownBoth` for a stalled read + the in-loop
+        // deadline inside `drainToReadyForQuery` for a fast stream.
+        let fd = self.fd
+        let shutdownTimer = DispatchWorkItem { SystemSocket.shutdownBoth(fd: fd) }
+        let millis = copyResyncTimeout.components.seconds * 1000
+                   + copyResyncTimeout.components.attoseconds / 1_000_000_000_000_000
+        DispatchQueue.global().asyncAfter(deadline: .now() + .milliseconds(Int(max(0, millis))),
+                                          execute: shutdownTimer)
+        defer { shutdownTimer.cancel() }
         do {
-            while copyOutActive {
-                switch try await readMessage() {
-                case let .readyForQuery(status):
-                    transactionStatus = status
-                    endCopyOut()
-                case let .parameterStatus(name, value):
-                    parameters[name] = value
-                case let .noticeResponse(notice):
-                    noticeHandler?(notice)
-                case let .notificationResponse(processID, channel, payload):
-                    notificationContinuation.yield(
-                        PostgresNotification(processID: processID, channel: channel, payload: payload))
-                default:
-                    continue                     // discard remaining CopyData / CopyDone / CommandComplete / error
-                }
-            }
+            try await drainToReadyForQuery(deadline: ContinuousClock().now + copyResyncTimeout)
+            endCopyOut()                          // reached ReadyForQuery — wire resynced, reusable
         } catch {
-            if !isClosed { forceClose() }
+            if !isClosed { forceClose() }         // large/slow remainder or transport error: discard
             copyOutActive = false
         }
     }
