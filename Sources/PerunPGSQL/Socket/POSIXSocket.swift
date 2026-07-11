@@ -69,8 +69,12 @@ enum SystemSocket {
 
         // One monotonic deadline for the whole connect, shared across every resolved address and
         // every EINTR retry — otherwise a full `timeout` would be re-applied per address (up to
-        // N × timeout) and re-armed on each signal (potentially forever).
-        let deadline: Int64? = timeout.map { monotonicMillis() + durationMillis($0) }
+        // N × timeout) and re-armed on each signal (potentially forever). Saturating add, so a
+        // huge timeout yields a far-future deadline instead of trapping on overflow.
+        let deadline: Int64? = timeout.map { duration in
+            let (sum, overflow) = monotonicMillis().addingReportingOverflow(durationMillis(duration))
+            return overflow ? .max : sum
+        }
 
         var lastReason = "no addresses returned"
         var candidate: UnsafeMutablePointer<addrinfo>? = head
@@ -159,11 +163,17 @@ enum SystemSocket {
         return Int64(ts.tv_sec) * 1000 + Int64(ts.tv_nsec) / 1_000_000
     }
 
-    /// A `Duration` as whole milliseconds, clamped to ≥ 0.
+    /// A `Duration` as whole milliseconds, clamped to `[0, Int64.max]` with saturating arithmetic
+    /// so an enormous duration (e.g. `.seconds(Int64.max)`) yields a practically-infinite timeout
+    /// rather than trapping on overflow.
     private static func durationMillis(_ duration: Duration) -> Int64 {
         let (seconds, attoseconds) = duration.components
-        let millis = seconds * 1000 + attoseconds / 1_000_000_000_000_000
-        return millis < 0 ? 0 : millis
+        guard seconds >= 0 else { return 0 }                             // negative timeout → no wait
+        let (secondsMillis, mulOverflow) = seconds.multipliedReportingOverflow(by: 1000)
+        if mulOverflow { return .max }
+        let (total, addOverflow) = secondsMillis.addingReportingOverflow(attoseconds / 1_000_000_000_000_000)
+        if addOverflow { return .max }
+        return total < 0 ? 0 : total
     }
 
     /// Write every byte of `bytes`, looping over partial writes.

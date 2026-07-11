@@ -46,6 +46,24 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertLessThan(ContinuousClock().now - start, .seconds(10), "connect timeout did not bound the wait")
     }
 
+    func testHugeConnectTimeoutDoesNotOverflow() async {
+        // .seconds(Int64.max) must saturate, not trap on overflow while computing the deadline;
+        // a refused port still fails fast.
+        let configuration = ConnectionConfiguration(host: "127.0.0.1", port: 1,
+                                                    user: "x", database: "x", tlsMode: .disable,
+                                                    connectTimeout: .seconds(Int64.max))
+        do {
+            _ = try await PostgresConnection.connect(configuration)
+            XCTFail("expected the connection to be refused")
+        } catch let error as PerunError {
+            guard case .connectionFailed = error else {
+                return XCTFail("expected .connectionFailed, got \(error)")
+            }
+        } catch {
+            XCTFail("expected a PerunError, got \(type(of: error)): \(error)")
+        }
+    }
+
     func testConnectToRefusedPortThrowsConnectionFailed() async {
         // A refused/unreachable host must surface as PerunError.connectionFailed — the internal
         // SocketError never leaks out of connect(), so callers see one error type.
