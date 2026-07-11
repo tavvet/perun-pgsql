@@ -887,6 +887,7 @@ public actor PostgresConnection {
         var columns = defaultColumns
         var rowValues: [[[UInt8]?]] = []
         var pendingError: PostgresServerError?
+        var copyMisuse: PerunError?
 
         loop: while true {
             switch try await readMessage() {
@@ -906,6 +907,20 @@ public actor PostgresConnection {
                 results.append(QueryResult(columns: defaultColumns, values: [], commandTag: ""))
                 columns = defaultColumns
                 rowValues = []
+
+            case .copyInResponse:
+                // COPY has no place in a pipeline (it needs a writer/reader): abort a FROM STDIN
+                // with CopyFail so the server stops waiting, drain to ReadyForQuery, then report.
+                if copyMisuse == nil {
+                    copyMisuse = PerunError.copyMismatch("COPY is not supported inside a pipeline")
+                    try await send(FrontendMessage.copyFail(message: "client aborted COPY"))
+                }
+
+            case .copyOutResponse:
+                if copyMisuse == nil {
+                    copyMisuse = PerunError.copyMismatch("COPY is not supported inside a pipeline")
+                    try? await sendCancelRequest()
+                }
 
             case let .parameterStatus(name, value):
                 parameters[name] = value
@@ -933,6 +948,9 @@ public actor PostgresConnection {
             }
         }
 
+        if let copyMisuse {
+            throw copyMisuse
+        }
         if let pendingError {
             throw PerunError.server(pendingError)
         }
@@ -1207,6 +1225,7 @@ public actor PostgresConnection {
         var rowValues: [[[UInt8]?]] = []
         var commandTag = ""
         var pendingError: PostgresServerError?
+        var copyMisuse: PerunError?
 
         loop: while true {
             let message = try await readMessage()
@@ -1223,6 +1242,27 @@ public actor PostgresConnection {
 
             case .emptyQueryResponse:
                 commandTag = ""
+
+            case .copyInResponse:
+                // A `COPY … FROM STDIN` was issued through query()/execute(): the server is
+                // now waiting for CopyData that these paths never send, which would hang the
+                // wire forever. Abort the copy with CopyFail, then keep draining to
+                // ReadyForQuery so the connection stays in sync, and report the misuse.
+                if copyMisuse == nil {
+                    copyMisuse = PerunError.copyMismatch(
+                        "COPY … FROM STDIN must be run with copyIn(_:_:), not query()/execute()")
+                    try await send(FrontendMessage.copyFail(message: "client aborted COPY"))
+                }
+
+            case .copyOutResponse:
+                // A `COPY … TO STDOUT` was issued through query()/execute(): its rows arrive as
+                // CopyData these paths would silently discard (returning an empty result). Stop
+                // the server, drain to ReadyForQuery, and report the misuse.
+                if copyMisuse == nil {
+                    copyMisuse = PerunError.copyMismatch(
+                        "COPY … TO STDOUT must be run with copyOut(_:), not query()/execute()")
+                    try? await sendCancelRequest()
+                }
 
             case let .parameterStatus(name, value):
                 parameters[name] = value
@@ -1252,6 +1292,11 @@ public actor PostgresConnection {
             }
         }
 
+        // A COPY-through-query misuse takes priority: after CopyFail the server echoes its own
+        // ErrorResponse, which is noise next to the real cause.
+        if let copyMisuse {
+            throw copyMisuse
+        }
         if let pendingError {
             throw PerunError.server(pendingError)
         }
