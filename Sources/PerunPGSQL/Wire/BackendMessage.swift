@@ -186,11 +186,21 @@ enum BackendMessage: Sendable {
     /// `Int16 column count`, then one `Int16` format code per column.
     private static func decodeCopyResponse(_ reader: inout ByteReader) throws -> (format: Int8, columnFormats: [Int16]) {
         let format = Int8(bitPattern: try reader.readUInt8())
+        guard format == 0 || format == 1 else {
+            throw PerunError.protocolViolation("CopyResponse overall format is \(format), not 0 (text) or 1 (binary)")
+        }
         let count = try reader.readInt16()
+        guard count >= 0 else {
+            throw PerunError.protocolViolation("CopyResponse column count is negative: \(count)")
+        }
         var columnFormats: [Int16] = []
-        columnFormats.reserveCapacity(max(0, Int(count)))
-        for _ in 0 ..< max(0, Int(count)) {
-            columnFormats.append(try reader.readInt16())
+        columnFormats.reserveCapacity(Int(count))
+        for _ in 0 ..< Int(count) {
+            let code = try reader.readInt16()
+            guard code == 0 || code == 1 else {
+                throw PerunError.protocolViolation("CopyResponse column format is \(code), not 0 (text) or 1 (binary)")
+            }
+            columnFormats.append(code)
         }
         return (format, columnFormats)
     }
@@ -199,9 +209,12 @@ enum BackendMessage: Sendable {
         _ reader: inout ByteReader
     ) throws -> [FieldDescription] {
         let count = try reader.readInt16()
+        guard count >= 0 else {
+            throw PerunError.protocolViolation("RowDescription field count is negative: \(count)")
+        }
         var fields: [FieldDescription] = []
-        fields.reserveCapacity(max(0, Int(count)))
-        for _ in 0 ..< max(0, Int(count)) {
+        fields.reserveCapacity(Int(count))
+        for _ in 0 ..< Int(count) {
             fields.append(FieldDescription(
                 name: try reader.readCString(),
                 tableOID: try reader.readInt32(),
@@ -217,12 +230,17 @@ enum BackendMessage: Sendable {
 
     private static func decodeDataRow(_ reader: inout ByteReader) throws -> [[UInt8]?] {
         let count = try reader.readInt16()
+        guard count >= 0 else {
+            throw PerunError.protocolViolation("DataRow column count is negative: \(count)")
+        }
         var columns: [[UInt8]?] = []
-        columns.reserveCapacity(max(0, Int(count)))
-        for _ in 0 ..< max(0, Int(count)) {
+        columns.reserveCapacity(Int(count))
+        for _ in 0 ..< Int(count) {
             let length = try reader.readInt32()
-            if length < 0 {
-                columns.append(nil)                     // SQL NULL
+            if length == -1 {
+                columns.append(nil)                     // SQL NULL — the only negative length the protocol allows
+            } else if length < 0 {
+                throw PerunError.protocolViolation("DataRow field length is negative but not -1: \(length)")
             } else {
                 columns.append(try reader.readBytes(Int(length)))
             }

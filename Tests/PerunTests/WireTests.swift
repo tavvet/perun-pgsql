@@ -156,4 +156,36 @@ final class WireTests: XCTestCase {
             return XCTFail("expected copyDone")
         }
     }
+
+    func testBackendDecoderRejectsMalformedFraming() throws {
+        func assertProtocolViolation(_ tag: Unicode.Scalar, _ payload: [UInt8],
+                                     _ message: String, line: UInt = #line) {
+            XCTAssertThrowsError(try BackendMessage.decode(tag: UInt8(ascii: tag), payload: payload),
+                                 message, line: line) { error in
+                guard case PerunError.protocolViolation = error else {
+                    return XCTFail("expected protocolViolation, got \(error)", line: line)
+                }
+            }
+        }
+
+        // DataRow ('D'): Int16 column count, then Int32 length + bytes per column. A negative count,
+        // or a negative length that isn't the -1 that marks SQL NULL, is malformed — not empty/NULL.
+        assertProtocolViolation("D", [0xFF, 0xFF], "negative DataRow column count")
+        assertProtocolViolation("D", [0x00, 0x01, 0xFF, 0xFF, 0xFF, 0xFE], "DataRow length -2 (not -1)")
+        // -1 is the one valid negative length: a single NULL column decodes cleanly.
+        guard case let .dataRow(columns) =
+            try BackendMessage.decode(tag: UInt8(ascii: "D"), payload: [0x00, 0x01, 0xFF, 0xFF, 0xFF, 0xFF]) else {
+            return XCTFail("expected dataRow")
+        }
+        XCTAssertEqual(columns, [nil])
+
+        // RowDescription ('T'): a negative field count is malformed.
+        assertProtocolViolation("T", [0xFF, 0xFF], "negative RowDescription field count")
+
+        // CopyResponse ('H'/'G'): Int8 overall format, Int16 count, Int16 per column. The formats
+        // are 0 (text) or 1 (binary); anything else, or a negative count, is malformed.
+        assertProtocolViolation("H", [0x02, 0x00, 0x00], "overall copy format 2")
+        assertProtocolViolation("H", [0x00, 0xFF, 0xFF], "negative copy column count")
+        assertProtocolViolation("H", [0x00, 0x00, 0x01, 0x00, 0x02], "copy column format code 2")
+    }
 }
