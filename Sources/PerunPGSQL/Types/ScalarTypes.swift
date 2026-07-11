@@ -20,7 +20,11 @@ extension Int16: PostgresDecodable {
     public static func decode(_ bytes: [UInt8], oid: Int32, format: PostgresFormat) throws -> Int16 {
         switch format {
         case .binary:
-            guard bytes.count == 2 else { throw postgresDecodeError("Int16", oid: oid, format: format, bytes) }
+            // Require the matching integer OID: another 2-byte binary value would otherwise be
+            // reinterpreted rather than rejected.
+            guard oid == PostgresOID.int2, bytes.count == 2 else {
+                throw postgresDecodeError("Int16", oid: oid, format: format, bytes)
+            }
             return Int16(bitPattern: WireBinary.uint16(bytes))
         case .text:
             guard let value = parseASCIIInteger(bytes, as: Int16.self) else {
@@ -35,7 +39,10 @@ extension Int32: PostgresDecodable {
     public static func decode(_ bytes: [UInt8], oid: Int32, format: PostgresFormat) throws -> Int32 {
         switch format {
         case .binary:
-            guard bytes.count == 4 else { throw postgresDecodeError("Int32", oid: oid, format: format, bytes) }
+            // Require int4: a float4 or date column is also 4 bytes and would be misread.
+            guard oid == PostgresOID.int4, bytes.count == 4 else {
+                throw postgresDecodeError("Int32", oid: oid, format: format, bytes)
+            }
             return Int32(bitPattern: WireBinary.uint32(bytes))
         case .text:
             guard let value = parseASCIIInteger(bytes, as: Int32.self) else {
@@ -50,7 +57,10 @@ extension Int64: PostgresDecodable {
     public static func decode(_ bytes: [UInt8], oid: Int32, format: PostgresFormat) throws -> Int64 {
         switch format {
         case .binary:
-            guard bytes.count == 8 else { throw postgresDecodeError("Int64", oid: oid, format: format, bytes) }
+            // Require int8: a float8, money, or timestamp column is also 8 bytes.
+            guard oid == PostgresOID.int8, bytes.count == 8 else {
+                throw postgresDecodeError("Int64", oid: oid, format: format, bytes)
+            }
             return Int64(bitPattern: WireBinary.uint64(bytes))
         case .text:
             guard let value = parseASCIIInteger(bytes, as: Int64.self) else {
@@ -65,12 +75,24 @@ extension Int: PostgresDecodable {
     public static func decode(_ bytes: [UInt8], oid: Int32, format: PostgresFormat) throws -> Int {
         switch format {
         case .binary:
-            // Accept int2/int4/int8 by width.
-            switch bytes.count {
-            case 8: return Int(Int64(bitPattern: WireBinary.uint64(bytes)))
-            case 4: return Int(Int32(bitPattern: WireBinary.uint32(bytes)))
-            case 2: return Int(Int16(bitPattern: WireBinary.uint16(bytes)))
-            default: throw postgresDecodeError("Int", oid: oid, format: format, bytes)
+            // Decode by the column's own integer type, so a same-width non-integer (float4,
+            // float8, money, a timestamp) is rejected rather than reinterpreted as a number.
+            switch oid {
+            case PostgresOID.int8:
+                guard bytes.count == 8 else { throw postgresDecodeError("Int", oid: oid, format: format, bytes) }
+                // Int64 → Int traps on a 32-bit platform for out-of-range values; fail instead.
+                guard let value = Int(exactly: Int64(bitPattern: WireBinary.uint64(bytes))) else {
+                    throw postgresDecodeError("Int", oid: oid, format: format, bytes)
+                }
+                return value
+            case PostgresOID.int4:
+                guard bytes.count == 4 else { throw postgresDecodeError("Int", oid: oid, format: format, bytes) }
+                return Int(Int32(bitPattern: WireBinary.uint32(bytes)))
+            case PostgresOID.int2:
+                guard bytes.count == 2 else { throw postgresDecodeError("Int", oid: oid, format: format, bytes) }
+                return Int(Int16(bitPattern: WireBinary.uint16(bytes)))
+            default:
+                throw postgresDecodeError("Int", oid: oid, format: format, bytes)
             }
         case .text:
             guard let value = parseASCIIInteger(bytes, as: Int.self) else {
@@ -85,7 +107,11 @@ extension Float: PostgresDecodable {
     public static func decode(_ bytes: [UInt8], oid: Int32, format: PostgresFormat) throws -> Float {
         switch format {
         case .binary:
-            guard bytes.count == 4 else { throw postgresDecodeError("Float", oid: oid, format: format, bytes) }
+            // Only float4 has this 4-byte IEEE-754 layout; an int4 column decoded here would
+            // otherwise reinterpret its bits (1 → 1.4e-45).
+            guard oid == PostgresOID.float4, bytes.count == 4 else {
+                throw postgresDecodeError("Float", oid: oid, format: format, bytes)
+            }
             return Float(bitPattern: WireBinary.uint32(bytes))
         case .text:
             // The standard library's parser is correctly rounded; a hand-rolled
@@ -103,7 +129,10 @@ extension Double: PostgresDecodable {
     public static func decode(_ bytes: [UInt8], oid: Int32, format: PostgresFormat) throws -> Double {
         switch format {
         case .binary:
-            guard bytes.count == 8 else { throw postgresDecodeError("Double", oid: oid, format: format, bytes) }
+            // Only float8 has this 8-byte IEEE-754 layout; an int8 column would be reinterpreted.
+            guard oid == PostgresOID.float8, bytes.count == 8 else {
+                throw postgresDecodeError("Double", oid: oid, format: format, bytes)
+            }
             return Double(bitPattern: WireBinary.uint64(bytes))
         case .text:
             // Correctly-rounded parse (see Float above).

@@ -60,6 +60,22 @@ final class TypeTests: XCTestCase {
         XCTAssertThrowsError(try Double.decode(Array("1e".utf8), oid: PostgresOID.float8, format: .text))
     }
 
+    // Binary numeric decoders must check the column OID, not just the byte width, so a
+    // same-width wrong type is rejected instead of having its bits reinterpreted.
+    func testBinaryNumericDecodersRejectMismatchedOID() {
+        // int4 bits decoded as Float would be 1.4e-45; must throw.
+        XCTAssertThrowsError(try Float.decode([0x00, 0x00, 0x00, 0x01], oid: PostgresOID.int4, format: .binary))
+        // float8 bits decoded as Int64 would be garbage; must throw.
+        let onePointFive = withUnsafeBytes(of: UInt64(1.5.bitPattern).bigEndian) { Array($0) }
+        XCTAssertThrowsError(try Int64.decode(onePointFive, oid: PostgresOID.float8, format: .binary))
+        XCTAssertThrowsError(try Int.decode(onePointFive, oid: PostgresOID.float8, format: .binary))
+        // float4 decoded as Int32 (both 4 bytes) must throw.
+        XCTAssertThrowsError(try Int32.decode([0x3F, 0xC0, 0x00, 0x00], oid: PostgresOID.float4, format: .binary))
+        // Matching OIDs still decode.
+        XCTAssertEqual(try Int32.decode([0x00, 0x00, 0x00, 0x2A], oid: PostgresOID.int4, format: .binary), 42)
+        XCTAssertEqual(try Int.decode([0x00, 0x00, 0x00, 0x2A], oid: PostgresOID.int4, format: .binary), 42)
+    }
+
     // Regression: PostgreSQL prints the shortest float text that round-trips, so a
     // correctly-rounded parse must return the exact same bits. Several of these were
     // mis-parsed (off by 1–3 ULP) by the previous accumulate-and-pow(10,e) parser.
