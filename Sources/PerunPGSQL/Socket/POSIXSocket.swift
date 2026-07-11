@@ -46,9 +46,10 @@ private func errnoString(_ code: Int32) -> String {
 enum SystemSocket {
 
     /// Resolve `host`/`port` and open a connected TCP socket, returning its fd. A non-nil
-    /// `timeout` bounds each address's connect attempt (via a non-blocking connect + poll), so a
-    /// blackholed host fails in bounded time instead of hanging on the OS default (~75 s); nil
-    /// uses the OS default. The returned fd is left in blocking mode.
+    /// A non-nil `timeout` bounds the *whole* connect — one monotonic deadline shared across every
+    /// resolved address and every EINTR retry (via a non-blocking connect + poll), so a blackholed
+    /// host fails within `timeout` instead of hanging on the OS default (~75 s) or stacking up to
+    /// N × timeout across addresses; nil uses the OS default. The returned fd is left in blocking mode.
     static func makeConnected(host: String, port: UInt16, timeout: Duration?) throws -> Int32 {
         var hints = addrinfo()
         hints.ai_family = AF_UNSPEC          // IPv4 or IPv6
@@ -65,6 +66,11 @@ enum SystemSocket {
             throw SocketError.resolutionFailed(host: host, port: port, code: rc)
         }
         defer { freeaddrinfo(head) }
+
+        // One monotonic deadline for the whole connect, shared across every resolved address and
+        // every EINTR retry — otherwise a full `timeout` would be re-applied per address (up to
+        // N × timeout) and re-armed on each signal (potentially forever).
+        let deadline: Int64? = timeout.map { monotonicMillis() + durationMillis($0) }
 
         var lastReason = "no addresses returned"
         var candidate: UnsafeMutablePointer<addrinfo>? = head
@@ -88,7 +94,7 @@ enum SystemSocket {
 
             do {
                 if try connectOne(fd: fd, address: info.pointee.ai_addr,
-                                  length: info.pointee.ai_addrlen, timeout: timeout) {
+                                  length: info.pointee.ai_addrlen, deadline: deadline) {
                     return fd
                 }
                 lastReason = "timed out"
@@ -101,14 +107,15 @@ enum SystemSocket {
         throw SocketError.connectionFailed(host: host, port: port, reason: lastReason)
     }
 
-    /// Connect `fd` to one resolved address. With a `timeout`, uses a non-blocking connect and
-    /// polls for completion, so the attempt can't outlast the deadline; the fd is returned to
-    /// blocking mode either way. Returns false on timeout; throws on a connect error.
+    /// Connect `fd` to one resolved address. With a `deadline` (monotonic ms), uses a non-blocking
+    /// connect and polls for the remaining time until the deadline, so the whole connect can't
+    /// outlast it; the fd is returned to blocking mode either way. Returns false on timeout; throws
+    /// on a connect error.
     private static func connectOne(fd: Int32,
                                    address: UnsafeMutablePointer<sockaddr>,
                                    length: socklen_t,
-                                   timeout: Duration?) throws -> Bool {
-        guard let timeout else {
+                                   deadline: Int64?) throws -> Bool {
+        guard let deadline else {
             if connect(fd, address, length) == 0 { return true }
             throw SocketError.connectionFailed(host: "", port: 0, reason: errnoString(errno))
         }
@@ -123,14 +130,18 @@ enum SystemSocket {
         }
 
         var pfd = pollfd(fd: fd, events: Int16(truncatingIfNeeded: POLLOUT), revents: 0)
-        let ready: Int32 = {
-            while true {
-                let r = poll(&pfd, 1, pollTimeoutMillis(timeout))
-                if r < 0 && errno == EINTR { continue }
-                return r
+        while true {
+            let remaining = deadline - monotonicMillis()
+            if remaining <= 0 { return false }                       // deadline reached: timed out
+            let wait = remaining > Int64(Int32.max) ? Int32.max : Int32(remaining)
+            let r = poll(&pfd, 1, wait)
+            if r < 0 {
+                if errno == EINTR { continue }                       // retry against the *remaining* time
+                return false
             }
-        }()
-        guard ready > 0 else { return false }            // 0 = timed out; <0 = poll error → treat as failure
+            if r == 0 { return false }                               // poll hit the deadline
+            break                                                    // the socket is writable
+        }
 
         var soError: Int32 = 0
         var errorLength = socklen_t(MemoryLayout<Int32>.size)
@@ -141,12 +152,18 @@ enum SystemSocket {
         return true
     }
 
-    /// A `Duration` as a `poll` timeout in whole milliseconds, clamped to `Int32` and ≥ 0.
-    private static func pollTimeoutMillis(_ duration: Duration) -> Int32 {
+    /// Milliseconds from a monotonic clock, for deadline math (immune to wall-clock changes).
+    private static func monotonicMillis() -> Int64 {
+        var ts = timespec()
+        clock_gettime(CLOCK_MONOTONIC, &ts)
+        return Int64(ts.tv_sec) * 1000 + Int64(ts.tv_nsec) / 1_000_000
+    }
+
+    /// A `Duration` as whole milliseconds, clamped to ≥ 0.
+    private static func durationMillis(_ duration: Duration) -> Int64 {
         let (seconds, attoseconds) = duration.components
         let millis = seconds * 1000 + attoseconds / 1_000_000_000_000_000
-        if millis <= 0 { return 0 }
-        return millis > Int64(Int32.max) ? Int32.max : Int32(millis)
+        return millis < 0 ? 0 : millis
     }
 
     /// Write every byte of `bytes`, looping over partial writes.
