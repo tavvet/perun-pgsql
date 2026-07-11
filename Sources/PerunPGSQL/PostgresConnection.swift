@@ -158,6 +158,8 @@ public actor PostgresConnection {
     private let port: UInt16
     /// Connect timeout, reused when `sendCancelRequest` opens its own socket.
     private let connectTimeout: Duration?
+    /// The session's TLS mode, so a query cancel can secure its own connection the same way.
+    private let tlsMode: TLSMode
     /// Reject backend messages whose payload exceeds this many bytes (DoS guard).
     private let maxMessageSize: Int
     /// Process-local identity used to keep prepared-statement handles scoped to
@@ -212,6 +214,7 @@ public actor PostgresConnection {
                  host: String,
                  port: UInt16,
                  connectTimeout: Duration?,
+                 tlsMode: TLSMode,
                  maxMessageSize: Int,
                  notificationBufferLimit: Int) {
         self.fd = fd
@@ -220,6 +223,7 @@ public actor PostgresConnection {
         self.host = host
         self.port = port
         self.connectTimeout = connectTimeout
+        self.tlsMode = tlsMode
         self.maxMessageSize = maxMessageSize
         self.connectionID = UInt64.random(in: UInt64.min ... UInt64.max)
         self.createdAt = ContinuousClock().now
@@ -248,6 +252,7 @@ public actor PostgresConnection {
         let connection = PostgresConnection(fd: fd, ioQueue: ioQueue,
                                             host: configuration.host, port: configuration.port,
                                             connectTimeout: configuration.connectTimeout,
+                                            tlsMode: configuration.tlsMode,
                                             maxMessageSize: configuration.maxMessageSize,
                                             notificationBufferLimit: configuration.notificationBufferLimit)
         do {
@@ -747,6 +752,10 @@ public actor PostgresConnection {
         guard processID != 0 else { return }
         let host = self.host
         let port = self.port
+        // The cancel key was delivered confidentially inside TLS; if the session is encrypted,
+        // secure the cancel connection too rather than re-exposing the key in cleartext.
+        let useTLS = isSecure
+        let verifyFull = tlsMode == .verifyFull
         // A dedicated queue and a *separate* socket: this connection may be parked in a
         // blocking recv waiting for the very query we're trying to cancel.
         let cancelQueue = DispatchQueue(label: "perun.cancel")
@@ -754,8 +763,20 @@ public actor PostgresConnection {
         try await withBlockingIO(on: cancelQueue) {
             let fd = try SystemSocket.makeConnected(host: host, port: port, timeout: timeout)
             defer { SystemSocket.disconnect(fd: fd) }
-            try SystemSocket.sendAll(fd: fd,
-                                     FrontendMessage.cancelRequest(processID: processID, secretKey: secretKey))
+            let request = FrontendMessage.cancelRequest(processID: processID, secretKey: secretKey)
+            guard useTLS else {
+                try SystemSocket.sendAll(fd: fd, request)
+                return
+            }
+            // SSLRequest, then send the CancelRequest over TLS. If the server declines TLS here,
+            // don't fall back to plaintext — skip the cancel rather than leak the key (it's
+            // best-effort anyway).
+            try SystemSocket.sendAll(fd: fd, FrontendMessage.sslRequest())
+            let reply = try SystemSocket.receive(fd: fd, maxLength: 1)
+            guard reply.first == UInt8(ascii: "S") else { return }
+            let tls = try TLSConnection.connect(fd: fd, hostname: host, verifyFull: verifyFull)
+            defer { tls.close() }
+            try tls.send(request)
         }
     }
 
