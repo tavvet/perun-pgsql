@@ -95,9 +95,9 @@ final class SCRAMTests: XCTestCase {
             try client.clientFinalMessage(
                 serverFirst: "r=myClientNonceEXT,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=1000000", deadline: past)
         ) { error in
-            guard case PerunError.timedOut = error else {
-                return XCTFail("expected PerunError.timedOut, got \(error)")
-            }
+            // An internal deadline error, not PerunError.timedOut — connect() maps it to
+            // connectionFailed, since the socket is torn down rather than left usable.
+            XCTAssertTrue(error is KeyDerivationDeadlineExceeded, "expected the derivation-deadline error, got \(error)")
         }
 
         // A comfortable future deadline lets an ordinary derivation finish.

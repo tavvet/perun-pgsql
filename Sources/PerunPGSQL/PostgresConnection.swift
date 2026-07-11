@@ -299,6 +299,12 @@ public actor PostgresConnection {
                 await connection.forceClose()
                 throw PerunError.connectionFailed("connect timed out during the startup handshake")
             }
+        } catch is KeyDerivationDeadlineExceeded {
+            // The connect deadline passed inside SCRAM's PBKDF2. The socket is torn down, so report a
+            // connection failure — not the query-oriented `.timedOut`, which promises a usable connection.
+            _ = await stopWatchdog()
+            await connection.forceClose()
+            throw PerunError.connectionFailed("connect timed out during authentication")
         } catch {
             _ = await stopWatchdog()
             await connection.forceClose()
