@@ -95,7 +95,8 @@ final class SASLprepTests: XCTestCase {
         }
         // Recompute: if our SASLprep matches PostgreSQL's pg_saslprep, both keys match byte for byte.
         let prepared = Array(saslPrep(rawPassword).utf8)
-        let salted = PBKDF2.deriveKey(password: prepared, salt: salt, iterations: iterations, keyLength: 32)
+        // No deadline here, so the derivation never throws (the only throw is a deadline overrun).
+        let salted = try! PBKDF2.deriveKey(password: prepared, salt: salt, iterations: iterations, keyLength: 32)
         let clientKey = HMACSHA256.authenticate(key: salted, message: Array("Client Key".utf8))
         let ourStoredKey = Base64.encode(SHA256.hash(clientKey))
         let ourServerKey = Base64.encode(HMACSHA256.authenticate(key: salted, message: Array("Server Key".utf8)))

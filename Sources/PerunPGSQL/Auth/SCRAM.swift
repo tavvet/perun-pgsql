@@ -35,8 +35,10 @@ struct SCRAMClient {
         return "n,,\(clientFirstBare)"
     }
 
-    /// Step 2: consume server-first, produce client-final (with the proof).
-    mutating func clientFinalMessage(serverFirst: String) throws -> String {
+    /// Step 2: consume server-first, produce client-final (with the proof). `deadline`, if set,
+    /// bounds the PBKDF2 work (see below) so a hostile iteration count can't burn CPU past the
+    /// caller's connect deadline.
+    mutating func clientFinalMessage(serverFirst: String, deadline: ContinuousClock.Instant? = nil) throws -> String {
         let attributes = Self.parseAttributes(serverFirst)
         guard let combinedNonce = attributes["r"],
               let saltBase64 = attributes["s"],
@@ -52,15 +54,21 @@ struct SCRAMClient {
         // The iteration count is server-controlled and consumed here, before the server is
         // authenticated in step 3, so validate it rather than trusting it. A value <= 0 would trip
         // PBKDF2's `precondition` and abort the whole process; an absurdly large one is a
-        // CPU-exhaustion DoS (billions of HMAC rounds). PostgreSQL's default is 4096.
-        guard (1 ... 10_000_000).contains(iterations) else {
+        // CPU-exhaustion DoS (each round is HMAC-SHA-256). PostgreSQL's default is 4096; a hard cap
+        // of one million is already far beyond any real configuration and rejects the hostile range
+        // up front, while `deadline` (the connect deadline) bounds the actual CPU time — so even an
+        // accepted count can't run past it. Both matter: the cap protects a caller that set no
+        // connect deadline; the deadline honors one that did (the derivation is otherwise
+        // synchronous, so the connect watchdog alone couldn't interrupt it).
+        guard (1 ... 1_000_000).contains(iterations) else {
             throw PerunError.protocolViolation("SCRAM iteration count out of range: \(iterations)")
         }
 
-        let saltedPassword = PBKDF2.deriveKey(password: password,
-                                              salt: salt,
-                                              iterations: iterations,
-                                              keyLength: 32)
+        let saltedPassword = try PBKDF2.deriveKey(password: password,
+                                                  salt: salt,
+                                                  iterations: iterations,
+                                                  keyLength: 32,
+                                                  deadline: deadline)
         let clientKey = HMACSHA256.authenticate(key: saltedPassword, message: Array("Client Key".utf8))
         let storedKey = SHA256.hash(clientKey)
 

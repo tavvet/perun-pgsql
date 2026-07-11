@@ -285,11 +285,16 @@ public actor PostgresConnection {
             return await watchdog?.value ?? false
         }
 
+        // The same absolute deadline the watchdog arms, handed to the startup path: the watchdog
+        // shuts the socket to unblock a parked recv, but SCRAM's PBKDF2 is synchronous CPU work it
+        // can't interrupt, so that step checks this deadline itself. Capped to avoid Instant overflow.
+        let deadline = configuration.connectTimeout.map { start + min($0, .seconds(Int64(Int32.max))) }
+
         do {
             if configuration.tlsMode != .disable {
                 try await connection.negotiateTLS(configuration)
             }
-            try await connection.startup(configuration)
+            try await connection.startup(configuration, deadline: deadline)
             if await stopWatchdog() {
                 await connection.forceClose()
                 throw PerunError.connectionFailed("connect timed out during the startup handshake")
@@ -1919,7 +1924,8 @@ public actor PostgresConnection {
         "IntervalStyle": "postgres",
     ]
 
-    private func startup(_ configuration: ConnectionConfiguration) async throws {
+    private func startup(_ configuration: ConnectionConfiguration,
+                         deadline: ContinuousClock.Instant? = nil) async throws {
         // Start from the caller's parameters and add each pin only if the caller didn't
         // already set that GUC. The match is case-insensitive because PostgreSQL GUC names
         // are, so `["datestyle": …]` replaces the pinned `DateStyle` instead of both keys
@@ -1940,7 +1946,7 @@ public actor PostgresConnection {
             let message = try await readMessage()
             switch message {
             case let .authentication(request):
-                try await handleAuthentication(request, configuration: configuration)
+                try await handleAuthentication(request, configuration: configuration, deadline: deadline)
 
             case let .parameterStatus(name, value):
                 parameters[name] = value
@@ -1967,7 +1973,8 @@ public actor PostgresConnection {
 
     private func handleAuthentication(
         _ request: AuthenticationRequest,
-        configuration: ConnectionConfiguration
+        configuration: ConnectionConfiguration,
+        deadline: ContinuousClock.Instant? = nil
     ) async throws {
         switch request {
         case .ok:
@@ -2022,7 +2029,7 @@ public actor PostgresConnection {
                 throw PerunError.protocolViolation("SASLContinue without an active SCRAM exchange")
             }
             let serverFirst = String(decoding: data, as: UTF8.self)
-            let clientFinal = try client.clientFinalMessage(serverFirst: serverFirst)
+            let clientFinal = try client.clientFinalMessage(serverFirst: serverFirst, deadline: deadline)
             scram = client
             try await send(FrontendMessage.saslResponse(Array(clientFinal.utf8)))
 

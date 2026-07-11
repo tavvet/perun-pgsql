@@ -77,7 +77,35 @@ final class SCRAMTests: XCTestCase {
         XCTAssertThrowsError(try attempt("0"))
         XCTAssertThrowsError(try attempt("-1"))
         XCTAssertThrowsError(try attempt("2147483647"))
-        // A sane count is still accepted.
+        XCTAssertThrowsError(try attempt("1000001"))     // just past the one-million hard cap
+        // A sane count is still accepted. (That the cap itself, 1000000, is in range — rather than
+        // rejected as out-of-range — is shown cheaply in testDerivationHonorsDeadline, where it
+        // reaches the derivation and times out instead of throwing a range violation.)
         XCTAssertNoThrow(try attempt("4096"))
+    }
+
+    func testDerivationHonorsDeadline() {
+        // A deadline already in the past must abort the (server-controlled) PBKDF2 work rather than
+        // running it to completion — this is what keeps a hostile iteration count from burning CPU
+        // past the connect deadline.
+        var client = SCRAMClient(password: "pencil", clientNonce: "myClientNonce")
+        _ = client.clientFirstMessage()
+        let past = ContinuousClock().now - .seconds(1)
+        XCTAssertThrowsError(
+            try client.clientFinalMessage(
+                serverFirst: "r=myClientNonceEXT,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=1000000", deadline: past)
+        ) { error in
+            guard case PerunError.timedOut = error else {
+                return XCTFail("expected PerunError.timedOut, got \(error)")
+            }
+        }
+
+        // A comfortable future deadline lets an ordinary derivation finish.
+        var ok = SCRAMClient(password: "pencil", clientNonce: "myClientNonce")
+        _ = ok.clientFirstMessage()
+        XCTAssertNoThrow(
+            try ok.clientFinalMessage(
+                serverFirst: "r=myClientNonceEXT,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096",
+                deadline: ContinuousClock().now + .seconds(60)))
     }
 }
