@@ -187,6 +187,31 @@ final class TLSConnection: @unchecked Sendable {
         }
     }
 
+    /// Bytes buffered inside OpenSSL that a raw socket peek can't see: plaintext already decrypted
+    /// but not yet read (`SSL_pending`), plus ciphertext `fillIncoming` pulled off the socket — up to
+    /// 64 KiB at a time — that still sits undecrypted in the read BIO (`BIO_ctrl_pending`). A drained,
+    /// healthy connection has none; any here are unexpected server data. Unlike a direct-fd engine,
+    /// where such bytes stay in the kernel buffer, the memory-BIO design needs the read-BIO term too.
+    func pendingBytes() -> Int {
+        engineLock.withLock {
+            guard !closed else { return 0 }
+            return Int(SSL_pending(ssl)) + Int(BIO_ctrl_pending(rbio))
+        }
+    }
+
+    #if DEBUG
+    /// Test seam: inject `count` bytes straight into the read BIO to simulate ciphertext the last
+    /// read pulled ahead. They are never fed to `SSL_read` (the test only probes `pendingBytes` then
+    /// closes), so they can't corrupt the engine.
+    func primeReadBIOForTest(_ count: Int) {
+        engineLock.withLock {
+            guard !closed else { return }
+            let bytes = [UInt8](repeating: 0, count: count)
+            _ = bytes.withUnsafeBytes { BIO_write(rbio, $0.baseAddress, Int32(count)) }
+        }
+    }
+    #endif
+
     func close() {
         engineLock.withLock {
             guard !closed else { return }

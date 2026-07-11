@@ -2254,13 +2254,31 @@ public actor PostgresConnection {
     func isProbablyAlive() async -> Bool {
         guard !isClosed else { return false }
         let fd = self.fd
+        let tls = self.tls
         let plaintext = (tls == nil)
         return await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
             readQueue.async {
-                continuation.resume(returning: SystemSocket.isQuiescentOpen(fd: fd, plaintextProtocol: plaintext))
+                // Over TLS the raw peek can't see bytes OpenSSL already pulled off the socket — decrypted
+                // in its buffer, or ciphertext waiting in the read BIO — so check those too. Done on the
+                // read queue, like SSL_read, so it can't race the background reader.
+                if let tls, tls.pendingBytes() != 0 {
+                    continuation.resume(returning: false)
+                } else {
+                    continuation.resume(returning: SystemSocket.isQuiescentOpen(fd: fd, plaintextProtocol: plaintext))
+                }
             }
         }
     }
+
+    #if DEBUG
+    /// Test seam: prime the TLS read BIO with `count` bytes to simulate ciphertext the last read
+    /// pulled ahead. Returns false on a plaintext connection (nothing to prime).
+    func primeTLSReadBufferForTest(_ count: Int) -> Bool {
+        guard let tls else { return false }
+        tls.primeReadBIOForTest(count)
+        return true
+    }
+    #endif
 
     /// Tear the connection down if `error` may have left the wire out of sync, so an inline
     /// (exclusive-path) reader — copyIn, copyOut, queryStream setup, a transaction — doesn't
