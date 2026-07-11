@@ -21,11 +21,15 @@ let config = ConnectionConfiguration(
 let connection = try await PostgresConnection.connect(config)
 ```
 
-Further options: ``ConnectionConfiguration/maxMessageSize`` (default 256 MiB) caps how large a
-single backend message may be, bounding memory against a hostile or buggy server that declares a
-huge length; ``ConnectionConfiguration/notificationBufferLimit`` (default 1024) bounds the
-`LISTEN`/`NOTIFY` buffer; ``ConnectionConfiguration/runtimeParameters`` sets extra startup GUCs,
-e.g. `["application_name": "perun"]`.
+Further options: ``ConnectionConfiguration/connectTimeout`` (default 10 seconds) bounds the whole
+connect — the TCP connection, TLS negotiation, and the startup/auth handshake — so a blackholed or
+silent host fails fast instead of pinning the caller (or a pool slot); pass `nil` for no bound
+beyond the OS TCP default (~75 s). DNS resolution runs before the bound is armed, so it is limited
+only by the system resolver. ``ConnectionConfiguration/maxMessageSize`` (default 256 MiB) caps how
+large a single backend message may be, bounding memory against a hostile or buggy server that
+declares a huge length; ``ConnectionConfiguration/notificationBufferLimit`` (default 1024) bounds
+the `LISTEN`/`NOTIFY` buffer; ``ConnectionConfiguration/runtimeParameters`` sets extra startup
+GUCs, e.g. `["application_name": "perun"]`.
 
 ## TLS modes
 
@@ -53,6 +57,14 @@ man-in-the-middle without the password cannot complete the exchange — this che
 skipped. Passwords are prepared with SASLprep (RFC 4013) before hashing, so a non-ASCII password
 hashes the same way it does server-side. A missing or wrong password fails cleanly with
 ``SQLState/invalidPassword`` (`28P01`).
+
+By default the driver accepts whichever method the server asks for
+(``AuthenticationRequirement/any``). Set ``ConnectionConfiguration/authenticationRequirement`` to
+refuse a weaker one: ``AuthenticationRequirement/disallowCleartext`` rejects a cleartext-password
+request (still allowing md5 or SCRAM), and ``AuthenticationRequirement/scramOnly`` accepts only
+SCRAM-SHA-256. This matters most under a relaxed ``ConnectionConfiguration/tlsMode``, where a
+man-in-the-middle could otherwise coax the client into handing over a weaker credential — the
+default `.verifyFull` already blocks that, so tightening the requirement is defence in depth.
 
 ## Pinned session defaults
 
