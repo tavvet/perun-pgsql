@@ -176,8 +176,9 @@ final class CopyIntegrationTests: XCTestCase {
         let connection = try await PostgresConnection.connect(integrationConfiguration())
         defer { Task { try? await connection.close() } }
 
-        // COPY TO STDOUT makes the server stream to us; copyIn must cancel/drain it and throw
-        // without running the writer closure.
+        // COPY TO STDOUT makes the server stream to us. A COPY-out can't be stopped in band and
+        // could block/stream unboundedly, so copyIn tears the connection down (without running the
+        // writer closure) rather than draining or firing a racy cancel.
         do {
             try await connection.copyIn("COPY (SELECT 1) TO STDOUT") { _ in
                 XCTFail("the writer closure should not run for a wrong-direction copyIn")
@@ -186,8 +187,74 @@ final class CopyIntegrationTests: XCTestCase {
         } catch {
             // expected
         }
-        let answer = try await connection.query("SELECT 2 AS a").rows[0].decode("a", as: Int.self)
-        XCTAssertEqual(answer, 2)
+        // The connection was closed to avoid an unbounded drain, so a further query must fail.
+        do {
+            _ = try await connection.query("SELECT 2 AS a")
+            XCTFail("the connection should have been closed after the wrong-direction copyIn")
+        } catch {
+            // expected
+        }
+    }
+
+    func testQueryRejectsCopyToStdoutAndClosesConnection() async throws {
+        let connection = try await PostgresConnection.connect(integrationConfiguration())
+        defer { Task { try? await connection.close() } }
+
+        // COPY … TO STDOUT via query() must be rejected; the connection is torn down (a COPY-out
+        // can't be stopped in band) rather than drained or cancelled.
+        do {
+            _ = try await connection.query("COPY (SELECT 1) TO STDOUT")
+            XCTFail("expected query() to reject a COPY … TO STDOUT")
+        } catch let error as PerunError {
+            guard case .copyMismatch = error else {
+                return XCTFail("expected .copyMismatch, got \(error)")
+            }
+        }
+        do {
+            _ = try await connection.query("SELECT 1")
+            XCTFail("connection should be closed after the COPY … TO STDOUT misuse")
+        } catch {
+            // expected
+        }
+    }
+
+    func testQueryRejectsHugeCopyToStdoutWithoutDraining() async throws {
+        let connection = try await PostgresConnection.connect(integrationConfiguration())
+        defer { Task { try? await connection.close() } }
+
+        // A fast-starting huge stream: CopyOutResponse arrives promptly, so the connection is
+        // torn down at once instead of draining tens of millions of rows (the reason we close
+        // rather than drain). A slow-to-first-row COPY would instead block like any slow query,
+        // bounded by task cancellation / withTimeout — that's not what this checks.
+        let start = ContinuousClock().now
+        do {
+            _ = try await connection.query("COPY (SELECT generate_series(1, 50000000)) TO STDOUT")
+            XCTFail("expected .copyMismatch")
+        } catch let error as PerunError {
+            guard case .copyMismatch = error else {
+                return XCTFail("expected .copyMismatch, got \(error)")
+            }
+        }
+        XCTAssertLessThan(ContinuousClock().now - start, .seconds(3),
+                          "the misuse must be rejected without draining the stream")
+    }
+
+    func testPoolRecoversAfterCopyToStdoutMisuse() async throws {
+        let pool = PostgresClient(configuration: try integrationConfiguration(), maxConnections: 2)
+        defer { Task { await pool.shutdown() } }
+
+        // The torn-down connection must be discarded, not returned to the pool or handed to a waiter.
+        do {
+            _ = try await pool.query("COPY (SELECT 1) TO STDOUT")
+            XCTFail("expected .copyMismatch")
+        } catch let error as PerunError {
+            guard case .copyMismatch = error else {
+                return XCTFail("expected .copyMismatch, got \(error)")
+            }
+        }
+        // The pool still serves queries on a fresh connection.
+        let answer = try await pool.query("SELECT 42 AS a").rows[0].decode("a", as: Int.self)
+        XCTAssertEqual(answer, 42)
     }
 
     func testCopyInWriterRejectedDuringLaterCopy() async throws {

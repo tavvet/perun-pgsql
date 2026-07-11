@@ -194,6 +194,10 @@ public actor PostgresConnection {
     /// Whether this connection is running over an encrypted TLS channel.
     public var isSecure: Bool { tls != nil }
 
+    /// The pool's release path needs both the transaction status (to decide whether to keep the
+    /// connection) and whether it was torn down mid-use (e.g. an abandoned COPY), in one hop.
+    var releaseState: (status: TransactionStatus, isClosed: Bool) { (transactionStatus, isClosed) }
+
     /// Backend PID + secret key, needed later to issue query cancellation.
     private var backendProcessID: Int32 = 0
     private var backendSecretKey: Int32 = 0
@@ -1016,11 +1020,10 @@ public actor PostgresConnection {
                 }
 
             case .copyOutResponse:
-                // Drain rather than cancel (see collectResults): a stray async CancelRequest
-                // could land on the next query once this connection is reused.
-                if copyMisuse == nil {
-                    copyMisuse = PerunError.copyMismatch("COPY is not supported inside a pipeline")
-                }
+                // Tear down rather than drain/cancel (see collectResults): a COPY-out can't be
+                // stopped in band, draining can block server-side, and a cancel races reuse.
+                forceClose()
+                throw PerunError.copyMismatch("COPY is not supported inside a pipeline")
 
             case let .parameterStatus(name, value):
                 parameters[name] = value
@@ -1396,17 +1399,14 @@ public actor PostgresConnection {
                 }
 
             case .copyOutResponse:
-                // A `COPY … TO STDOUT` was issued through query()/execute(): its rows arrive as
-                // CopyData these paths would silently discard (returning an empty result). Just
-                // drain them to ReadyForQuery (below) and report the misuse. We deliberately do
-                // NOT send a CancelRequest: a short COPY can finish before the async cancel
-                // reaches the backend, and the stray cancel would then land on whatever query
-                // runs next on this (reusable) connection. The relation is finite, so the drain
-                // terminates on its own.
-                if copyMisuse == nil {
-                    copyMisuse = PerunError.copyMismatch(
-                        "COPY … TO STDOUT must be run with copyOut(_:), not query()/execute()")
-                }
+                // A `COPY … TO STDOUT` was issued through query()/execute(): the server streams
+                // the result to us. A COPY-out can't be stopped in band; the stream can be huge or
+                // unbounded, so draining it just to reuse the connection is costly, and an
+                // out-of-band CancelRequest races the next query on the reused connection. So tear
+                // the connection down — this is an API misuse, so discarding it is acceptable.
+                forceClose()
+                throw PerunError.copyMismatch(
+                    "COPY … TO STDOUT must be run with copyOut(_:), not query()/execute()")
 
             case let .parameterStatus(name, value):
                 parameters[name] = value
@@ -1793,11 +1793,11 @@ public actor PostgresConnection {
             case .copyInResponse:
                 return                           // the server is ready to receive CopyData
             case .copyOutResponse:
-                // Wrong direction: a COPY … TO STDOUT. The server streams the (finite) relation
-                // to us — drain it to ReadyForQuery, then surface the error. We don't send a
-                // CancelRequest: a short COPY can finish first, and the stray async cancel would
-                // then land on the next query once this connection is reused.
-                try await drainToReadyForQuery()
+                // Wrong direction: a COPY … TO STDOUT. The server streams to us; a COPY-out can't
+                // be stopped in band, the stream can be huge or unbounded so draining it to reuse
+                // the connection is costly, and an out-of-band cancel races the next query. Tear
+                // the connection down — this is an API misuse, so discarding it is acceptable.
+                forceClose()
                 throw PerunError.copyMismatch("copyIn needs a COPY … FROM STDIN statement, not TO STDOUT")
             case let .errorResponse(error):
                 pendingError = error

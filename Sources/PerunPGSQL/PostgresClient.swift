@@ -200,7 +200,7 @@ public actor PostgresClient {
             closeDuringShutdown(connection)
             return
         }
-        let status = await connection.transactionStatus
+        let state = await connection.releaseState
         // Re-check: shutdown() may have run — and drained `idle` — while we were
         // suspended on the await above. Without this we would append to an
         // already-torn-down pool and leak the connection.
@@ -208,7 +208,13 @@ public actor PostgresClient {
             closeDuringShutdown(connection)
             return
         }
-        guard status == .idle else {
+        // A connection force-closed mid-use (e.g. an abandoned COPY … TO STDOUT) must be
+        // discarded, never pooled or handed to a waiter that would then fail on its first query.
+        if state.isClosed {
+            await discardAndReplaceIfNeeded(connection)
+            return
+        }
+        guard state.status == .idle else {
             await discardAndReplaceIfNeeded(connection)
             return
         }

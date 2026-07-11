@@ -216,9 +216,11 @@ public enum PerunError: Error, CustomStringConvertible, Sendable {
     /// A prepared-statement handle was used on a different connection than the
     /// one that created it.
     case preparedStatementConnectionMismatch
-    /// A COPY was started on a statement of the wrong kind — `copyOut` on a `COPY … FROM STDIN`,
-    /// `copyIn` on a `COPY … TO STDOUT`, or either on a non-COPY statement. The handshake is
-    /// drained to ReadyForQuery first, so the connection stays in sync and is kept.
+    /// A COPY was started on a statement of the wrong kind. For a non-COPY statement, or a
+    /// `copyOut`/`query` facing a `COPY … FROM STDIN` (aborted in band with CopyFail), the wire is
+    /// drained to ReadyForQuery and the connection is kept. For a `copyIn`/`query` facing a
+    /// `COPY … TO STDOUT` — which can't be stopped in band and could stream unboundedly or block
+    /// server-side — the connection is closed instead.
     case copyMismatch(String)
     /// An operation wrapped in `withTimeout` did not finish before its deadline. The
     /// underlying query was cancelled (a `CancelRequest`), so the connection stays usable.
