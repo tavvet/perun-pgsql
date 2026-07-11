@@ -42,11 +42,18 @@ extension Date: PostgresDecodable {
             case PostgresOID.timestamp, PostgresOID.timestamptz:
                 guard bytes.count == 8 else { throw postgresDecodeError("Date", oid: oid, format: format, bytes) }
                 let microseconds = Int64(bitPattern: WireBinary.uint64(bytes))
+                // PostgreSQL encodes ±infinity as the Int64 extremes. `Date` can't hold infinity,
+                // so map them to its distant sentinels (as the text path does) rather than
+                // silently decode Int64.max µs into a finite date around year 294247.
+                if microseconds == Int64.max { return .distantFuture }
+                if microseconds == Int64.min { return .distantPast }
                 let seconds = Double(microseconds) / 1_000_000
                 return Date(timeIntervalSinceReferenceDate: seconds - pgEpochToReferenceDate)
             case PostgresOID.date:
                 guard bytes.count == 4 else { throw postgresDecodeError("Date", oid: oid, format: format, bytes) }
                 let days = Int32(bitPattern: WireBinary.uint32(bytes))
+                if days == Int32.max { return .distantFuture }        // 'infinity'::date
+                if days == Int32.min { return .distantPast }          // '-infinity'::date
                 return Date(timeIntervalSinceReferenceDate: Double(days) * 86_400 - pgEpochToReferenceDate)
             default:
                 throw postgresDecodeError("Date", oid: oid, format: format, bytes)
@@ -120,6 +127,11 @@ extension Decimal: PostgresDecodable {
 /// `timestamptz`, e.g. `2026-07-07`, `2026-07-07 20:50:24.123456`, or
 /// `2026-07-07 20:50:24.123456+00`. Returns nil if it doesn't match.
 func parsePostgresTimestamp(_ string: String) -> Date? {
+    // PostgreSQL renders ±infinity literally; `Date` has no infinity, so use its sentinels
+    // (the binary decoder maps Int64.max/min the same way).
+    if string == "infinity" { return .distantFuture }
+    if string == "-infinity" { return .distantPast }
+
     let scalars = Array(string.utf8)
     var index = 0
 
