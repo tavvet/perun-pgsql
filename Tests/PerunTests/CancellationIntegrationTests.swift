@@ -140,51 +140,56 @@ final class CancellationIntegrationTests: XCTestCase {
         try await cleanup.close()
     }
 
-    func testCopyInCancelledAtCopyModeTransitionNeverDesyncs() async throws {
-        // The race the previous test can't hit: a cancel that lands *after* CopyInResponse has been
-        // read (the server is already in copy-in mode) but before copyIn marks the copy active.
-        // Abandoning the wire there would desynchronise it; the fix tears the connection down. Drive
-        // the window by starting the copyIn already-cancelled against an *unlocked* table, so the
-        // handshake wins the race and the cancel is observed right at the transition.
+    func testCopyInCancelledAtCopyModeTransitionTearsDown() async throws {
+        // The race the lock test can't reach: a cancel that lands *after* CopyInResponse is read (the
+        // server is in copy-in mode) but before copyIn marks the copy active. Abandoning the wire
+        // there would desynchronise it; the fix tears the connection down. A test seam lets us hit
+        // that window deterministically — the copyIn parks inside the handshake right after
+        // CopyInResponse, we cancel, then release it — instead of racing cancel() against the wire.
         let setup = try await PostgresConnection.connect(integrationConfiguration())
         _ = try await setup.query("DROP TABLE IF EXISTS perun_copy_race")
         _ = try await setup.query("CREATE TABLE perun_copy_race (id int)")
         try await setup.close()
 
-        for _ in 0 ..< 10 {
-            let connection = try await PostgresConnection.connect(integrationConfiguration())
-            let task = Task {
-                try await connection.copyIn("COPY perun_copy_race FROM STDIN") { writer in
-                    try await writer.write(Array("1\n".utf8))
-                }
-            }
-            task.cancel()
-            _ = try? await task.value
-
-            // The handshake wins the race (unlocked table), so the cancel is observed just after the
-            // server entered copy-in mode. The driver must have torn the connection down *itself*
-            // rather than hand it back — so isClosed is set. (If instead the CancelRequest had won
-            // and aborted before CopyInResponse, the wire would be cleanly drained and reusable.)
-            let closedByDriver = await connection.releaseState.isClosed
-
-            var reusableAnswer: Int?
-            var hung = false
-            do {
-                reusableAnswer = try await withTimeout(.seconds(10)) {
-                    try await connection.query("SELECT 1 AS n").rows[0].decode("n", as: Int.self)
-                }
-            } catch let error as PerunError {
-                if case .timedOut = error { hung = true }   // a desynced wire would hang the follow-up
-            }
-
-            XCTAssertFalse(hung, "a follow-up query hung → the connection desynced after a cancelled copyIn")
-            // What must never happen: the connection is kept but desynchronised (left mid-COPY, so the
-            // server drops it on the next, now-bogus, query). Either the driver discarded it, or it is
-            // genuinely reusable — not "kept" and broken.
-            XCTAssertTrue(closedByDriver || reusableAnswer == 1,
-                          "after a cancel at the copy-mode transition the connection must be torn down or cleanly reusable")
-            try? await connection.close()
+        let connection = try await PostgresConnection.connect(integrationConfiguration())
+        let handshakeReached = Gate(), release = Gate()
+        await connection.setCopyInHandshakeTestHook {
+            await handshakeReached.open()    // CopyInResponse has been read — the server is in copy mode
+            await release.wait()             // hold here until the test has cancelled
         }
+
+        let task = Task {
+            try await connection.copyIn("COPY perun_copy_race FROM STDIN") { writer in
+                try await writer.write(Array("1\n".utf8))
+            }
+        }
+        await handshakeReached.wait()        // now deterministically in the post-CopyInResponse window
+        task.cancel()                        // observed at runInlineCancellable's isCancelled check
+        await release.open()                 // let the handshake body return → onCancelledAfterSuccess runs
+
+        do {
+            _ = try await task.value
+            XCTFail("a cancelled copyIn should throw")
+        } catch is CancellationError {
+            // expected
+        }
+
+        // The cancel landed after the copy-mode transition, so the driver must have torn the
+        // connection down itself (onCancelledAfterSuccess) rather than hand back a desynced wire.
+        let tornDown = await connection.releaseState.isClosed
+        XCTAssertTrue(tornDown,
+                      "a cancel after CopyInResponse must tear the connection down, not reuse it mid-COPY")
+
+        // A follow-up therefore fails promptly as closed — it must not hang on a desynchronised wire.
+        do {
+            _ = try await withTimeout(.seconds(10)) { try await connection.query("SELECT 1").rows }
+            XCTFail("the connection should have been torn down")
+        } catch let error as PerunError {
+            guard case .connectionClosed = error else {
+                return XCTFail("expected connectionClosed after teardown, got \(error)")
+            }
+        }
+        try? await connection.close()
 
         let cleanup = try await PostgresConnection.connect(integrationConfiguration())
         _ = try await cleanup.query("DROP TABLE IF EXISTS perun_copy_race")

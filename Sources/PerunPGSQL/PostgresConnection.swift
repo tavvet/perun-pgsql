@@ -201,6 +201,14 @@ public actor PostgresConnection {
     /// connection) and whether it was torn down mid-use (e.g. an abandoned COPY), in one hop.
     var releaseState: (status: TransactionStatus, isClosed: Bool) { (transactionStatus, isClosed) }
 
+    #if DEBUG
+    /// Test seam (debug builds only): invoked inside `copyIn` right after `CopyInResponse` is read
+    /// but before the copy is marked active, so a test can cancel *deterministically* in the window
+    /// `onCancelledAfterSuccess` covers instead of racing `cancel()` against the handshake.
+    private var copyInHandshakeTestHook: (@Sendable () async -> Void)?
+    func setCopyInHandshakeTestHook(_ hook: @escaping @Sendable () async -> Void) { copyInHandshakeTestHook = hook }
+    #endif
+
     /// Backend PID + secret key, needed later to issue query cancellation.
     private var backendProcessID: Int32 = 0
     private var backendSecretKey: Int32 = 0
@@ -505,6 +513,9 @@ public actor PostgresConnection {
             // down rather than hand it back desynchronised.
             try await runInlineCancellable {
                 try await self.readCopyInResponse()
+                #if DEBUG
+                await self.copyInHandshakeTestHook?()   // no-op unless a test installed a seam
+                #endif
             } onCancelledAfterSuccess: {
                 self.forceClose()
             }
