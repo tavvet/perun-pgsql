@@ -3,3 +3,11 @@
 # Resolved only for a docs build (PERUN_BUILD_DOCS=1); the normal graph has no dependencies.
 Package.resolved
 
+# Xcode / SwiftPM local state — per-user, not part of the package.
+.swiftpm/
+xcuserdata/
+*.xcuserstate
+.DS_Store
+
+# Local audit working notes.
+AUDIT.md

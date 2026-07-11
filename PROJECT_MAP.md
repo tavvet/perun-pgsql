@@ -1066,7 +1066,7 @@ environment variables.
 Unit tests:
 
 ```bash
-rtk swift test
+swift test
 ```
 
 Observed:
@@ -1078,7 +1078,7 @@ Observed:
 Demo against PostgreSQL:
 
 ```bash
-rtk swift run perun-demo
+swift run perun-demo
 ```
 
 The demo reads:

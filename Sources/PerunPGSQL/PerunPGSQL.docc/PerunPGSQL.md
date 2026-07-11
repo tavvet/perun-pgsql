@@ -18,7 +18,7 @@ let pool = PostgresClient(configuration: config, maxConnections: 8)
 let rows = try await pool.query("SELECT id, email FROM users WHERE id = $1", [id]).rows
 let email = try rows[0].decode("email", as: String.self)
 
-try await pool.shutdown()
+await pool.shutdown()
 ```
 
 Parameters are always sent out of band (`$1`, `$2`, …), never spliced into the SQL text, so the

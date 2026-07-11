@@ -33,7 +33,7 @@ No extra configuration is needed — the package's `pkg-config` files land in a 
 ```swift
 // Package.swift
 dependencies: [
-    .package(url: "https://github.com/tavvet/perun-pgsql", from: "1.0.0"),
+    .package(url: "https://github.com/tavvet/perun-pgsql", from: "0.1.0"),
 ],
 targets: [
     .target(
@@ -77,7 +77,7 @@ let pool = PostgresClient(configuration: config, maxConnections: 8)
 let count = try await pool.query("SELECT count(*)::int AS c FROM users")
     .rows[0].decode("c", as: Int.self)
 
-try await pool.shutdown()
+await pool.shutdown()
 ```
 
 ## Next steps

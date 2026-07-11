@@ -1,0 +1,58 @@
+name: CI
+
+# Build the package and run the test suite on every push and pull request. The unit suite
+# needs no server; a PostgreSQL service container plus PERUN_PGSQL_INTEGRATION=1 also exercises
+# the live integration tests.
+
+on:
+  push:
+    branches: [main, dev-main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container: swift:6.0
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: perun
+          POSTGRES_PASSWORD: perun
+          POSTGRES_DB: perun
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U perun"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OpenSSL
+        run: apt-get update && apt-get install -y libssl-dev pkg-config
+
+      - name: Build
+        run: swift build
+
+      - name: Run tests (unit + live integration)
+        env:
+          PERUN_PGSQL_INTEGRATION: "1"
+          PGHOST: postgres
+          PGPORT: "5432"
+          PGUSER: perun
+          PGPASSWORD: perun
+          PGDATABASE: perun
+          PGSSLMODE: disable   # the service container speaks plaintext
+        run: swift test
