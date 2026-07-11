@@ -244,6 +244,7 @@ public actor PostgresConnection {
     /// server reports it is ready for queries.
     public static func connect(_ configuration: ConnectionConfiguration) async throws -> PostgresConnection {
         let ioQueue = DispatchQueue(label: "perun.connection.io")
+        let start = ContinuousClock().now
         let fd: Int32
         do {
             let timeout = configuration.connectTimeout
@@ -259,12 +260,32 @@ public actor PostgresConnection {
                                             tlsMode: configuration.tlsMode,
                                             maxMessageSize: configuration.maxMessageSize,
                                             notificationBufferLimit: configuration.notificationBufferLimit)
+
+        // One deadline for the whole connect (from `start`, so TCP time counts): a watchdog shuts
+        // the socket down when it passes, unblocking any recv/send parked in TLS or startup/auth.
+        // This bounds the *total* handshake — a peer that accepts TCP then dribbles bytes can't
+        // extend it the way a per-recv SO_RCVTIMEO would. Cancelled the moment we're ready.
+        let watchdog: Task<Void, Never>? = configuration.connectTimeout.map { timeout in
+            Task {
+                let remaining = timeout - (ContinuousClock().now - start)
+                let capped = min(max(remaining, .zero), .seconds(Int64(Int32.max)))
+                try? await Task.sleep(for: capped)
+                if !Task.isCancelled { SystemSocket.shutdownBoth(fd: fd) }
+            }
+        }
+        func stopWatchdog() async {
+            watchdog?.cancel()
+            _ = await watchdog?.value   // ensure it can't shut the fd down after we're done with it
+        }
+
         do {
             if configuration.tlsMode != .disable {
                 try await connection.negotiateTLS(configuration)
             }
             try await connection.startup(configuration)
+            await stopWatchdog()
         } catch {
+            await stopWatchdog()
             await connection.forceClose()
             throw error
         }
@@ -990,7 +1011,6 @@ public actor PostgresConnection {
         var columns = defaultColumns
         var rowValues: [[[UInt8]?]] = []
         var pendingError: PostgresServerError?
-        var copyMisuse: PerunError?
 
         loop: while true {
             switch try await readMessage() {
@@ -999,6 +1019,10 @@ public actor PostgresConnection {
                 rowValues.removeAll(keepingCapacity: true)
 
             case let .dataRow(values):
+                guard values.count == columns.count else {
+                    throw PerunError.protocolViolation(
+                        "DataRow has \(values.count) values but the row has \(columns.count) columns")
+                }
                 rowValues.append(values)
 
             case let .commandComplete(tag):
@@ -1011,17 +1035,10 @@ public actor PostgresConnection {
                 columns = defaultColumns
                 rowValues = []
 
-            case .copyInResponse:
-                // COPY has no place in a pipeline (it needs a writer/reader): abort a FROM STDIN
-                // with CopyFail so the server stops waiting, drain to ReadyForQuery, then report.
-                if copyMisuse == nil {
-                    copyMisuse = PerunError.copyMismatch("COPY is not supported inside a pipeline")
-                    try await send(FrontendMessage.copyFail(message: "client aborted COPY"))
-                }
-
-            case .copyOutResponse:
-                // Tear down rather than drain/cancel (see collectResults): a COPY-out can't be
-                // stopped in band, draining can block server-side, and a cancel races reuse.
+            case .copyInResponse, .copyOutResponse:
+                // COPY has no place in a pipeline (it needs a writer/reader), and neither
+                // direction can be recovered in band here (see collectResults): tear the
+                // connection down.
                 forceClose()
                 throw PerunError.copyMismatch("COPY is not supported inside a pipeline")
 
@@ -1051,9 +1068,6 @@ public actor PostgresConnection {
             }
         }
 
-        if let copyMisuse {
-            throw copyMisuse
-        }
         if let pendingError {
             throw PerunError.server(pendingError)
         }
@@ -1361,7 +1375,6 @@ public actor PostgresConnection {
         var resultRows: [[[UInt8]?]] = []
         var resultTag = ""
         var pendingError: PostgresServerError?
-        var copyMisuse: PerunError?
 
         loop: while true {
             let message = try await readMessage()
@@ -1371,6 +1384,10 @@ public actor PostgresConnection {
                 rowValues.removeAll(keepingCapacity: true)
 
             case let .dataRow(values):
+                guard values.count == columns.count else {
+                    throw PerunError.protocolViolation(
+                        "DataRow has \(values.count) values but the row has \(columns.count) columns")
+                }
                 rowValues.append(values)
 
             case let .commandComplete(tag):
@@ -1388,15 +1405,14 @@ public actor PostgresConnection {
                 rowValues = []
 
             case .copyInResponse:
-                // A `COPY … FROM STDIN` was issued through query()/execute(): the server is
-                // now waiting for CopyData that these paths never send, which would hang the
-                // wire forever. Abort the copy with CopyFail, then keep draining to
-                // ReadyForQuery so the connection stays in sync, and report the misuse.
-                if copyMisuse == nil {
-                    copyMisuse = PerunError.copyMismatch(
-                        "COPY … FROM STDIN must be run with copyIn(_:_:), not query()/execute()")
-                    try await send(FrontendMessage.copyFail(message: "client aborted COPY"))
-                }
+                // A `COPY … FROM STDIN` was issued through query()/execute(): the server now waits
+                // for CopyData these paths never send. Aborting with CopyFail resynchronises a
+                // Simple Query, but not the extended protocol — its pre-sent Sync is ignored during
+                // COPY, and after CopyFail the server waits for a *fresh* Sync that never comes — so
+                // tear the connection down uniformly. This is an API misuse; use copyIn(_:_:).
+                forceClose()
+                throw PerunError.copyMismatch(
+                    "COPY … FROM STDIN must be run with copyIn(_:_:), not query()/execute()")
 
             case .copyOutResponse:
                 // A `COPY … TO STDOUT` was issued through query()/execute(): the server streams
@@ -1436,11 +1452,6 @@ public actor PostgresConnection {
             }
         }
 
-        // A COPY-through-query misuse takes priority: after CopyFail the server echoes its own
-        // ErrorResponse, which is noise next to the real cause.
-        if let copyMisuse {
-            throw copyMisuse
-        }
         if let pendingError {
             throw PerunError.server(pendingError)
         }
@@ -1506,7 +1517,18 @@ public actor PostgresConnection {
                 let message = try await readMessage()
                 switch message {
                 case let .dataRow(values) where !streamTerminating:
+                    guard values.count == streamColumns.count else {
+                        throw PerunError.protocolViolation(
+                            "DataRow has \(values.count) values but the row has \(streamColumns.count) columns")
+                    }
                     return PostgresRow(values: values, columns: streamColumns, columnIndexByName: streamColumnIndex)
+
+                case .copyInResponse, .copyOutResponse:
+                    // queryStream isn't for COPY: FROM STDIN would wait for client data forever and
+                    // TO STDOUT would silently stream the whole (possibly unbounded) relation. Tear
+                    // the connection down (the catch below frees the wire and discards it).
+                    throw PerunError.copyMismatch(
+                        "COPY is not supported by queryStream; use copyIn(_:_:) or copyOut(_:)")
 
                 case let .rowDescription(fields):
                     streamColumns = fields.map(ColumnMetadata.init)

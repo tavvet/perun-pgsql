@@ -257,6 +257,52 @@ final class CopyIntegrationTests: XCTestCase {
         XCTAssertEqual(answer, 42)
     }
 
+    func testExtendedQueryRejectsCopyFromStdin() async throws {
+        let connection = try await PostgresConnection.connect(integrationConfiguration())
+        defer { Task { try? await connection.close() } }
+
+        _ = try await connection.query("CREATE TEMP TABLE copy_ext (id int)")
+        // A binary result forces the extended protocol (Parse/Bind/Execute/Sync). A CopyFail
+        // can't resynchronise that path (the pre-sent Sync is consumed during COPY), so the misuse
+        // must tear the connection down promptly rather than hang waiting for a Sync that never comes.
+        let start = ContinuousClock().now
+        do {
+            _ = try await connection.query("COPY copy_ext FROM STDIN", [], resultFormat: .binary)
+            XCTFail("expected query() to reject a COPY … FROM STDIN")
+        } catch let error as PerunError {
+            guard case .copyMismatch = error else {
+                return XCTFail("expected .copyMismatch, got \(error)")
+            }
+        }
+        XCTAssertLessThan(ContinuousClock().now - start, .seconds(4), "the misuse must not hang")
+        do {
+            _ = try await connection.query("SELECT 1")
+            XCTFail("connection should be closed after the COPY … FROM STDIN misuse")
+        } catch {
+            // expected
+        }
+    }
+
+    func testQueryStreamRejectsCopy() async throws {
+        let connection = try await PostgresConnection.connect(integrationConfiguration())
+        defer { Task { try? await connection.close() } }
+
+        // queryStream isn't for COPY: TO STDOUT would silently stream the whole relation. The
+        // stream must reject it promptly and tear the connection down.
+        let start = ContinuousClock().now
+        do {
+            for try await _ in try await connection.queryStream("COPY (SELECT 1) TO STDOUT") {
+                XCTFail("no rows should stream from a COPY")
+            }
+            XCTFail("expected queryStream to reject a COPY")
+        } catch let error as PerunError {
+            guard case .copyMismatch = error else {
+                return XCTFail("expected .copyMismatch, got \(error)")
+            }
+        }
+        XCTAssertLessThan(ContinuousClock().now - start, .seconds(4), "the misuse must not hang")
+    }
+
     func testCopyInWriterRejectedDuringLaterCopy() async throws {
         let connection = try await PostgresConnection.connect(integrationConfiguration())
         defer { Task { try? await connection.close() } }
