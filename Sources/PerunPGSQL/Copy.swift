@@ -16,28 +16,36 @@
 /// row sequence. Like `queryStream`, it holds the connection's wire **exclusively** until it
 /// is consumed, delivers chunks on demand (a slow consumer throttles the server), and frees
 /// the wire when it ends. Stopping early — a `break`, an error, or cancelling the task —
-/// cancels the COPY server-side and releases the connection.
+/// cancels the COPY server-side and releases the connection, even if the sequence value is held.
 public struct PostgresCopyOutSequence: AsyncSequence, Sendable {
     public typealias Element = [UInt8]
 
     private let connection: PostgresConnection
-    private let cleanup: CopyOutCleanup
     private let generation: UInt64
+    private let lifetime: CopyOutLifetime
 
     init(connection: PostgresConnection, generation: UInt64) {
         self.connection = connection
         self.generation = generation
-        self.cleanup = CopyOutCleanup(connection: connection, generation: generation)
+        self.lifetime = CopyOutLifetime(connection: connection, generation: generation)
     }
 
     public func makeAsyncIterator() -> AsyncIterator {
-        AsyncIterator(connection: connection, cleanup: cleanup, generation: generation)
+        // Hand out the single driving iterator exactly once, synchronised (the sequence is Sendable;
+        // see PostgresRowStream). It owns cleanup, so a `break` frees the wire even when the sequence
+        // is retained; a second iterator is inert (no cleanup, generation 0).
+        if lifetime.claimIterator() {
+            return AsyncIterator(connection: connection,
+                                 cleanup: CopyOutCleanup(connection: connection, generation: generation),
+                                 generation: generation)
+        }
+        return AsyncIterator(connection: connection, cleanup: nil, generation: 0)
     }
 
     public struct AsyncIterator: AsyncIteratorProtocol {
         let connection: PostgresConnection
-        let cleanup: CopyOutCleanup     // retained for the iterator's lifetime; frees the wire on drop
-        let generation: UInt64          // the copy this iterator pulls from; a stale next() reads nothing
+        let cleanup: CopyOutCleanup?    // frees the wire when the driving iterator is dropped; nil if inert
+        let generation: UInt64          // 0 for an inert duplicate iterator, so next() yields nothing
 
         public mutating func next() async throws -> [UInt8]? {
             try await connection.nextCopyData(generation: generation)
@@ -45,10 +53,10 @@ public struct PostgresCopyOutSequence: AsyncSequence, Sendable {
     }
 }
 
-/// Releases a `COPY … TO STDOUT` that the consumer abandoned before it finished. Dropping
-/// the sequence and its iterator cancels the COPY server-side (a `CancelRequest`, since the
-/// server would otherwise stream the whole relation), drains to `ReadyForQuery`, and frees
-/// the wire. A copy consumed to its end has already cleaned up, so this is a no-op.
+/// Releases a `COPY … TO STDOUT` that the consumer abandoned before it finished. Dropping the
+/// iterator cancels the COPY server-side (a `CancelRequest`, since the server would otherwise
+/// stream the whole relation), drains to `ReadyForQuery`, and frees the wire. A copy consumed to
+/// its end has already cleaned up, so this is a no-op.
 final class CopyOutCleanup: @unchecked Sendable {
     private let connection: PostgresConnection
     private let generation: UInt64      // the copy this cleanup belongs to; a stale deinit is a no-op
@@ -59,6 +67,36 @@ final class CopyOutCleanup: @unchecked Sendable {
     }
 
     deinit {
+        let connection = self.connection
+        let generation = self.generation
+        Task { await connection.finishCopyOut(generation: generation) }
+    }
+}
+
+/// Frees a copy that was created but never iterated. Once iteration begins the iterator's
+/// `CopyOutCleanup` owns teardown, so a sequence temporary released mid-iteration is a no-op here.
+final class CopyOutLifetime: @unchecked Sendable {
+    private let connection: PostgresConnection
+    private let generation: UInt64
+    private let lock = POSIXLock()
+    private var iteratorTaken = false
+
+    init(connection: PostgresConnection, generation: UInt64) {
+        self.connection = connection
+        self.generation = generation
+    }
+
+    /// Claim the single driving iterator; returns true for the first caller only. Thread-safe.
+    func claimIterator() -> Bool {
+        lock.withLock {
+            guard !iteratorTaken else { return false }
+            iteratorTaken = true
+            return true
+        }
+    }
+
+    deinit {
+        guard !lock.withLock({ iteratorTaken }) else { return }
         let connection = self.connection
         let generation = self.generation
         Task { await connection.finishCopyOut(generation: generation) }

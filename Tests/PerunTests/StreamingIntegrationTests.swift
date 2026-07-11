@@ -62,6 +62,27 @@ final class StreamingIntegrationTests: XCTestCase {
         XCTAssertEqual(answer, 42)
     }
 
+    func testHeldStreamSequenceFreesWireOnBreak() async throws {
+        let connection = try await PostgresConnection.connect(integrationConfiguration())
+        defer { Task { try? await connection.close() } }
+
+        // Hold the SEQUENCE in a variable (not a temporary): breaking the loop drops the iterator,
+        // and the wire must be freed even though `stream` is still retained. Cleanup is owned by
+        // the iterator, so this works; if the sequence held it, the query below would hang.
+        let stream = try await connection.queryStream(
+            "SELECT g FROM generate_series(1, 100000) g", chunkSize: 10)
+        var seen = 0
+        for try await _ in stream {
+            seen += 1
+            if seen == 5 { break }
+        }
+        XCTAssertEqual(seen, 5)
+
+        let answer = try await connection.query("SELECT 42 AS a").rows[0].decode("a", as: Int.self)
+        XCTAssertEqual(answer, 42)
+        withExtendedLifetime(stream) {}          // keep the sequence alive past the query above
+    }
+
     func testMidStreamErrorSurfacesAndConnectionUsable() async throws {
         let connection = try await PostgresConnection.connect(integrationConfiguration())
         defer { Task { try? await connection.close() } }
