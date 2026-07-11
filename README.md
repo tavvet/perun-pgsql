@@ -1,5 +1,7 @@
 # perun-pgsql
 
+[![CI](https://github.com/tavvet/perun-pgsql/actions/workflows/ci.yml/badge.svg)](https://github.com/tavvet/perun-pgsql/actions/workflows/ci.yml)
+
 **The PostgreSQL driver for the [Perun](#part-of-the-perun-framework) framework** —
 the wire protocol (v3), authentication, type codecs, TLS and a connection pool, all
 implemented from scratch in Swift. No PostgresNIO, no SwiftNIO. The only external
