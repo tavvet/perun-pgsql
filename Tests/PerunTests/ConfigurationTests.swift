@@ -64,6 +64,32 @@ final class ConfigurationTests: XCTestCase {
         }
     }
 
+    func testPoolWaitersFailFastWhenConnectFails() async {
+        // Point the pool at a refused port with more concurrent callers than maxConnections: the
+        // extra callers park as waiters. A connect failure decrements the open count but must also
+        // fail the waiters — otherwise they hang until cancellation. The test would time out if
+        // any waiter hung; instead every caller must fail quickly.
+        let configuration = ConnectionConfiguration(host: "127.0.0.1", port: 1,
+                                                    user: "x", database: "x", tlsMode: .disable,
+                                                    connectTimeout: .seconds(2))
+        let pool = PostgresClient(configuration: configuration, maxConnections: 2)
+        let start = ContinuousClock().now
+        let failures = await withTaskGroup(of: Bool.self) { group in
+            for _ in 0 ..< 6 {
+                group.addTask {
+                    do { _ = try await pool.query("SELECT 1"); return false }
+                    catch { return true }
+                }
+            }
+            var count = 0
+            for await failed in group where failed { count += 1 }
+            return count
+        }
+        XCTAssertEqual(failures, 6, "every caller should fail; none should hang")
+        XCTAssertLessThan(ContinuousClock().now - start, .seconds(10), "waiters must not hang")
+        await pool.shutdown()
+    }
+
     func testConnectToRefusedPortThrowsConnectionFailed() async {
         // A refused/unreachable host must surface as PerunError.connectionFailed — the internal
         // SocketError never leaks out of connect(), so callers see one error type.

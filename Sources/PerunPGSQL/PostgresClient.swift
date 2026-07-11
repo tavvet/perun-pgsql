@@ -35,6 +35,8 @@ public actor PostgresClient {
     private var waiters: [(id: UInt64, continuation: CheckedContinuation<PostgresConnection, Error>)] = []
     private var nextWaiterID: UInt64 = 0
     private var isShutDown = false
+    /// True while the background waiter pump is running, so at most one runs at a time.
+    private var waiterPumpRunning = false
     /// Reaps expired idle connections; started lazily when age-based recycling is enabled.
     private var reaperTask: Task<Void, Never>?
 
@@ -157,6 +159,11 @@ public actor PostgresClient {
                 return connection
             } catch {
                 openCount -= 1
+                // Concurrent callers may have parked as waiters while openCount was at capacity;
+                // the slot we just freed won't wake them on its own. Kick a background pump to
+                // hand it (and other freed slots) out — so waiters never hang — but return this
+                // caller's own error now, rather than making it drain a live, growing queue.
+                startWaiterPumpIfNeeded()
                 throw error
             }
         }
@@ -255,22 +262,42 @@ public actor PostgresClient {
     private func discardAndReplaceIfNeeded(_ connection: PostgresConnection) async {
         openCount -= 1
         try? await connection.close()
-        guard !isShutDown, !waiters.isEmpty, openCount < maxConnections else { return }
-        let waiter = waiters.removeFirst()
-        openCount += 1
-        do {
-            let replacement = try await PostgresConnection.connect(configuration)
-            if isShutDown {
-                openCount -= 1
-                try? await replacement.close()
-                waiter.continuation.resume(throwing: PerunError.clientShutdown)
-                return
+        startWaiterPumpIfNeeded()
+    }
+
+    /// Start the background waiter pump if it isn't already running and there is work for it. It
+    /// runs on its own task so no caller is turned into the pump for the whole (possibly
+    /// ever-growing) queue: a caller kicks it and returns immediately.
+    private func startWaiterPumpIfNeeded() {
+        guard !waiterPumpRunning, !isShutDown, !waiters.isEmpty, openCount < maxConnections else { return }
+        waiterPumpRunning = true
+        Task { await self.pumpWaiters() }
+    }
+
+    /// Hand freed slots to parked waiters, one at a time: open a fresh connection and pass it over,
+    /// or fail that waiter with the connect error and move on. This keeps draining as new waiters
+    /// arrive, so during an outage every waiter fails with the connect error instead of hanging,
+    /// and a reachable server fills up to `maxConnections`. Exits (and clears the running flag)
+    /// once the queue empties or capacity is reached; a later freed slot restarts it.
+    private func pumpWaiters() async {
+        while !isShutDown, !waiters.isEmpty, openCount < maxConnections {
+            let waiter = waiters.removeFirst()
+            openCount += 1
+            do {
+                let replacement = try await PostgresConnection.connect(configuration)
+                if isShutDown {
+                    openCount -= 1
+                    try? await replacement.close()
+                    waiter.continuation.resume(throwing: PerunError.clientShutdown)
+                    break
+                }
+                waiter.continuation.resume(returning: replacement)   // served; the slot stays in use
+            } catch {
+                openCount -= 1                                        // slot freed again; serve the next waiter
+                waiter.continuation.resume(throwing: error)
             }
-            waiter.continuation.resume(returning: replacement)
-        } catch {
-            openCount -= 1
-            waiter.continuation.resume(throwing: error)
         }
+        waiterPumpRunning = false
     }
 
     // MARK: - Age-based recycling
