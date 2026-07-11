@@ -130,10 +130,13 @@ enum BackendMessage: Sendable {
             return .copyDone
 
         case UInt8(ascii: "t"):
-            let count = try reader.readInt16()
+            // The parameter count is an unsigned 16-bit field, and Parse allows up to 65535
+            // parameters. Reading it signed would decode 32768…65535 as negative and silently
+            // drop every OID that follows.
+            let count = Int(UInt16(bitPattern: try reader.readInt16()))
             var oids: [Int32] = []
-            oids.reserveCapacity(max(0, Int(count)))
-            for _ in 0 ..< max(0, Int(count)) {
+            oids.reserveCapacity(count)
+            for _ in 0 ..< count {
                 oids.append(try reader.readInt32())
             }
             return .parameterDescription(oids)

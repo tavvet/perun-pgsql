@@ -309,8 +309,9 @@ public actor PostgresConnection {
     // so without this two overlapping calls from different tasks could interleave
     // their messages and corrupt the protocol stream.
 
-    /// Run one Simple Query request. The string may contain multiple
-    /// statements; the result reflects the last statement that produced rows.
+    /// Run one Simple Query request. The string may contain multiple statements; the returned
+    /// result is the last statement's — its rows and command tag together — matching libpq's
+    /// `PQexec`.
     @discardableResult
     public func query(_ sql: String) async throws -> QueryResult {
         try await acquireShared(); defer { releaseShared() }
@@ -1343,7 +1344,13 @@ public actor PostgresConnection {
     private func collectResults(initialColumns: [ColumnMetadata] = []) async throws -> QueryResult {
         var columns = initialColumns
         var rowValues: [[[UInt8]?]] = []
-        var commandTag = ""
+        // The most recently completed statement's result. A simple query may run several
+        // statements; snapshotting at each CommandComplete keeps a statement's rows and command
+        // tag together, so a trailing no-rows statement can't pair its tag with an earlier
+        // statement's rows.
+        var resultColumns = initialColumns
+        var resultRows: [[[UInt8]?]] = []
+        var resultTag = ""
         var pendingError: PostgresServerError?
         var copyMisuse: PerunError?
 
@@ -1358,10 +1365,18 @@ public actor PostgresConnection {
                 rowValues.append(values)
 
             case let .commandComplete(tag):
-                commandTag = tag
+                resultColumns = columns
+                resultRows = rowValues
+                resultTag = tag
+                columns = initialColumns          // reset for the next statement in the batch
+                rowValues = []
 
             case .emptyQueryResponse:
-                commandTag = ""
+                resultColumns = initialColumns
+                resultRows = []
+                resultTag = ""
+                columns = initialColumns
+                rowValues = []
 
             case .copyInResponse:
                 // A `COPY … FROM STDIN` was issued through query()/execute(): the server is
@@ -1420,7 +1435,7 @@ public actor PostgresConnection {
         if let pendingError {
             throw PerunError.server(pendingError)
         }
-        return QueryResult(columns: columns, values: rowValues, commandTag: commandTag)
+        return QueryResult(columns: resultColumns, values: resultRows, commandTag: resultTag)
     }
 
     // MARK: - Row streaming
@@ -1837,6 +1852,10 @@ public actor PostgresConnection {
     /// read — e.g. a `waitForNotifications` loop parked waiting for the next
     /// notification — so a listening connection can always be shut down.
     public func close() async throws {
+        // Send Terminate before dropping the socket so the server does a clean backend exit
+        // instead of logging "unexpected EOF on client connection". Best-effort — if the wire
+        // is already broken this just fails and we force-close anyway.
+        if !isClosed { try? await send(FrontendMessage.terminate()) }
         forceClose()
     }
 
