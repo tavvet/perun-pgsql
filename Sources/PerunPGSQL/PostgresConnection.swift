@@ -46,6 +46,9 @@ public struct ConnectionConfiguration: Sendable {
     /// Which authentication methods to accept from the server. Defaults to `.any`; tighten it
     /// to forbid a cleartext/md5 downgrade when running under a relaxed TLS mode.
     public var authenticationRequirement: AuthenticationRequirement
+    /// Bound on establishing the TCP connection (nil = the OS default, ~75 s). Defaults to
+    /// 10 seconds, so a blackholed host fails fast instead of pinning a pool slot.
+    public var connectTimeout: Duration?
     /// Reject any backend message whose payload exceeds this many bytes. Bounds
     /// memory against a malicious or buggy server that declares a huge length.
     /// Defaults to 256 MiB.
@@ -67,6 +70,7 @@ public struct ConnectionConfiguration: Sendable {
                 password: String? = nil,
                 tlsMode: TLSMode = .verifyFull,
                 authenticationRequirement: AuthenticationRequirement = .any,
+                connectTimeout: Duration? = .seconds(10),
                 maxMessageSize: Int = 256 * 1024 * 1024,
                 notificationBufferLimit: Int = 1024,
                 runtimeParameters: [String: String] = [:]) {
@@ -78,6 +82,7 @@ public struct ConnectionConfiguration: Sendable {
         self.password = password
         self.tlsMode = tlsMode
         self.authenticationRequirement = authenticationRequirement
+        self.connectTimeout = connectTimeout
         self.maxMessageSize = maxMessageSize
         self.notificationBufferLimit = notificationBufferLimit
         self.runtimeParameters = runtimeParameters
@@ -151,6 +156,8 @@ public actor PostgresConnection {
     /// Remembered so `cancelCurrentQuery` can open a fresh connection.
     private let host: String
     private let port: UInt16
+    /// Connect timeout, reused when `sendCancelRequest` opens its own socket.
+    private let connectTimeout: Duration?
     /// Reject backend messages whose payload exceeds this many bytes (DoS guard).
     private let maxMessageSize: Int
     /// Process-local identity used to keep prepared-statement handles scoped to
@@ -204,6 +211,7 @@ public actor PostgresConnection {
                  ioQueue: DispatchQueue,
                  host: String,
                  port: UInt16,
+                 connectTimeout: Duration?,
                  maxMessageSize: Int,
                  notificationBufferLimit: Int) {
         self.fd = fd
@@ -211,6 +219,7 @@ public actor PostgresConnection {
         self.readQueue = DispatchQueue(label: "perun.connection.read")
         self.host = host
         self.port = port
+        self.connectTimeout = connectTimeout
         self.maxMessageSize = maxMessageSize
         self.connectionID = UInt64.random(in: UInt64.min ... UInt64.max)
         self.createdAt = ContinuousClock().now
@@ -229,14 +238,16 @@ public actor PostgresConnection {
         let ioQueue = DispatchQueue(label: "perun.connection.io")
         let fd: Int32
         do {
+            let timeout = configuration.connectTimeout
             fd = try await withBlockingIO(on: ioQueue) {
-                try SystemSocket.makeConnected(host: configuration.host, port: configuration.port)
+                try SystemSocket.makeConnected(host: configuration.host, port: configuration.port, timeout: timeout)
             }
         } catch let error as SocketError {
             throw PerunError.connectionFailed(error.description)   // one error type out of connect: PerunError
         }
         let connection = PostgresConnection(fd: fd, ioQueue: ioQueue,
                                             host: configuration.host, port: configuration.port,
+                                            connectTimeout: configuration.connectTimeout,
                                             maxMessageSize: configuration.maxMessageSize,
                                             notificationBufferLimit: configuration.notificationBufferLimit)
         do {
@@ -739,8 +750,9 @@ public actor PostgresConnection {
         // A dedicated queue and a *separate* socket: this connection may be parked in a
         // blocking recv waiting for the very query we're trying to cancel.
         let cancelQueue = DispatchQueue(label: "perun.cancel")
+        let timeout = connectTimeout
         try await withBlockingIO(on: cancelQueue) {
-            let fd = try SystemSocket.makeConnected(host: host, port: port)
+            let fd = try SystemSocket.makeConnected(host: host, port: port, timeout: timeout)
             defer { SystemSocket.disconnect(fd: fd) }
             try SystemSocket.sendAll(fd: fd,
                                      FrontendMessage.cancelRequest(processID: processID, secretKey: secretKey))

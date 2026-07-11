@@ -45,8 +45,11 @@ private func errnoString(_ code: Int32) -> String {
 /// actor / continuation boundary.
 enum SystemSocket {
 
-    /// Resolve `host`/`port` and open a connected TCP socket, returning its fd.
-    static func makeConnected(host: String, port: UInt16) throws -> Int32 {
+    /// Resolve `host`/`port` and open a connected TCP socket, returning its fd. A non-nil
+    /// `timeout` bounds each address's connect attempt (via a non-blocking connect + poll), so a
+    /// blackholed host fails in bounded time instead of hanging on the OS default (~75 s); nil
+    /// uses the OS default. The returned fd is left in blocking mode.
+    static func makeConnected(host: String, port: UInt16, timeout: Duration?) throws -> Int32 {
         var hints = addrinfo()
         hints.ai_family = AF_UNSPEC          // IPv4 or IPv6
         #if canImport(Darwin)
@@ -83,14 +86,67 @@ enum SystemSocket {
                        socklen_t(MemoryLayout<Int32>.size))
             #endif
 
-            if connect(fd, info.pointee.ai_addr, info.pointee.ai_addrlen) == 0 {
-                return fd
+            do {
+                if try connectOne(fd: fd, address: info.pointee.ai_addr,
+                                  length: info.pointee.ai_addrlen, timeout: timeout) {
+                    return fd
+                }
+                lastReason = "timed out"
+            } catch let error as SocketError {
+                if case let .connectionFailed(_, _, reason) = error { lastReason = reason }
             }
-            lastReason = errnoString(errno)
             close(fd)
             candidate = info.pointee.ai_next
         }
         throw SocketError.connectionFailed(host: host, port: port, reason: lastReason)
+    }
+
+    /// Connect `fd` to one resolved address. With a `timeout`, uses a non-blocking connect and
+    /// polls for completion, so the attempt can't outlast the deadline; the fd is returned to
+    /// blocking mode either way. Returns false on timeout; throws on a connect error.
+    private static func connectOne(fd: Int32,
+                                   address: UnsafeMutablePointer<sockaddr>,
+                                   length: socklen_t,
+                                   timeout: Duration?) throws -> Bool {
+        guard let timeout else {
+            if connect(fd, address, length) == 0 { return true }
+            throw SocketError.connectionFailed(host: "", port: 0, reason: errnoString(errno))
+        }
+
+        let flags = fcntl(fd, F_GETFL, 0)
+        _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+        defer { _ = fcntl(fd, F_SETFL, flags) }          // restore blocking mode for steady-state I/O
+
+        if connect(fd, address, length) == 0 { return true }   // connected immediately (e.g. localhost)
+        guard errno == EINPROGRESS else {
+            throw SocketError.connectionFailed(host: "", port: 0, reason: errnoString(errno))
+        }
+
+        var pfd = pollfd(fd: fd, events: Int16(truncatingIfNeeded: POLLOUT), revents: 0)
+        let ready: Int32 = {
+            while true {
+                let r = poll(&pfd, 1, pollTimeoutMillis(timeout))
+                if r < 0 && errno == EINTR { continue }
+                return r
+            }
+        }()
+        guard ready > 0 else { return false }            // 0 = timed out; <0 = poll error → treat as failure
+
+        var soError: Int32 = 0
+        var errorLength = socklen_t(MemoryLayout<Int32>.size)
+        getsockopt(fd, SOL_SOCKET, SO_ERROR, &soError, &errorLength)
+        guard soError == 0 else {
+            throw SocketError.connectionFailed(host: "", port: 0, reason: errnoString(soError))
+        }
+        return true
+    }
+
+    /// A `Duration` as a `poll` timeout in whole milliseconds, clamped to `Int32` and ≥ 0.
+    private static func pollTimeoutMillis(_ duration: Duration) -> Int32 {
+        let (seconds, attoseconds) = duration.components
+        let millis = seconds * 1000 + attoseconds / 1_000_000_000_000_000
+        if millis <= 0 { return 0 }
+        return millis > Int64(Int32.max) ? Int32.max : Int32(millis)
     }
 
     /// Write every byte of `bytes`, looping over partial writes.
