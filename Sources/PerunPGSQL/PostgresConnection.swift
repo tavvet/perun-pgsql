@@ -1016,9 +1016,10 @@ public actor PostgresConnection {
                 }
 
             case .copyOutResponse:
+                // Drain rather than cancel (see collectResults): a stray async CancelRequest
+                // could land on the next query once this connection is reused.
                 if copyMisuse == nil {
                     copyMisuse = PerunError.copyMismatch("COPY is not supported inside a pipeline")
-                    try? await sendCancelRequest()
                 }
 
             case let .parameterStatus(name, value):
@@ -1396,12 +1397,15 @@ public actor PostgresConnection {
 
             case .copyOutResponse:
                 // A `COPY … TO STDOUT` was issued through query()/execute(): its rows arrive as
-                // CopyData these paths would silently discard (returning an empty result). Stop
-                // the server, drain to ReadyForQuery, and report the misuse.
+                // CopyData these paths would silently discard (returning an empty result). Just
+                // drain them to ReadyForQuery (below) and report the misuse. We deliberately do
+                // NOT send a CancelRequest: a short COPY can finish before the async cancel
+                // reaches the backend, and the stray cancel would then land on whatever query
+                // runs next on this (reusable) connection. The relation is finite, so the drain
+                // terminates on its own.
                 if copyMisuse == nil {
                     copyMisuse = PerunError.copyMismatch(
                         "COPY … TO STDOUT must be run with copyOut(_:), not query()/execute()")
-                    try? await sendCancelRequest()
                 }
 
             case let .parameterStatus(name, value):
@@ -1789,9 +1793,10 @@ public actor PostgresConnection {
             case .copyInResponse:
                 return                           // the server is ready to receive CopyData
             case .copyOutResponse:
-                // Wrong direction: a COPY … TO STDOUT. The server is now streaming to us (it
-                // could be the whole relation) — cancel it, drain, then surface the error.
-                try? await sendCancelRequest()
+                // Wrong direction: a COPY … TO STDOUT. The server streams the (finite) relation
+                // to us — drain it to ReadyForQuery, then surface the error. We don't send a
+                // CancelRequest: a short COPY can finish first, and the stray async cancel would
+                // then land on the next query once this connection is reused.
                 try await drainToReadyForQuery()
                 throw PerunError.copyMismatch("copyIn needs a COPY … FROM STDIN statement, not TO STDOUT")
             case let .errorResponse(error):
