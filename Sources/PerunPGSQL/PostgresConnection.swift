@@ -454,8 +454,15 @@ public actor PostgresConnection {
             try await send(FrontendMessage.query(sql))
             // Cancellable like copyIn's handshake: a COPY parked before CopyOutResponse (e.g. on a
             // table lock) must not hold the wire uninterruptibly — a cancel fires a CancelRequest
-            // and the response drains to ReadyForQuery.
-            try await runInlineCancellable { try await self.readCopyOutResponse() }
+            // and the response drains to ReadyForQuery. If instead the handshake *succeeded* and the
+            // cancel lands in the race window before copyOutActive is set, the server is about to
+            // stream CopyData that can't be stopped in band (and a CancelRequest may already be in
+            // flight), so tear the connection down rather than leave rows on the wire.
+            try await runInlineCancellable {
+                try await self.readCopyOutResponse()
+            } onCancelledAfterSuccess: {
+                self.forceClose()
+            }
             copyOutActive = true
             copyOutGeneration += 1
             copyOutTerminating = false
@@ -492,7 +499,15 @@ public actor PostgresConnection {
             // table lock, say) or a slow post-CopyDone completion would otherwise hold the wire
             // uninterruptibly. A cancel fires a CancelRequest, the server aborts, and the response
             // drains to ReadyForQuery — the connection stays reusable and the caller sees the cancel.
-            try await runInlineCancellable { try await self.readCopyInResponse() }
+            // If instead the handshake *succeeded* and the cancel lands in the race window before
+            // copyInActive is set, the server is now in copy-in mode; abandoning that would leave the
+            // wire mid-COPY (and a CancelRequest may already be in flight), so tear the connection
+            // down rather than hand it back desynchronised.
+            try await runInlineCancellable {
+                try await self.readCopyInResponse()
+            } onCancelledAfterSuccess: {
+                self.forceClose()
+            }
 
             copyInActive = true
             copyInGeneration += 1
@@ -674,7 +689,15 @@ public actor PostgresConnection {
     /// `CancellationError`. The `generation` guard stops a late cancel from hitting a later
     /// inline op. Only the transaction *body* is wrapped — BEGIN/COMMIT/ROLLBACK run
     /// uncancellable, so a timed-out transaction still rolls back cleanly.
-    private func runInlineCancellable<T: Sendable>(_ body: () async throws -> T) async throws -> T {
+    /// - Parameter onCancelledAfterSuccess: run when `body` *succeeded* but the task was cancelled,
+    ///   so its result is about to be discarded. For a plain query the wire is already back at
+    ///   ReadyForQuery, so nothing is needed (the default). A COPY handshake, though, leaves the
+    ///   server in copy mode on success — abandoning that would desynchronise the wire — so the
+    ///   caller uses this to clean up (tear the connection down) rather than hand it back mid-COPY.
+    private func runInlineCancellable<T: Sendable>(
+        _ body: () async throws -> T,
+        onCancelledAfterSuccess: () async -> Void = {}
+    ) async throws -> T {
         inlineReadGeneration += 1
         let generation = inlineReadGeneration
         let outcome: Result<T, Error> = await withTaskCancellationHandler {
@@ -683,7 +706,10 @@ public actor PostgresConnection {
         } onCancel: {
             Task { await self.cancelInlineInFlight(generation: generation) }
         }
-        if Task.isCancelled { throw CancellationError() }
+        if Task.isCancelled {
+            if case .success = outcome { await onCancelledAfterSuccess() }
+            throw CancellationError()
+        }
         return try outcome.get()
     }
 
