@@ -1969,13 +1969,21 @@ public actor PostgresConnection {
         failAllAccessWaiters(PerunError.connectionClosed)  // and everyone parked for wire access
         let fd = self.fd
         let tls = self.tls
+        let readQueue = self.readQueue
         self.tls = nil
-        // Shut the socket down from here so any recv parked on readQueue returns;
-        // otherwise the teardown dispatched below would queue behind it forever.
+        // Shut the socket down from here so any recv parked on readQueue (or send parked on
+        // ioQueue) returns; otherwise the teardown dispatched below would queue behind it.
         SystemSocket.shutdownBoth(fd: fd)
-        readQueue.async {
-            tls?.close()
-            SystemSocket.disconnect(fd: fd)
+        // Free the TLS engine and the fd only after both I/O queues have drained: hop
+        // ioQueue → readQueue so any already-dispatched write finishes before the fd is
+        // closed, otherwise a queued write could land on a descriptor the OS has since reused.
+        // `isClosed` is already set, so no new writes are dispatched; `tls.close()` is
+        // internally locked, so it can't race an in-flight SSL_read/SSL_write.
+        ioQueue.async {
+            readQueue.async {
+                tls?.close()
+                SystemSocket.disconnect(fd: fd)
+            }
         }
     }
 
@@ -1987,10 +1995,14 @@ public actor PostgresConnection {
         notificationContinuation.finish()
         let fd = self.fd
         let tls = self.tls
+        let readQueue = self.readQueue
+        let ioQueue = self.ioQueue
         SystemSocket.shutdownBoth(fd: fd)
-        readQueue.async {
-            tls?.close()
-            SystemSocket.disconnect(fd: fd)
+        ioQueue.async {
+            readQueue.async {
+                tls?.close()
+                SystemSocket.disconnect(fd: fd)
+            }
         }
     }
 }
