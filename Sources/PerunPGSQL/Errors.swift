@@ -204,6 +204,10 @@ public enum PerunError: Error, CustomStringConvertible, Sendable {
     case tlsNotAvailable
     /// An operation was requested on a pool that has been shut down.
     case clientShutdown
+    /// A binary parameter's wire type doesn't match the type the server inferred for that
+    /// placeholder when the statement was prepared. `Bind` carries no type OIDs, so the server
+    /// would decode the bytes as the inferred type — pass a matching type or use text parameters.
+    case parameterTypeMismatch(parameter: Int, expected: Int32, actual: Int32)
     /// More parameters than the protocol's unsigned 16-bit count field allows (max 65535).
     case tooManyParameters(count: Int)
     /// A prepared-statement handle was used on a different connection than the
@@ -247,6 +251,9 @@ public enum PerunError: Error, CustomStringConvertible, Sendable {
             return "server does not support TLS but it was required"
         case .clientShutdown:
             return "the connection pool has been shut down"
+        case let .parameterTypeMismatch(parameter, expected, actual):
+            return "parameter \(parameter) is encoded as OID \(actual) but the prepared statement "
+                + "expects OID \(expected); pass a matching type or use text parameters"
         case let .tooManyParameters(count):
             return "too many parameters: \(count) (PostgreSQL allows at most 65535 per statement)"
         case .preparedStatementConnectionMismatch:
@@ -275,7 +282,8 @@ extension PerunError {
              .tlsIO, .tlsNotAvailable, .authenticationFailed, .unsupportedAuthentication:
             return true
         case .server, .unexpectedNull, .columnNotFound, .decodingFailed, .tooManyParameters,
-             .clientShutdown, .preparedStatementConnectionMismatch, .copyMismatch, .timedOut:
+             .clientShutdown, .preparedStatementConnectionMismatch, .copyMismatch, .timedOut,
+             .parameterTypeMismatch:
             return false
         }
     }

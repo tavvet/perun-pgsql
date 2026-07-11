@@ -462,6 +462,7 @@ public actor PostgresConnection {
                         parameterFormat: PostgresFormat = .text,
                         resultFormat: PostgresFormat = .text) async throws -> QueryResult {
         try validatePreparedStatement(statement)
+        try validateBinaryParameterTypes(statement, parameters, parameterFormat: parameterFormat)
         try await acquireShared(); defer { releaseShared() }
         let request = try FrontendMessage.execute(statement: statement.name, parameters: parameters,
                                                   parameterFormat: parameterFormat, resultFormat: resultFormat)
@@ -488,6 +489,7 @@ public actor PostgresConnection {
                          parameterFormat: PostgresFormat = .text,
                          resultFormat: PostgresFormat = .text) async throws -> [QueryResult] {
         try validatePreparedStatement(statement)
+        for set in parameterSets { try validateBinaryParameterTypes(statement, set, parameterFormat: parameterFormat) }
         guard !parameterSets.isEmpty else { return [] }
         try await acquireShared(); defer { releaseShared() }
         return try await runPipelinedExecute(statement, parameterSets,
@@ -504,6 +506,7 @@ public actor PostgresConnection {
                                       parameterFormat: PostgresFormat = .text,
                                       resultFormat: PostgresFormat = .text) async throws -> [Result<QueryResult, Error>] {
         try validatePreparedStatement(statement)
+        for set in parameterSets { try validateBinaryParameterTypes(statement, set, parameterFormat: parameterFormat) }
         guard !parameterSets.isEmpty else { return [] }
         try await acquireShared(); defer { releaseShared() }
         return try await runPipelinedExecuteIndependently(statement, parameterSets,
@@ -847,6 +850,7 @@ public actor PostgresConnection {
                             parameterFormat: PostgresFormat,
                             resultFormat: PostgresFormat) async throws -> QueryResult {
         try validatePreparedStatement(statement)
+        try validateBinaryParameterTypes(statement, parameters, parameterFormat: parameterFormat)
         try await send(try FrontendMessage.execute(statement: statement.name,
                                                    parameters: parameters,
                                                    parameterFormat: parameterFormat,
@@ -1021,6 +1025,28 @@ public actor PostgresConnection {
     private func validatePreparedStatement(_ statement: PreparedStatement) throws {
         guard statement.connectionID == connectionID else {
             throw PerunError.preparedStatementConnectionMismatch
+        }
+    }
+
+    /// `Bind` carries no parameter type OIDs, so a binary parameter is decoded by the server as
+    /// the type it inferred for that placeholder at `Parse` time. Reject a value whose wire type
+    /// differs (e.g. a `Double` bound to a `bigint` parameter), which the server would otherwise
+    /// silently reinterpret whenever the widths happen to match. Only binary values are checked —
+    /// a text fallback is parsed type-agnostically, and a placeholder the server left untyped
+    /// (OID 0) accepts anything.
+    private func validateBinaryParameterTypes(_ statement: PreparedStatement,
+                                              _ parameters: [(any PostgresEncodable)?],
+                                              parameterFormat: PostgresFormat) throws {
+        guard parameterFormat == .binary else { return }
+        for (index, parameter) in parameters.enumerated() {
+            guard let parameter, index < statement.parameterTypeOIDs.count else { continue }
+            let expected = statement.parameterTypeOIDs[index]
+            guard expected != 0, parameter.postgresBinary() != nil else { continue }
+            guard parameter.postgresTypeOID == expected else {
+                throw PerunError.parameterTypeMismatch(parameter: index + 1,
+                                                       expected: expected,
+                                                       actual: parameter.postgresTypeOID)
+            }
         }
     }
 
