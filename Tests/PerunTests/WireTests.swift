@@ -32,6 +32,17 @@ final class WireTests: XCTestCase {
         XCTAssertEqual(FrontendMessage.sync(), [0x53, 0x00, 0x00, 0x00, 0x04])
     }
 
+    // An embedded NUL in a startup field would smuggle extra startup parameters into the
+    // unframed packet; the builder must reject it rather than encode it.
+    func testStartupRejectsEmbeddedNUL() {
+        XCTAssertThrowsError(try FrontendMessage.startup(user: "app\u{0}options", database: "db"))
+        XCTAssertThrowsError(try FrontendMessage.startup(user: "app", database: "db\u{0}-c x=y"))
+        XCTAssertThrowsError(try FrontendMessage.startup(user: "app", database: "db",
+                                                         parameters: ["application_name": "a\u{0}b"]))
+        XCTAssertNoThrow(try FrontendMessage.startup(user: "app", database: "db",
+                                                     parameters: ["application_name": "perun"]))
+    }
+
     func testParseWithoutParameterTypes() throws {
         let message = try FrontendMessage.parse(statement: "", query: "SELECT 1")
         let expected: [UInt8] = [

@@ -25,7 +25,18 @@ enum FrontendMessage {
     /// ending with an empty key.
     static func startup(user: String,
                         database: String,
-                        parameters: [String: String] = [:]) -> [UInt8] {
+                        parameters: [String: String] = [:]) throws -> [UInt8] {
+        // The startup packet is an unframed, NUL-delimited key/value list, so an embedded NUL
+        // in any field terminates it early and lets the trailing bytes be parsed as extra
+        // startup parameters (e.g. `options`, which accepts `-c GUC=…`). Reject it up front.
+        // Framed messages are length-prefixed, so the server itself rejects a smuggled NUL there.
+        try requireNoInteriorNUL(user, "startup user")
+        try requireNoInteriorNUL(database, "startup database")
+        for (key, value) in parameters {
+            try requireNoInteriorNUL(key, "startup parameter name")
+            try requireNoInteriorNUL(value, "startup parameter \"\(key)\"")
+        }
+
         var body = ByteWriter()
         body.writeInt32(protocolVersion)
         body.writeCString("user")
@@ -42,6 +53,13 @@ enum FrontendMessage {
         message.writeInt32(Int32(body.bytes.count + 4))
         message.writeBytes(body.bytes)
         return message.bytes
+    }
+
+    /// Reject a string with an interior NUL before it goes into a NUL-terminated wire field.
+    static func requireNoInteriorNUL(_ value: String, _ field: String) throws {
+        guard !value.utf8.contains(0) else {
+            throw PerunError.protocolViolation("\(field) contains an embedded NUL byte")
+        }
     }
 
     /// `SSLRequest`: sent before the startup message to ask the server to switch

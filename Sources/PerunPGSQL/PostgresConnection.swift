@@ -1757,7 +1757,7 @@ public actor PostgresConnection {
         for (key, value) in Self.pinnedParameters where !callerGUCs.contains(key.lowercased()) {
             startupParameters[key] = value
         }
-        let startupMessage = FrontendMessage.startup(
+        let startupMessage = try FrontendMessage.startup(
             user: configuration.user,
             database: configuration.database,
             parameters: startupParameters
