@@ -49,9 +49,59 @@ final class CopyIntegrationTests: XCTestCase {
         }
         XCTAssertEqual(chunks, 3)
 
-        // The abandon path cancelled the COPY server-side and freed the wire.
+        // The break drained the (small) remainder within copyResyncTimeout and freed the wire — no
+        // CancelRequest — so the connection stays usable.
         let answer = try await connection.query("SELECT 42 AS a").rows[0].decode("a", as: Int.self)
         XCTAssertEqual(answer, 42)
+    }
+
+    func testBrokenCopyOutDoesNotCancelTheNextQuery() async throws {
+        // Breaking out of a copyOut must fire no CancelRequest. A CancelRequest is async and
+        // per-backend: with a tiny relation the COPY finishes streaming before the cancel's socket
+        // even connects, so the stray cancel lands on whatever runs next — here a pg_sleep, which
+        // gives it a wide window to strike (a spurious 57014). With the fix (drain, no cancel) the
+        // follow-up query runs untouched.
+        let connection = try await PostgresConnection.connect(integrationConfiguration())
+        defer { Task { try? await connection.close() } }
+        _ = try await connection.query(
+            "CREATE TEMP TABLE copy_leak AS SELECT g AS id FROM generate_series(1, 5) g")
+
+        var chunks = 0
+        for try await _ in try await connection.copyOut("COPY copy_leak TO STDOUT") {
+            chunks += 1
+            if chunks == 1 { break }
+        }
+        // A slow statement the stray cancel would strike if the break fired one.
+        let n = try await connection.query("SELECT 7 AS n FROM pg_sleep(1)").rows[0].decode("n", as: Int.self)
+        XCTAssertEqual(n, 7, "a broken copyOut leaked a CancelRequest onto the next query")
+    }
+
+    func testCopyOutBreakOnHugeStreamClosesRatherThanDrainingItAll() async throws {
+        // A physical table streams CopyData immediately after CopyOutResponse (a generate_series
+        // subquery would materialize first), so a remainder too large to drain within the resync
+        // timeout must close+discard the connection rather than read the whole relation.
+        let connection = try await PostgresConnection.connect(integrationConfiguration())
+        defer { Task { try? await connection.close() } }
+        await connection.setCopyResyncTimeout(.milliseconds(50))
+        _ = try await connection.query(
+            "CREATE TEMP TABLE copy_huge AS SELECT g AS id FROM generate_series(1, 2000000) g")
+
+        var chunks = 0
+        for try await _ in try await connection.copyOut("COPY copy_huge TO STDOUT") {
+            chunks += 1
+            if chunks == 3 { break }
+        }
+
+        // The break gave up on the huge remainder and tore the connection down, so a follow-up fails
+        // promptly as closed — it must not hang draining millions of rows.
+        do {
+            _ = try await withTimeout(.seconds(5)) { try await connection.query("SELECT 1").rows }
+            XCTFail("expected the connection closed after abandoning a huge copyOut")
+        } catch let error as PerunError {
+            guard case .connectionClosed = error else {
+                return XCTFail("expected connectionClosed, got \(error)")
+            }
+        }
     }
 
     func testCopyOutRejectsNonCopyStatement() async throws {

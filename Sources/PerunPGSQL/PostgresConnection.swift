@@ -1745,13 +1745,37 @@ public actor PostgresConnection {
     //
     // A `COPY … TO STDOUT` streams `CopyData` under exclusive access, read inline like a
     // stream — but with no chunk requests: the server sends CopyData until CopyDone, then
-    // CommandComplete and ReadyForQuery (Simple Query, so no Sync). The same cancellation
-    // and abandon handling as row streaming, using a `CancelRequest` to stop the server.
+    // CommandComplete and ReadyForQuery (Simple Query, so no Sync). A consumer that *breaks* out
+    // drains the remainder (bounded, keep-if-cheap); a consumer that is *cancelled* shuts the socket
+    // and discards the connection — no `CancelRequest`, which is async and could hit the next query.
 
     private var copyOutActive = false
     private var copyOutTerminating = false
     private var copyOutPendingError: PostgresServerError?
     private var copyOutGeneration: UInt64 = 0
+
+    /// How long a *break* out of a copyOut may spend draining the server's remaining stream to keep
+    /// the connection reusable. A small remainder finishes well under this; a large or slow one hits
+    /// it and the connection is closed+discarded instead. Task *cancellation* doesn't drain at all.
+    /// Internal, not public config — it governs one rare abandonment path and can be promoted to
+    /// configuration additively if real demand appears.
+    private static let defaultCopyResyncTimeout: Duration = .seconds(5)
+    private var copyResyncTimeout: Duration {
+        #if DEBUG
+        return copyResyncTimeoutOverride ?? Self.defaultCopyResyncTimeout
+        #else
+        return Self.defaultCopyResyncTimeout
+        #endif
+    }
+    #if DEBUG
+    private var copyResyncTimeoutOverride: Duration?
+    func setCopyResyncTimeout(_ timeout: Duration) { copyResyncTimeoutOverride = timeout }
+    /// Test seam: invoked in `nextCopyData` after the pre-read cancellation check but before the
+    /// read, so a test can park there, cancel, and release — landing the cancel in the read window
+    /// deterministically instead of racing `Task.sleep`.
+    private var copyOutBeforeReadTestHook: (@Sendable () async -> Void)?
+    func setCopyOutBeforeReadTestHook(_ hook: @escaping @Sendable () async -> Void) { copyOutBeforeReadTestHook = hook }
+    #endif
 
     /// Consume the `CopyOutResponse` handshake after a `COPY … TO STDOUT` query. Drains to
     /// ReadyForQuery and throws if the statement errored or wasn't a COPY TO STDOUT.
@@ -1791,17 +1815,22 @@ public actor PostgresConnection {
         // reads nothing and can't tear down a copy that has since reused the connection.
         guard copyOutActive, copyOutGeneration == generation else { return nil }
         if Task.isCancelled {
-            await finishCopyOut(generation: generation)   // fires the CancelRequest itself, then drains
+            abandonCopyOutOnCancellation(generation: generation)   // discard promptly — no drain, no cancel
             throw CancellationError()
         }
+        #if DEBUG
+        await copyOutBeforeReadTestHook?()   // no-op unless a test installed a seam
+        #endif
         let outcome: Result<[UInt8]?, Error> = await withTaskCancellationHandler {
             do { return .success(try await readNextCopyData()) }
             catch { return .failure(error) }
         } onCancel: {
-            Task { await self.cancelCopyOutInFlight(generation: generation) }
+            // Interrupt the parked read by tearing the connection down — forceClose's shutdown wakes
+            // the recv. Hop to the actor and guard on generation; never shut an fd from onCancel raw.
+            Task { await self.abandonCopyOutOnCancellation(generation: generation) }
         }
         if Task.isCancelled {
-            await finishCopyOut(generation: generation)   // idempotent; cleans up if a chunk raced the cancel
+            abandonCopyOutOnCancellation(generation: generation)   // idempotent if a chunk raced the cancel
             throw CancellationError()
         }
         return try outcome.get()
@@ -1850,34 +1879,37 @@ public actor PostgresConnection {
         }
     }
 
-    /// The consumer abandoned the copy (its `deinit`) or cancelled it. Stop the server with a
-    /// `CancelRequest` — it would otherwise stream the whole relation — then drain to
-    /// ReadyForQuery and free the wire. Idempotent. The `generation` guard makes a late `deinit`
-    /// a no-op once *this* copy has ended, so a stale cleanup can never tear down a newer copy
-    /// that has since reused the connection.
+    /// The consumer *broke out of* the copy (its `deinit`), rather than cancelling. Drain the
+    /// server's remaining stream to resync and keep the connection — but bounded by
+    /// `copyResyncTimeout`: a small remainder drains fast and the connection stays reusable; a large
+    /// or slow one hits the bound and it is closed+discarded. No `CancelRequest` — it is async and
+    /// per-backend and could strike the *next* borrower's query. Idempotent; the `generation` guard
+    /// makes a late `deinit` a no-op once this copy has ended, so it can't tear down a newer copy.
     func finishCopyOut(generation: UInt64) async {
         guard copyOutActive, copyOutGeneration == generation else { return }
         copyOutTerminating = true
-        await cancelCopyOutInFlight(generation: generation)
-        do {
-            while copyOutActive {
-                switch try await readMessage() {
-                case let .readyForQuery(status):
-                    transactionStatus = status
-                    endCopyOut()
-                case let .parameterStatus(name, value):
-                    parameters[name] = value
-                case let .noticeResponse(notice):
-                    noticeHandler?(notice)
-                case let .notificationResponse(processID, channel, payload):
-                    notificationContinuation.yield(
-                        PostgresNotification(processID: processID, channel: channel, payload: payload))
-                default:
-                    continue                     // discard remaining CopyData / CopyDone / CommandComplete / error
-                }
-            }
-        } catch {
-            if !isClosed { forceClose() }
+        let fd = self.fd
+        let capped = min(max(copyResyncTimeout, .zero), .seconds(Int64(Int32.max)))
+        let deadline = ContinuousClock().now + capped
+        // Two bounds: `drainToReadyForQuery`'s in-loop deadline stops a fast *streaming* drain; the
+        // watchdog's shutdown unblocks a *stalled* read. Mirrors connect()'s watchdog — cancel AND
+        // await its value before any forceClose (so it can never shut a reused fd), and a fired
+        // watchdog forces a discard even if the drain "reached" ReadyForQuery on the dead socket.
+        let watchdog = Task<Bool, Never> {
+            do { try await Task.sleep(for: capped) } catch { return false }
+            SystemSocket.shutdownBoth(fd: fd)
+            return true
+        }
+        func stopWatchdog() async -> Bool { watchdog.cancel(); return await watchdog.value }
+
+        var resynced = false
+        do { try await drainToReadyForQuery(deadline: deadline); resynced = true }
+        catch { /* deadline, watchdog shutdown, or transport error → discard below */ }
+        let fired = await stopWatchdog()
+        if resynced, !fired {
+            endCopyOut()                          // reached ReadyForQuery on a healthy socket: reusable
+        } else {
+            if !isClosed { forceClose() }         // large/slow remainder, or the watchdog shut it: discard
             copyOutActive = false
         }
     }
@@ -1890,9 +1922,15 @@ public actor PostgresConnection {
         unlock()
     }
 
-    private func cancelCopyOutInFlight(generation: UInt64) async {
-        guard !isClosed, copyOutActive, copyOutGeneration == generation else { return }
-        try? await sendCancelRequest()
+    /// Abandon an in-flight copyOut because the consuming task was cancelled: tear the connection
+    /// down and discard it — promptly, no drain and no `CancelRequest`. `forceClose`'s synchronous
+    /// `shutdownBoth` unblocks a read parked in `recv`. Guarded on generation so a stale cancel can't
+    /// tear down a newer copy that reused the connection. (A plain break/deinit takes the bounded
+    /// `finishCopyOut` drain instead, which keeps the connection when the remainder is cheap.)
+    private func abandonCopyOutOnCancellation(generation: UInt64) {
+        guard copyOutActive, copyOutGeneration == generation else { return }
+        if !isClosed { forceClose() }
+        copyOutActive = false
     }
 
     // MARK: - COPY IN (client → server)
@@ -1962,9 +2000,14 @@ public actor PostgresConnection {
     }
 
     /// Read and discard messages until ReadyForQuery, keeping session parameters and
-    /// notifications current. Resynchronises the wire after aborting a COPY.
-    private func drainToReadyForQuery() async throws {
+    /// notifications current. Resynchronises the wire after aborting a COPY. With a `deadline`, a
+    /// fast *streaming* drain gives up with `timedOut` once it passes (a *stalled* read, parked in
+    /// `readMessage`, needs an out-of-band socket shutdown to unblock — the caller's watchdog).
+    private func drainToReadyForQuery(deadline: ContinuousClock.Instant? = nil) async throws {
         while true {
+            if let deadline, ContinuousClock().now >= deadline {
+                throw PerunError.timedOut
+            }
             switch try await readMessage() {
             case let .readyForQuery(status):
                 transactionStatus = status

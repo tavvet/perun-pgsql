@@ -196,6 +196,50 @@ final class CancellationIntegrationTests: XCTestCase {
         try await cleanup.close()
     }
 
+    func testCopyOutTaskCancellationTearsDownWithoutCancelRequest() async throws {
+        // A *cancelled* copyOut (unlike a plain break) must tear the connection down promptly — no
+        // drain, no CancelRequest — so control returns at once and no stray cancel can leak. A test
+        // seam parks nextCopyData right before a read so the cancel lands there deterministically.
+        let connection = try await PostgresConnection.connect(integrationConfiguration())
+        _ = try await connection.query(
+            "CREATE TEMP TABLE copy_cancel AS SELECT g AS id FROM generate_series(1, 100000) g")
+
+        let reached = Gate(), release = Gate()
+        await connection.setCopyOutBeforeReadTestHook {
+            await reached.open()     // parked in nextCopyData, copy active, before a read
+            await release.wait()
+        }
+
+        let task = Task {
+            for try await _ in try await connection.copyOut("COPY copy_cancel TO STDOUT") {}
+        }
+        await reached.wait()
+        task.cancel()
+        await release.open()
+
+        do {
+            _ = try await task.value
+            XCTFail("a cancelled copyOut should throw")
+        } catch is CancellationError {
+            // expected
+        }
+
+        let closed = await connection.releaseState.isClosed
+        XCTAssertTrue(closed, "a cancelled copyOut must tear the connection down, not drain and keep it")
+
+        // The connection is closed, so a follow-up fails promptly — it must not hang on a wire the
+        // cancellation left mid-COPY.
+        do {
+            _ = try await withTimeout(.seconds(10)) { try await connection.query("SELECT 1").rows }
+            XCTFail("the connection should have been torn down")
+        } catch let error as PerunError {
+            guard case .connectionClosed = error else {
+                return XCTFail("expected connectionClosed, got \(error)")
+            }
+        }
+        try? await connection.close()
+    }
+
     // The hand-off (release / unlock) resumes a waiter asynchronously w.r.t.
     // cancellation, so a hand-off can win the race *after* a waiter is cancelled. A
     // waiter cancelled while parked must still fail — never run on the resource it was
