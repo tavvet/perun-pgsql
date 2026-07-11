@@ -93,7 +93,12 @@ extension PostgresTimeTz: PostgresDecodable {
             var reader = ByteReader(bytes)
             let microseconds = try reader.readInt64()
             let zoneWest = try reader.readInt32()
-            return PostgresTimeTz(time: PostgresTime(microseconds: microseconds), zoneOffsetSeconds: -zoneWest)
+            // Negate in a wider type: a malformed zoneWest == Int32.min would trap the plain
+            // -zoneWest (its negation overflows Int32).
+            guard let zoneEast = Int32(exactly: -Int(zoneWest)) else {
+                throw postgresDecodeError("timetz", oid: oid, format: format, bytes)
+            }
+            return PostgresTimeTz(time: PostgresTime(microseconds: microseconds), zoneOffsetSeconds: zoneEast)
         case .text:
             guard let value = parsePostgresTimeTz(utf8String(bytes)) else {
                 throw postgresDecodeError("timetz", oid: oid, format: format, bytes)
@@ -151,7 +156,10 @@ extension PostgresTimeTz: PostgresEncodable {
     public var postgresTypeOID: Int32 { PostgresOID.timetz }
 
     public func postgresBinary() -> [UInt8]? {
-        bigEndianBytes(time.microseconds) + bigEndianBytes(-zoneOffsetSeconds)   // zone is seconds west of UTC
+        // zone is seconds west of UTC; negate in a wider type so an absurd zoneOffsetSeconds ==
+        // Int32.min falls back to text instead of trapping.
+        guard let zoneWest = Int32(exactly: -Int(zoneOffsetSeconds)) else { return nil }
+        return bigEndianBytes(time.microseconds) + bigEndianBytes(zoneWest)
     }
 }
 
