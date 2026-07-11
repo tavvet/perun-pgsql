@@ -28,10 +28,19 @@ stream concurrently.
 
 ## Rollback, cancellation, and retries
 
-The transaction rolls back — never commits partial work — when the closure throws, the task is
-cancelled, or a wrapping ``withTimeout(_:_:)`` fires. The `COMMIT`/`ROLLBACK` itself always
-completes, so the connection is left clean and reusable. Transient conflicts (serialization
-failures, deadlocks) are worth retrying the *whole* transaction — see <doc:ErrorsAndRecovery>.
+The transaction rolls back rather than committing partial work when the closure throws, the task is
+cancelled, or a wrapping ``withTimeout(_:_:)`` fires **before** the `COMMIT` is sent — cancellation
+is checked right up to that point. The `COMMIT`/`ROLLBACK` itself always completes, so the
+connection is left clean and reusable.
+
+> Important: once `COMMIT` is on the wire its outcome is indeterminate. It runs to completion
+> uncancellable, so a cancel or timeout that races it can report `CancellationError`/`timedOut`
+> even though the server committed. Treat a cancelled or timed-out transaction as *unknown*, not
+> *definitely rolled back* — the same best-effort caveat cancellation carries everywhere (see
+> <doc:ErrorsAndRecovery>).
+
+Transient conflicts (serialization failures, deadlocks) are worth retrying the *whole* transaction
+— see <doc:ErrorsAndRecovery>.
 
 ## On a pool
 

@@ -446,7 +446,10 @@ public actor PostgresConnection {
         do {
             guard !isClosed else { throw PerunError.connectionClosed }
             try await send(FrontendMessage.query(sql))
-            try await readCopyOutResponse()      // consume the CopyOutResponse handshake (or error)
+            // Cancellable like copyIn's handshake: a COPY parked before CopyOutResponse (e.g. on a
+            // table lock) must not hold the wire uninterruptibly — a cancel fires a CancelRequest
+            // and the response drains to ReadyForQuery.
+            try await runInlineCancellable { try await self.readCopyOutResponse() }
             copyOutActive = true
             copyOutGeneration += 1
             copyOutTerminating = false
@@ -479,7 +482,11 @@ public actor PostgresConnection {
         do {
             guard !isClosed else { throw PerunError.connectionClosed }
             try await send(FrontendMessage.query(sql))
-            try await readCopyInResponse()           // consume the CopyInResponse handshake (or error)
+            // Both inline reads are cancellable: a COPY parked before CopyInResponse (waiting on a
+            // table lock, say) or a slow post-CopyDone completion would otherwise hold the wire
+            // uninterruptibly. A cancel fires a CancelRequest, the server aborts, and the response
+            // drains to ReadyForQuery — the connection stays reusable and the caller sees the cancel.
+            try await runInlineCancellable { try await self.readCopyInResponse() }
 
             copyInActive = true
             copyInGeneration += 1
@@ -494,7 +501,7 @@ public actor PostgresConnection {
             }
             copyInActive = false
             try await send(FrontendMessage.copyDone())
-            return try await collectResults()        // CommandComplete ("COPY n") + ReadyForQuery
+            return try await runInlineCancellable { try await self.collectResults() }   // "COPY n" + ReadyForQuery
         } catch {
             forceCloseIfDesynced(error)              // an inline reader must not leave a desynced wire open
             throw error
@@ -623,6 +630,11 @@ public actor PostgresConnection {
         }
         do {
             let result = try await body(Transaction(connection: self, contextID: contextID))
+            // A cancel or timeout observed after the body finished but before COMMIT must roll back,
+            // not commit: checking here turns that window into a ROLLBACK (via the catch below)
+            // rather than a silent commit. Once COMMIT reaches the wire its outcome is indeterminate
+            // — it runs uncancellable to completion, so a cancel racing it may still commit.
+            try Task.checkCancellation()
             _ = try await runSimpleQuery("COMMIT")
             return result
         } catch {
@@ -801,24 +813,53 @@ public actor PostgresConnection {
         // blocking recv waiting for the very query we're trying to cancel.
         let cancelQueue = DispatchQueue(label: "perun.cancel")
         let timeout = connectTimeout
-        try await withBlockingIO(on: cancelQueue) {
-            let fd = try SystemSocket.makeConnected(host: host, port: port, timeout: timeout)
-            defer { SystemSocket.disconnect(fd: fd) }
-            let request = FrontendMessage.cancelRequest(processID: processID, secretKey: secretKey)
-            guard useTLS else {
-                try SystemSocket.sendAll(fd: fd, request)
-                return
-            }
-            // SSLRequest, then send the CancelRequest over TLS. If the server declines TLS here,
-            // don't fall back to plaintext — skip the cancel rather than leak the key (it's
-            // best-effort anyway).
-            try SystemSocket.sendAll(fd: fd, FrontendMessage.sslRequest())
-            let reply = try SystemSocket.receive(fd: fd, maxLength: 1)
-            guard reply.first == UInt8(ascii: "S") else { return }
-            let tls = try TLSConnection.connect(fd: fd, hostname: host, verifyFull: verifyFull)
-            defer { tls.close() }
-            try tls.send(request)
+        let start = ContinuousClock().now
+
+        // The TCP connect is bounded by makeConnected's own poll deadline.
+        let fd = try await withBlockingIO(on: cancelQueue) {
+            try SystemSocket.makeConnected(host: host, port: port, timeout: timeout)
         }
+        // Bound the rest — the SSL reply read, the TLS handshake, and the send — with the same
+        // absolute deadline connect() uses: a partially-responding server must not pin this task
+        // forever (the original query and any wrapping withTimeout would keep waiting on it). The
+        // watchdog shuts the socket down when the deadline passes so a parked recv/handshake/send
+        // returns. A nil connectTimeout means no bound, matching connect().
+        let watchdog: Task<Void, Never>? = timeout.map { total in
+            Task {
+                let remaining = total - (ContinuousClock().now - start)
+                let capped = min(max(remaining, .zero), .seconds(Int64(Int32.max)))
+                do { try await Task.sleep(for: capped) } catch { return }   // cancelled: finished in time
+                SystemSocket.shutdownBoth(fd: fd)
+            }
+        }
+        func stopWatchdog() async {
+            watchdog?.cancel()
+            _ = await watchdog?.value   // let it finish touching fd before we close it
+        }
+        do {
+            try await withBlockingIO(on: cancelQueue) {
+                let request = FrontendMessage.cancelRequest(processID: processID, secretKey: secretKey)
+                guard useTLS else {
+                    try SystemSocket.sendAll(fd: fd, request)
+                    return
+                }
+                // SSLRequest, then send the CancelRequest over TLS. If the server declines TLS here,
+                // don't fall back to plaintext — skip the cancel rather than leak the key (it's
+                // best-effort anyway).
+                try SystemSocket.sendAll(fd: fd, FrontendMessage.sslRequest())
+                let reply = try SystemSocket.receive(fd: fd, maxLength: 1)
+                guard reply.first == UInt8(ascii: "S") else { return }
+                let tls = try TLSConnection.connect(fd: fd, hostname: host, verifyFull: verifyFull)
+                defer { tls.close() }
+                try tls.send(request)
+            }
+        } catch {
+            await stopWatchdog()
+            SystemSocket.disconnect(fd: fd)
+            throw error
+        }
+        await stopWatchdog()
+        SystemSocket.disconnect(fd: fd)
     }
 
     /// Double-quote a SQL identifier, escaping embedded quotes.
@@ -1902,10 +1943,22 @@ public actor PostgresConnection {
     /// read — e.g. a `waitForNotifications` loop parked waiting for the next
     /// notification — so a listening connection can always be shut down.
     public func close() async throws {
-        // Send Terminate before dropping the socket so the server does a clean backend exit
-        // instead of logging "unexpected EOF on client connection". Best-effort — if the wire
-        // is already broken this just fails and we force-close anyway.
-        if !isClosed { try? await send(FrontendMessage.terminate()) }
+        // A best-effort graceful Terminate lets the server do a clean backend exit instead of
+        // logging "unexpected EOF on client connection" — but it must never stall teardown. If the
+        // wire is wedged (the peer stopped reading, the send buffer is full, or the io queue is
+        // already parked in a blocking send) the send would block indefinitely, so a watchdog shuts
+        // the socket down after a short grace to make it return. Either way, forceClose then tears
+        // the connection down — an immediate, out-of-band shutdown that never waits on the wire.
+        if !isClosed {
+            let fd = self.fd
+            let watchdog = Task {
+                do { try await Task.sleep(for: .seconds(2)) } catch { return }   // sent in time: nothing to unblock
+                SystemSocket.shutdownBoth(fd: fd)                                 // make the parked Terminate return
+            }
+            try? await send(FrontendMessage.terminate())
+            watchdog.cancel()
+            _ = await watchdog.value                                             // finish touching fd before forceClose
+        }
         forceClose()
     }
 

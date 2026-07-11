@@ -92,6 +92,54 @@ final class CancellationIntegrationTests: XCTestCase {
         try await connection.close()
     }
 
+    func testCopyInBlockedOnLockCancellationFreesTheWire() async throws {
+        // copyIn's handshake read is cancellable: a COPY parked before CopyInResponse (here, waiting
+        // on a table lock another session holds) must unblock on cancel — a CancelRequest aborts the
+        // lock wait and the response drains — rather than holding the wire uninterruptibly.
+        let setup = try await PostgresConnection.connect(integrationConfiguration())
+        _ = try await setup.query("DROP TABLE IF EXISTS perun_copy_cancel")
+        _ = try await setup.query("CREATE TABLE perun_copy_cancel (id int)")
+        try await setup.close()
+
+        // A second session takes an ACCESS EXCLUSIVE lock and keeps it, so the COPY below blocks.
+        let holder = try await PostgresConnection.connect(integrationConfiguration())
+        _ = try await holder.query("BEGIN")
+        _ = try await holder.query("LOCK TABLE perun_copy_cancel IN ACCESS EXCLUSIVE MODE")
+
+        let victim = try await PostgresConnection.connect(integrationConfiguration())
+        let copy = Task {
+            try await victim.copyIn("COPY perun_copy_cancel FROM STDIN") { writer in
+                try await writer.write(Array("1\n".utf8))   // never reached: blocks before CopyInResponse
+            }
+        }
+        try await Task.sleep(nanoseconds: 300_000_000)      // let the COPY park on the lock
+        let start = Date()
+        copy.cancel()
+        do {
+            _ = try await copy.value
+            XCTFail("a cancelled copyIn blocked on a lock should throw")
+        } catch is CancellationError {
+            // expected: the CancelRequest aborted the lock wait and the response drained
+        } catch let error as PerunError {
+            // A late race can surface the server's own "canceling statement" error first; either way
+            // the point is that it unblocked promptly, asserted below.
+            _ = error
+        }
+        XCTAssertLessThan(Date().timeIntervalSince(start), 3.0, "the cancel must unblock the parked COPY promptly")
+
+        // The victim drained to ReadyForQuery, so it stays usable.
+        let n = try await victim.query("SELECT 1 AS n").rows[0].decode("n", as: Int.self)
+        XCTAssertEqual(n, 1)
+
+        _ = try await holder.query("ROLLBACK")
+        try await victim.close()
+        try await holder.close()
+
+        let cleanup = try await PostgresConnection.connect(integrationConfiguration())
+        _ = try await cleanup.query("DROP TABLE IF EXISTS perun_copy_cancel")
+        try await cleanup.close()
+    }
+
     // The hand-off (release / unlock) resumes a waiter asynchronously w.r.t.
     // cancellation, so a hand-off can win the race *after* a waiter is cancelled. A
     // waiter cancelled while parked must still fail — never run on the resource it was

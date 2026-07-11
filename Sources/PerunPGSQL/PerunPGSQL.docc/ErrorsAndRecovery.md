@@ -124,7 +124,10 @@ applies unchanged: a timed-out statement may still have run.
 always complete, so:
 
 - an error inside the transaction rolls back and rethrows the cause;
-- a cancel or a timeout rolls back rather than committing partial work;
+- a cancel or a timeout observed *before* `COMMIT` is sent rolls back rather than committing partial
+  work; but once `COMMIT` is on the wire it runs uncancellable, so a cancel racing it may still
+  commit while the caller sees `CancellationError`/`timedOut` — treat that outcome as unknown, per
+  the best-effort caveat above;
 - a connection returned to the pool still inside a transaction (or a failed one) is discarded,
   never reused mid-transaction.
 
