@@ -36,9 +36,12 @@ final class ErrorClassificationTests: XCTestCase {
             .columnNotFound("name"),
             .decodingFailed(type: "Int", oid: PostgresOID.int4, format: "text", reason: "1 bytes"),
             .tooManyParameters(count: 65536),
+            .valueTooLarge(bytes: 3_000_000_000),
             .clientShutdown,
             .preparedStatementConnectionMismatch,
+            .parameterTypeMismatch(parameter: 1, expected: PostgresOID.int8, actual: PostgresOID.float8),
             .copyMismatch("wrong direction"),
+            .timedOut,
         ]
 
         for error in errors {

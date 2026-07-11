@@ -73,25 +73,4 @@ final class SessionParameterIntegrationTests: XCTestCase {
         try await connection.query("SHOW \(name)").rows[0][0].string() ?? ""
     }
 
-    private func integrationConfiguration(user: String? = nil,
-                                          runtimeParameters: [String: String] = [:]) throws -> ConnectionConfiguration {
-        let environment = ProcessInfo.processInfo.environment
-        guard environment["PERUN_PGSQL_INTEGRATION"] == "1" else {
-            throw XCTSkip("set PERUN_PGSQL_INTEGRATION=1 to run live PostgreSQL integration tests")
-        }
-        let tlsMode: TLSMode
-        switch environment["PGSSLMODE"] {
-        case "disable": tlsMode = .disable
-        case "require", "encrypt-without-verification": tlsMode = .encryptWithoutVerification
-        default: tlsMode = .verifyFull
-        }
-        return ConnectionConfiguration(
-            host: environment["PGHOST"] ?? "localhost",
-            port: UInt16(environment["PGPORT"] ?? "") ?? 5432,
-            user: user ?? (environment["PGUSER"] ?? "perun"),
-            database: environment["PGDATABASE"] ?? "perun",
-            password: environment["PGPASSWORD"],
-            tlsMode: tlsMode,
-            runtimeParameters: runtimeParameters)
-    }
 }

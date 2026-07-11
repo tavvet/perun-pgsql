@@ -104,28 +104,4 @@ final class TransactionIntegrationTests: XCTestCase {
         await pool.shutdown()
     }
 
-    private func integrationConfiguration() throws -> ConnectionConfiguration {
-        let environment = ProcessInfo.processInfo.environment
-        guard environment["PERUN_PGSQL_INTEGRATION"] == "1" else {
-            throw XCTSkip("set PERUN_PGSQL_INTEGRATION=1 to run live PostgreSQL integration tests")
-        }
-
-        let tlsMode: TLSMode
-        switch environment["PGSSLMODE"] {
-        case "disable": tlsMode = .disable
-        case "prefer", "allow-plaintext-fallback": tlsMode = .allowPlaintextFallback
-        case "require", "encrypt-without-verification": tlsMode = .encryptWithoutVerification
-        case "verify-full": tlsMode = .verifyFull
-        default: tlsMode = .verifyFull
-        }
-
-        return ConnectionConfiguration(
-            host: environment["PGHOST"] ?? "localhost",
-            port: UInt16(environment["PGPORT"] ?? "") ?? 5432,
-            user: environment["PGUSER"] ?? "perun",
-            database: environment["PGDATABASE"] ?? "perun",
-            password: environment["PGPASSWORD"],
-            tlsMode: tlsMode
-        )
-    }
 }
