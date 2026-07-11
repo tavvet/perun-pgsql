@@ -187,5 +187,11 @@ final class WireTests: XCTestCase {
         assertProtocolViolation("H", [0x02, 0x00, 0x00], "overall copy format 2")
         assertProtocolViolation("H", [0x00, 0xFF, 0xFF], "negative copy column count")
         assertProtocolViolation("H", [0x00, 0x00, 0x01, 0x00, 0x02], "copy column format code 2")
+
+        // Trailing bytes past a well-formed body are malformed too — the whole payload must be
+        // consumed. (DataRow/RowDescription/CopyResponse with zero columns, plus a stray byte.)
+        assertProtocolViolation("D", [0x00, 0x00, 0x99], "DataRow trailing byte")
+        assertProtocolViolation("T", [0x00, 0x00, 0x99], "RowDescription trailing byte")
+        assertProtocolViolation("H", [0x00, 0x00, 0x00, 0x99], "CopyResponse trailing byte")
     }
 }

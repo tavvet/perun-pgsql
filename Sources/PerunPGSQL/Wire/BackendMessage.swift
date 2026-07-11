@@ -202,6 +202,9 @@ enum BackendMessage: Sendable {
             }
             columnFormats.append(code)
         }
+        guard reader.remaining == 0 else {
+            throw PerunError.protocolViolation("CopyResponse has \(reader.remaining) trailing byte(s)")
+        }
         return (format, columnFormats)
     }
 
@@ -225,6 +228,9 @@ enum BackendMessage: Sendable {
                 formatCode: try reader.readInt16()
             ))
         }
+        guard reader.remaining == 0 else {
+            throw PerunError.protocolViolation("RowDescription has \(reader.remaining) trailing byte(s)")
+        }
         return fields
     }
 
@@ -244,6 +250,9 @@ enum BackendMessage: Sendable {
             } else {
                 columns.append(try reader.readBytes(Int(length)))
             }
+        }
+        guard reader.remaining == 0 else {
+            throw PerunError.protocolViolation("DataRow has \(reader.remaining) trailing byte(s)")
         }
         return columns
     }
