@@ -373,6 +373,7 @@ public actor PostgresConnection {
             streamPendingError = nil
             return PostgresRowStream(connection: self, generation: streamGeneration)
         } catch {
+            forceCloseIfDesynced(error)              // a failed send here leaves the wire out of sync
             unlock()
             throw error
         }
@@ -395,6 +396,7 @@ public actor PostgresConnection {
             copyOutPendingError = nil
             return PostgresCopyOutSequence(connection: self, generation: copyOutGeneration)
         } catch {
+            forceCloseIfDesynced(error)              // readCopyOutResponse desynced: don't leave it open
             unlock()
             throw error
         }
@@ -417,22 +419,29 @@ public actor PostgresConnection {
                        _ write: @Sendable (PostgresCopyInWriter) async throws -> Void) async throws -> QueryResult {
         try await lock()
         defer { unlock() }
-        guard !isClosed else { throw PerunError.connectionClosed }
-        try await send(FrontendMessage.query(sql))
-        try await readCopyInResponse()           // consume the CopyInResponse handshake (or error)
-
-        copyInActive = true
-        copyInGeneration += 1
         do {
-            try await write(PostgresCopyInWriter(connection: self, generation: copyInGeneration))
-        } catch {
+            guard !isClosed else { throw PerunError.connectionClosed }
+            try await send(FrontendMessage.query(sql))
+            try await readCopyInResponse()           // consume the CopyInResponse handshake (or error)
+
+            copyInActive = true
+            copyInGeneration += 1
+            do {
+                try await write(PostgresCopyInWriter(connection: self, generation: copyInGeneration))
+            } catch {
+                copyInActive = false
+                // Abort the copy, but keep the closure's error as the reported cause even if the
+                // abort's own drain fails — only tearing down then, if that drain desynced the wire.
+                do { try await failCopyIn() } catch let drainError { forceCloseIfDesynced(drainError) }
+                throw error
+            }
             copyInActive = false
-            try await failCopyIn()               // CopyFail + drain; we rethrow the closure's error
+            try await send(FrontendMessage.copyDone())
+            return try await collectResults()        // CommandComplete ("COPY n") + ReadyForQuery
+        } catch {
+            forceCloseIfDesynced(error)              // an inline reader must not leave a desynced wire open
             throw error
         }
-        copyInActive = false
-        try await send(FrontendMessage.copyDone())
-        return try await collectResults()        // CommandComplete ("COPY n") + ReadyForQuery
     }
 
     /// Parse a statement once so it can be executed repeatedly with different
@@ -546,13 +555,27 @@ public actor PostgresConnection {
             unlock()
         }
 
-        _ = try await runSimpleQuery("BEGIN")
+        do {
+            _ = try await runSimpleQuery("BEGIN")
+        } catch {
+            forceCloseIfDesynced(error)
+            throw error
+        }
         do {
             let result = try await body(Transaction(connection: self, contextID: contextID))
             _ = try await runSimpleQuery("COMMIT")
             return result
         } catch {
-            _ = try? await runSimpleQuery("ROLLBACK")
+            // A desynced wire can't carry a ROLLBACK: reading its bogus reply could hang on a
+            // garbage length. Tear the connection down instead (the server rolls the aborted
+            // transaction back on disconnect). Otherwise the wire is in sync — roll back, and
+            // tear down only if the ROLLBACK itself desyncs.
+            if let perun = error as? PerunError, perun.mayHaveDesynchronizedWire {
+                forceCloseIfDesynced(error)
+            } else {
+                do { _ = try await runSimpleQuery("ROLLBACK") }
+                catch let rollbackError { forceCloseIfDesynced(rollbackError) }
+            }
             throw error
         }
     }
@@ -2004,6 +2027,16 @@ public actor PostgresConnection {
             readQueue.async {
                 continuation.resume(returning: SystemSocket.isQuiescentOpen(fd: fd))
             }
+        }
+    }
+
+    /// Tear the connection down if `error` may have left the wire out of sync, so an inline
+    /// (exclusive-path) reader — copyIn, copyOut, queryStream setup, a transaction — doesn't
+    /// leave a half-consumed message behind for the next caller. The shared, pipelined path
+    /// already does this centrally in `readerLoop`.
+    private func forceCloseIfDesynced(_ error: Error) {
+        if let perun = error as? PerunError, perun.mayHaveDesynchronizedWire, !isClosed {
+            forceClose()
         }
     }
 
