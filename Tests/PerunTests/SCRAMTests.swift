@@ -46,6 +46,15 @@ final class SCRAMTests: XCTestCase {
         XCTAssertFalse(client.hasVerifiedServerSignature)
     }
 
+    func testServerFinalBeforeClientFinalIsRejected() throws {
+        // A server that jumps straight to SASLFinal with an empty v= (skipping SASLContinue)
+        // must not be "verified" by matching the empty initial expected-signature.
+        var client = SCRAMClient(password: "pencil", clientNonce: "myClientNonce")
+        _ = client.clientFirstMessage()
+        XCTAssertThrowsError(try client.verifyServerFinal("v="))
+        XCTAssertFalse(client.hasVerifiedServerSignature)
+    }
+
     func testWrongClientNonceRejected() {
         var client = SCRAMClient(password: "pencil", clientNonce: "myClientNonce")
         _ = client.clientFirstMessage()

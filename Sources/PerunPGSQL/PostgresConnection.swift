@@ -1129,6 +1129,11 @@ public actor PostgresConnection {
                         return
                     }
                     kickWrite(request)
+                    // Defensive: this runs synchronously on the actor after the earlier
+                    // startReaderIfNeeded(), so the reader can't have drained and exited in
+                    // between — but re-arm it here too, so enqueueing an op never depends on
+                    // that ordering to guarantee a reader is running to deliver its response.
+                    startReaderIfNeeded()
                 })
             } catch {
                 return .failure(error)
@@ -1816,6 +1821,9 @@ public actor PostgresConnection {
             throw PerunError.protocolViolation("COPY data written outside its copyIn")
         }
         guard !bytes.isEmpty else { return }
+        // The CopyData frame length is an Int32; reject an oversized chunk rather than trap the
+        // trapping Int32(_:) conversion inside frame(). Callers should chunk COPY data anyway.
+        guard bytes.count <= Int(Int32.max) - 4 else { throw PerunError.valueTooLarge(bytes: bytes.count) }
         try await send(FrontendMessage.copyData(bytes))
     }
 

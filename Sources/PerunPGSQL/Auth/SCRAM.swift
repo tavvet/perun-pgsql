@@ -93,6 +93,12 @@ struct SCRAMClient {
         else {
             throw PerunError.protocolViolation("malformed SCRAM server-final: \(serverFinal)")
         }
+        // Refuse to "verify" before client-final computed the expected signature: otherwise a
+        // server sending SASLFinal with an empty v= (before any SASLContinue) would match the
+        // empty initial value and be treated as authenticated.
+        guard !expectedServerSignature.isEmpty else {
+            throw PerunError.protocolViolation("SCRAM server-final arrived before client-final")
+        }
         guard Self.constantTimeEquals(signature, expectedServerSignature) else {
             throw PerunError.authenticationFailed("server signature mismatch (wrong password or MITM)")
         }

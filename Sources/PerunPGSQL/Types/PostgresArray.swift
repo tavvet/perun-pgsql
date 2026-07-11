@@ -75,7 +75,9 @@ public struct PostgresArray: PostgresEncodable {
     /// element is double-quoted (and `"`/`\` escaped), so numbers, strings with commas,
     /// `\x…` bytea and JSON all carry literally; a nil element is the unquoted word `NULL`.
     public var postgresText: String? {
-        guard !dimensions.isEmpty else { return "{}" }
+        // A zero-length dimension means the array is empty; render it as `{}` rather than
+        // `{{},{}}`, which PostgreSQL rejects as a syntax error.
+        guard !dimensions.isEmpty, !dimensions.contains(0) else { return "{}" }
         var offset = 0
         func render(_ dimension: Int) -> String {
             var out = "{"
@@ -105,6 +107,11 @@ public struct PostgresArray: PostgresEncodable {
     /// binary form.
     public func postgresBinary() -> [UInt8]? {
         guard elementTypeOID != 0 else { return nil }
+        // A zero-length dimension (or none) means the array is empty: emit PostgreSQL's canonical
+        // empty-array form (ndim = 0), not a descriptor for a dimension with no elements.
+        if dimensions.isEmpty || dimensions.contains(0) {
+            return bigEndianBytes(Int32(0)) + bigEndianBytes(Int32(0)) + bigEndianBytes(elementTypeOID)
+        }
         var body = [UInt8]()
         var hasNulls = false
         for element in elements {

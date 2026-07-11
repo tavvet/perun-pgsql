@@ -15,6 +15,16 @@ final class ArrayDecodingTests: XCTestCase {
         XCTAssertEqual(empty, [])
     }
 
+    func testEmptyNestedArrayEncodesAsEmpty() {
+        // Rows with a zero-length dimension are an empty array: text must render as {} (not the
+        // {{},{}} that PostgreSQL rejects).
+        XCTAssertEqual(PostgresArray([[Int]]([[], []])).postgresText, "{}")
+        // With a known element type, binary encodes the canonical empty array (ndim = 0).
+        let typed = PostgresArray(dimensions: [2, 0], elements: [], elementTypeOID: PostgresOID.int8)
+        XCTAssertEqual(typed.postgresText, "{}")
+        XCTAssertEqual(typed.postgresBinary()?.prefix(4), [0, 0, 0, 0])   // ndim = 0
+    }
+
     func testTextArrayQuotingAndNulls() throws {
         // A comma and an escaped quote inside quoted elements, plus an unquoted NULL.
         let texts: [String?] = try textCell(#"{plain,"a,b","c\"d",NULL}"#, oid: 1009).decodeArray(of: String.self)

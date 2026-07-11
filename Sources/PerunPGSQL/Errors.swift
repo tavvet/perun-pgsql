@@ -210,6 +210,9 @@ public enum PerunError: Error, CustomStringConvertible, Sendable {
     case parameterTypeMismatch(parameter: Int, expected: Int32, actual: Int32)
     /// More parameters than the protocol's unsigned 16-bit count field allows (max 65535).
     case tooManyParameters(count: Int)
+    /// A single value (a bind parameter or a COPY chunk) is too large to frame — the protocol's
+    /// Int32 length field caps it just under 2 GiB. Split the data into smaller pieces.
+    case valueTooLarge(bytes: Int)
     /// A prepared-statement handle was used on a different connection than the
     /// one that created it.
     case preparedStatementConnectionMismatch
@@ -256,6 +259,8 @@ public enum PerunError: Error, CustomStringConvertible, Sendable {
                 + "expects OID \(expected); pass a matching type or use text parameters"
         case let .tooManyParameters(count):
             return "too many parameters: \(count) (PostgreSQL allows at most 65535 per statement)"
+        case let .valueTooLarge(bytes):
+            return "value of \(bytes) bytes is too large to frame (the protocol length field caps it near 2 GiB)"
         case .preparedStatementConnectionMismatch:
             return "prepared statement belongs to a different connection"
         case let .copyMismatch(detail):
@@ -283,7 +288,7 @@ extension PerunError {
             return true
         case .server, .unexpectedNull, .columnNotFound, .decodingFailed, .tooManyParameters,
              .clientShutdown, .preparedStatementConnectionMismatch, .copyMismatch, .timedOut,
-             .parameterTypeMismatch:
+             .parameterTypeMismatch, .valueTooLarge:
             return false
         }
     }

@@ -148,12 +148,12 @@ enum FrontendMessage {
             throw PerunError.tooManyParameters(count: parameters.count)
         }
         var body = ByteWriter()
-        appendBindBody(to: &body,
-                       portal: portal,
-                       statement: statement,
-                       parameters: parameters,
-                       parameterFormat: parameterFormat,
-                       resultFormat: resultFormat)
+        try appendBindBody(to: &body,
+                           portal: portal,
+                           statement: statement,
+                           parameters: parameters,
+                           parameterFormat: parameterFormat,
+                           resultFormat: resultFormat)
         return frame(tag: "B", body: body.bytes)
     }
 
@@ -355,13 +355,13 @@ enum FrontendMessage {
         guard parameters.count <= 65535 else {
             throw PerunError.tooManyParameters(count: parameters.count)
         }
-        appendFrame(to: &writer, tag: "B") { body in
-            appendBindBody(to: &body,
-                           portal: portal,
-                           statement: statement,
-                           parameters: parameters,
-                           parameterFormat: parameterFormat,
-                           resultFormat: resultFormat)
+        try appendFrame(to: &writer, tag: "B") { body in
+            try appendBindBody(to: &body,
+                               portal: portal,
+                               statement: statement,
+                               parameters: parameters,
+                               parameterFormat: parameterFormat,
+                               resultFormat: resultFormat)
         }
     }
 
@@ -370,7 +370,7 @@ enum FrontendMessage {
                                        statement: String,
                                        parameters: [(any PostgresEncodable)?],
                                        parameterFormat: PostgresFormat,
-                                       resultFormat: PostgresFormat) {
+                                       resultFormat: PostgresFormat) throws {
         writer.writeCString(portal)
         writer.writeCString(statement)
 
@@ -380,7 +380,7 @@ enum FrontendMessage {
             writer.writeInt16(Int16(bitPattern: UInt16(parameters.count)))   // parameter values
             for parameter in parameters {
                 if let text = parameter?.postgresText {
-                    writer.writeInt32(Int32(text.utf8.count))
+                    try writeParameterLength(to: &writer, text.utf8.count)
                     writer.writeString(text)
                 } else {
                     writer.writeInt32(-1)                 // SQL NULL
@@ -395,7 +395,7 @@ enum FrontendMessage {
             writer.writeInt16(Int16(bitPattern: UInt16(resolved.count)))      // parameter values
             for parameter in resolved {
                 if let bytes = parameter.bytes {
-                    writer.writeInt32(Int32(bytes.count))
+                    try writeParameterLength(to: &writer, bytes.count)
                     writer.writeBytes(bytes)
                 } else {
                     writer.writeInt32(-1)                 // SQL NULL
@@ -410,6 +410,14 @@ enum FrontendMessage {
         } else {
             writer.writeInt16(0)                      // all text
         }
+    }
+
+    /// Write a parameter's Int32 length, rejecting a value that would overflow the signed
+    /// 32-bit field (the trapping `Int32(_:)` would otherwise abort the whole process on a
+    /// ≥ 2 GiB value).
+    private static func writeParameterLength(to writer: inout ByteWriter, _ count: Int) throws {
+        guard count <= Int(Int32.max) else { throw PerunError.valueTooLarge(bytes: count) }
+        writer.writeInt32(Int32(count))
     }
 
     /// Resolve one parameter's binary-mode wire form: binary when the value
@@ -450,9 +458,9 @@ enum FrontendMessage {
 
     private static func appendFrame(to writer: inout ByteWriter,
                                     tag: Character,
-                                    writeBody: (inout ByteWriter) -> Void) {
+                                    writeBody: (inout ByteWriter) throws -> Void) rethrows {
         let lengthOffset = writer.beginFrame(tag: tag.asciiValue!)
-        writeBody(&writer)
+        try writeBody(&writer)
         writer.endFrame(lengthOffset: lengthOffset)
     }
 
