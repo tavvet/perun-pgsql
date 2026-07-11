@@ -18,6 +18,22 @@ public enum TLSMode: Sendable, Equatable {
     public static var require: TLSMode { .encryptWithoutVerification }
 }
 
+/// Which password-based authentication methods the client will accept from the server.
+///
+/// A guard against an authentication downgrade: an attacker able to influence the handshake
+/// (e.g. under `.allowPlaintextFallback`, or a MITM under `.encryptWithoutVerification`) could
+/// otherwise make the server request cleartext and capture the password, or request md5 and
+/// capture an offline-crackable digest. Under the default `.verifyFull` TLS this is already
+/// mitigated; tighten it when the TLS mode is relaxed. Analogous to libpq's `require_auth`.
+public enum AuthenticationRequirement: Sendable, Equatable {
+    /// Accept whatever the server asks for — SCRAM, md5, or cleartext. The default.
+    case any
+    /// Refuse cleartext password; accept md5 or SCRAM.
+    case disallowCleartext
+    /// Accept only SCRAM-SHA-256 (SASL); refuse md5 and cleartext.
+    case scramOnly
+}
+
 /// Everything needed to open a connection.
 public struct ConnectionConfiguration: Sendable {
     public var host: String
@@ -27,6 +43,9 @@ public struct ConnectionConfiguration: Sendable {
     public var password: String?
     /// How to negotiate TLS. Defaults to `.verifyFull`.
     public var tlsMode: TLSMode
+    /// Which authentication methods to accept from the server. Defaults to `.any`; tighten it
+    /// to forbid a cleartext/md5 downgrade when running under a relaxed TLS mode.
+    public var authenticationRequirement: AuthenticationRequirement
     /// Reject any backend message whose payload exceeds this many bytes. Bounds
     /// memory against a malicious or buggy server that declares a huge length.
     /// Defaults to 256 MiB.
@@ -47,6 +66,7 @@ public struct ConnectionConfiguration: Sendable {
                 database: String,
                 password: String? = nil,
                 tlsMode: TLSMode = .verifyFull,
+                authenticationRequirement: AuthenticationRequirement = .any,
                 maxMessageSize: Int = 256 * 1024 * 1024,
                 notificationBufferLimit: Int = 1024,
                 runtimeParameters: [String: String] = [:]) {
@@ -57,6 +77,7 @@ public struct ConnectionConfiguration: Sendable {
         self.database = database
         self.password = password
         self.tlsMode = tlsMode
+        self.authenticationRequirement = authenticationRequirement
         self.maxMessageSize = maxMessageSize
         self.notificationBufferLimit = notificationBufferLimit
         self.runtimeParameters = runtimeParameters
@@ -1808,12 +1829,20 @@ public actor PostgresConnection {
             return
 
         case .cleartextPassword:
+            guard configuration.authenticationRequirement == .any else {
+                throw PerunError.authenticationFailed(
+                    "server requested cleartext password authentication, which the configuration forbids")
+            }
             guard let password = configuration.password else {
                 throw PerunError.authenticationFailed("server requires a password, none provided")
             }
             try await send(FrontendMessage.password(password))
 
         case let .md5Password(salt):
+            guard configuration.authenticationRequirement != .scramOnly else {
+                throw PerunError.authenticationFailed(
+                    "server requested md5 authentication, but the configuration requires SCRAM")
+            }
             guard let password = configuration.password else {
                 throw PerunError.authenticationFailed("server requires a password, none provided")
             }
