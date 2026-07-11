@@ -2114,9 +2114,10 @@ public actor PostgresConnection {
     func isProbablyAlive() async -> Bool {
         guard !isClosed else { return false }
         let fd = self.fd
+        let plaintext = (tls == nil)
         return await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
             readQueue.async {
-                continuation.resume(returning: SystemSocket.isQuiescentOpen(fd: fd))
+                continuation.resume(returning: SystemSocket.isQuiescentOpen(fd: fd, plaintextProtocol: plaintext))
             }
         }
     }
