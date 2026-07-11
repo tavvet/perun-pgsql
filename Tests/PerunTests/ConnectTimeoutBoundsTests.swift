@@ -25,8 +25,16 @@ final class ConnectTimeoutBoundsTests: XCTestCase {
         do {
             _ = try await PostgresConnection.connect(configuration)
             XCTFail("expected the connect to time out against a silent server")
+        } catch let error as PerunError {
+            // The watchdog shut the socket down; startup's parked recv surfaces one of these.
+            switch error {
+            case .connectionClosed, .ioError, .connectionFailed:
+                break
+            default:
+                XCTFail("expected a connection failure, got \(error)")
+            }
         } catch {
-            // expected — the watchdog shuts the socket down, surfacing as a connection failure
+            XCTFail("expected a PerunError, got \(type(of: error)): \(error)")
         }
         XCTAssertLessThan(ContinuousClock().now - start, .seconds(5),
                           "the watchdog must bound the handshake, not only the TCP connect")

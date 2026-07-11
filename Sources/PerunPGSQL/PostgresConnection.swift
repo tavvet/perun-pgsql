@@ -46,8 +46,11 @@ public struct ConnectionConfiguration: Sendable {
     /// Which authentication methods to accept from the server. Defaults to `.any`; tighten it
     /// to forbid a cleartext/md5 downgrade when running under a relaxed TLS mode.
     public var authenticationRequirement: AuthenticationRequirement
-    /// Bound on establishing the TCP connection (nil = the OS default, ~75 s). Defaults to
-    /// 10 seconds, so a blackholed host fails fast instead of pinning a pool slot.
+    /// Bound on the whole connect — the TCP connection, TLS negotiation, and the startup/auth
+    /// handshake — after which the socket is torn down (nil = no bound beyond the OS TCP default,
+    /// ~75 s). Defaults to 10 seconds, so a blackholed or silent host fails fast instead of pinning
+    /// a pool slot. The one exception is DNS resolution, which runs before the deadline is armed and
+    /// is bounded only by the system resolver.
     public var connectTimeout: Duration?
     /// Reject any backend message whose payload exceeds this many bytes. Bounds
     /// memory against a malicious or buggy server that declares a huge length.
@@ -262,20 +265,24 @@ public actor PostgresConnection {
                                             notificationBufferLimit: configuration.notificationBufferLimit)
 
         // One deadline for the whole connect (from `start`, so TCP time counts): a watchdog shuts
-        // the socket down when it passes, unblocking any recv/send parked in TLS or startup/auth.
-        // This bounds the *total* handshake — a peer that accepts TCP then dribbles bytes can't
-        // extend it the way a per-recv SO_RCVTIMEO would. Cancelled the moment we're ready.
-        let watchdog: Task<Void, Never>? = configuration.connectTimeout.map { timeout in
+        // the socket down when it passes, unblocking any recv/send parked in TLS or startup/auth,
+        // so the total handshake is bounded even against a peer that dribbles or withholds bytes.
+        // It reports whether it fired; if it did — even in the rare case startup raced to finish at
+        // the same instant — connect() discards the (now shut-down) connection and reports a
+        // timeout, so a broken connection is never returned. Cancelled the moment we're ready.
+        let watchdog: Task<Bool, Never>? = configuration.connectTimeout.map { timeout in
             Task {
                 let remaining = timeout - (ContinuousClock().now - start)
                 let capped = min(max(remaining, .zero), .seconds(Int64(Int32.max)))
-                try? await Task.sleep(for: capped)
-                if !Task.isCancelled { SystemSocket.shutdownBoth(fd: fd) }
+                do { try await Task.sleep(for: capped) } catch { return false }   // cancelled before the deadline
+                SystemSocket.shutdownBoth(fd: fd)
+                return true                                                       // fired: the fd is shut down
             }
         }
-        func stopWatchdog() async {
+        /// Stop the watchdog and report whether it had already fired.
+        func stopWatchdog() async -> Bool {
             watchdog?.cancel()
-            _ = await watchdog?.value   // ensure it can't shut the fd down after we're done with it
+            return await watchdog?.value ?? false
         }
 
         do {
@@ -283,9 +290,12 @@ public actor PostgresConnection {
                 try await connection.negotiateTLS(configuration)
             }
             try await connection.startup(configuration)
-            await stopWatchdog()
+            if await stopWatchdog() {
+                await connection.forceClose()
+                throw PerunError.connectionFailed("connect timed out during the startup handshake")
+            }
         } catch {
-            await stopWatchdog()
+            _ = await stopWatchdog()
             await connection.forceClose()
             throw error
         }
