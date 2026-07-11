@@ -77,7 +77,13 @@ final class TLSConnection: @unchecked Sendable {
         // SSL takes ownership of both BIOs; SSL_free releases them.
         SSL_set_bio(ssl, rbio, wbio)
         SSL_set_connect_state(ssl)
-        _ = hostname.withCString { perun_SSL_set_tlsext_host_name(ssl, $0) }   // SNI
+        // SNI names the target host for the server's virtual-host selection. RFC 6066 forbids IP
+        // literals in the SNI HostName, and a strict server or proxy may reject a connection that
+        // carries one — so send SNI only for DNS names. An IP host's identity is still bound below
+        // through the IP-address verification path.
+        if !isIPLiteral(hostname) {
+            _ = hostname.withCString { perun_SSL_set_tlsext_host_name(ssl, $0) }   // SNI
+        }
         if verifyFull {
             // Bind identity verification to the handshake. SSL_set1_host matches DNS names
             // (SAN/CN); an IP-literal host instead needs the IP-address path, or a certificate
