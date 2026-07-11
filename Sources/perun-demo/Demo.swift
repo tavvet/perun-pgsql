@@ -10,7 +10,6 @@ import Glibc
 @main
 struct Demo {
     static func main() async {
-        setvbuf(stdout, nil, _IONBF, 0)   // unbuffered, so progress is visible live
         let environment = ProcessInfo.processInfo.environment
         let tlsMode: TLSMode
         switch environment["PGSSLMODE"] {
