@@ -79,12 +79,22 @@ final class TLSConnection: @unchecked Sendable {
         SSL_set_connect_state(ssl)
         _ = hostname.withCString { perun_SSL_set_tlsext_host_name(ssl, $0) }   // SNI
         if verifyFull {
-            // Binds hostname verification to the handshake. Its only realistic failure is
-            // allocation, which would otherwise silently disable the host check — fail closed.
-            guard hostname.withCString({ SSL_set1_host(ssl, $0) }) == 1 else {
+            // Bind identity verification to the handshake. SSL_set1_host matches DNS names
+            // (SAN/CN); an IP-literal host instead needs the IP-address path, or a certificate
+            // with a valid IP SAN would be wrongly rejected. Failing to set it would silently
+            // disable the check, so fail closed.
+            let hostCheckConfigured: Bool
+            if isIPLiteral(hostname) {
+                hostCheckConfigured = hostname.withCString {
+                    X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl), $0) == 1
+                }
+            } else {
+                hostCheckConfigured = hostname.withCString { SSL_set1_host(ssl, $0) == 1 }
+            }
+            guard hostCheckConfigured else {
                 SSL_free(ssl)
                 SSL_CTX_free(ctx)
-                throw PerunError.tlsHandshakeFailed("SSL_set1_host failed: \(opensslErrors())")
+                throw PerunError.tlsHandshakeFailed("host verification setup failed: \(opensslErrors())")
             }
         }
 
@@ -301,6 +311,16 @@ final class POSIXLock: @unchecked Sendable {
         defer { unlock() }
         return try body()
     }
+}
+
+/// Whether `host` is a numeric IP literal (IPv4 or IPv6) rather than a DNS name — so TLS
+/// verification uses the IP-address path instead of DNS-name matching.
+private func isIPLiteral(_ host: String) -> Bool {
+    var v4 = in_addr()
+    if host.withCString({ inet_pton(AF_INET, $0, &v4) }) == 1 { return true }
+    var v6 = in6_addr()
+    if host.withCString({ inet_pton(AF_INET6, $0, &v6) }) == 1 { return true }
+    return false
 }
 
 /// Drain OpenSSL's per-thread error queue into a readable string.
