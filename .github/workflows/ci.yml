@@ -56,3 +56,35 @@ jobs:
           PGDATABASE: perun
           PGSSLMODE: disable   # the service container speaks plaintext
         run: swift test
+
+  # A second run over TLS, so the memory-BIO transport is exercised end to end. Debian's
+  # PostgreSQL package enables SSL out of the box (the snakeoil cert), which PGSSLMODE=require
+  # accepts without needing a trusted certificate.
+  tls-test:
+    runs-on: ubuntu-latest
+    container: swift:6.0
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OpenSSL and PostgreSQL
+        run: apt-get update && apt-get install -y libssl-dev pkg-config postgresql postgresql-client
+
+      - name: Start PostgreSQL with TLS and create the role
+        run: |
+          set -eu
+          PG_VER="$(pg_lsclusters -h | awk 'NR==1 {print $1}')"
+          pg_ctlcluster "$PG_VER" main start
+          su postgres -c "psql -c \"CREATE ROLE perun LOGIN SUPERUSER PASSWORD 'perun';\""
+          su postgres -c "psql -c \"CREATE DATABASE perun OWNER perun;\""
+
+      - name: Run tests over TLS
+        env:
+          PERUN_PGSQL_INTEGRATION: "1"
+          PGHOST: localhost
+          PGPORT: "5432"
+          PGUSER: perun
+          PGPASSWORD: perun
+          PGDATABASE: perun
+          PGSSLMODE: require   # encrypted, certificate not verified (snakeoil cert)
+        run: swift test

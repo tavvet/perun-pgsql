@@ -45,7 +45,11 @@ final class SessionParameterIntegrationTests: XCTestCase {
     func testPinOverridesRoleDefault() async throws {
         let admin = try await PostgresConnection.connect(integrationConfiguration())
         _ = try await admin.query("DROP ROLE IF EXISTS perun_pin_test")
-        _ = try await admin.query("CREATE ROLE perun_pin_test LOGIN")
+        // Give the role the same password the connection below will present (PGPASSWORD), so this
+        // works against a server that requires password auth, not only a trust setup.
+        let password = ProcessInfo.processInfo.environment["PGPASSWORD"]
+        let passwordClause = password.map { " PASSWORD '\($0.replacingOccurrences(of: "'", with: "''"))'" } ?? ""
+        _ = try await admin.query("CREATE ROLE perun_pin_test LOGIN\(passwordClause)")
         _ = try await admin.query("ALTER ROLE perun_pin_test SET DateStyle = 'SQL, DMY'")
         try await admin.close()
 
