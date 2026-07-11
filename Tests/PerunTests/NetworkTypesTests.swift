@@ -8,23 +8,23 @@ final class NetworkTypesTests: XCTestCase {
 
     func testIPv4() throws {
         let decoded = try PostgresInet.decode(Array("192.168.1.5/24".utf8), oid: PostgresOID.inet, format: .text)
-        XCTAssertEqual(decoded, PostgresInet(address: [192, 168, 1, 5], prefixLength: 24))
+        XCTAssertEqual(decoded, inet(address: [192, 168, 1, 5], prefixLength: 24))
 
-        XCTAssertEqual(PostgresInet(address: [192, 168, 1, 5]).postgresText, "192.168.1.5")   // /32 host omits prefix
-        XCTAssertEqual(PostgresInet(address: [192, 168, 1, 0], prefixLength: 24, isCIDR: true).postgresText,
+        XCTAssertEqual(inet(address: [192, 168, 1, 5]).postgresText, "192.168.1.5")   // /32 host omits prefix
+        XCTAssertEqual(inet(address: [192, 168, 1, 0], prefixLength: 24, isCIDR: true).postgresText,
                        "192.168.1.0/24")
         // Binary: family, bits, is_cidr, length, address.
-        XCTAssertEqual(PostgresInet(address: [192, 168, 1, 5]).postgresBinary(), [2, 32, 0, 4, 192, 168, 1, 5])
+        XCTAssertEqual(inet(address: [192, 168, 1, 5]).postgresBinary(), [2, 32, 0, 4, 192, 168, 1, 5])
         XCTAssertEqual(try PostgresInet.decode([2, 32, 0, 4, 192, 168, 1, 5], oid: PostgresOID.inet, format: .binary),
-                       PostgresInet(address: [192, 168, 1, 5]))
-        XCTAssertEqual(PostgresInet(address: [192, 168, 1, 5]).postgresTypeOID, 869)             // inet
-        XCTAssertEqual(PostgresInet(address: [10, 0, 0, 0], prefixLength: 8, isCIDR: true).postgresTypeOID, 650)   // cidr
+                       inet(address: [192, 168, 1, 5]))
+        XCTAssertEqual(inet(address: [192, 168, 1, 5]).postgresTypeOID, 869)             // inet
+        XCTAssertEqual(inet(address: [10, 0, 0, 0], prefixLength: 8, isCIDR: true).postgresTypeOID, 650)   // cidr
     }
 
     func testIPv6ParsingAndFormatting() throws {
         // Zero-compression round-trips through the verbose form.
         let compressed = try XCTUnwrap(parseIPv6("2001:db8::1"))
-        XCTAssertEqual(PostgresInet(address: compressed).postgresText, "2001:db8:0:0:0:0:0:1")
+        XCTAssertEqual(inet(address: compressed).postgresText, "2001:db8:0:0:0:0:0:1")
         XCTAssertEqual(parseIPv6("2001:db8:0:0:0:0:0:1"), compressed)
 
         XCTAssertEqual(parseIPv6("::1"), Array(repeating: 0, count: 15) + [1])                   // loopback
@@ -56,14 +56,30 @@ final class NetworkTypesTests: XCTestCase {
         XCTAssertThrowsError(try decode([2, 32, 0, 4, 1, 2, 3]))          // address too short
     }
 
+    func testInitRejectsInvalidAddressWidth() {
+        // The public initializer must never trap on a stray length: a non-4/16-byte address has no
+        // valid prefix or wire form, so it fails rather than crashing on `UInt8(count * 8)`.
+        XCTAssertNil(PostgresInet(address: Array(repeating: 0, count: 32)))   // the finding's repro (would trap)
+        XCTAssertNil(PostgresInet(address: []))
+        XCTAssertNil(PostgresInet(address: [1, 2, 3]))
+        XCTAssertNotNil(PostgresInet(address: [192, 168, 1, 5]))              // 4 bytes — IPv4
+        XCTAssertNotNil(PostgresInet(address: Array(repeating: 0, count: 16)))// 16 bytes — IPv6
+
+        // `address` is a public var: a value mutated to an invalid width formats to nil, not a trap.
+        var mutated = inet(address: [192, 168, 1, 5])
+        mutated.address = Array(repeating: 0, count: 32)
+        XCTAssertNil(mutated.postgresText)
+        XCTAssertNil(mutated.postgresBinary())
+    }
+
     func testNetworkRoundTripLive() async throws {
         let connection = try await PostgresConnection.connect(integrationConfiguration())
 
         let cases: [(type: String, value: PostgresInet)] = [
-            ("inet", PostgresInet(address: [192, 168, 1, 5], prefixLength: 24)),
-            ("cidr", PostgresInet(address: [10, 0, 0, 0], prefixLength: 8, isCIDR: true)),
-            ("inet", PostgresInet(address: try XCTUnwrap(parseIPv6("2001:db8::1")))),
-            ("cidr", PostgresInet(address: try XCTUnwrap(parseIPv6("2001:db8::")), prefixLength: 32, isCIDR: true)),
+            ("inet", inet(address: [192, 168, 1, 5], prefixLength: 24)),
+            ("cidr", inet(address: [10, 0, 0, 0], prefixLength: 8, isCIDR: true)),
+            ("inet", inet(address: try XCTUnwrap(parseIPv6("2001:db8::1")))),
+            ("cidr", inet(address: try XCTUnwrap(parseIPv6("2001:db8::")), prefixLength: 32, isCIDR: true)),
         ]
         for item in cases {
             for format in [PostgresFormat.text, .binary] {
@@ -75,14 +91,19 @@ final class NetworkTypesTests: XCTestCase {
 
         // Decode a server-produced value and an inet[] array.
         let produced: PostgresInet = try await connection.query("SELECT inet '192.168.1.5/24' AS v").rows[0].decode("v")
-        XCTAssertEqual(produced, PostgresInet(address: [192, 168, 1, 5], prefixLength: 24))
+        XCTAssertEqual(produced, inet(address: [192, 168, 1, 5], prefixLength: 24))
         let list: [PostgresInet] = try await connection.query("SELECT ARRAY[inet '10.0.0.1', inet '10.0.0.2'] AS v")
             .rows[0].decodeArray("v", of: PostgresInet.self)
-        XCTAssertEqual(list, [PostgresInet(address: [10, 0, 0, 1]), PostgresInet(address: [10, 0, 0, 2])])
+        XCTAssertEqual(list, [inet(address: [10, 0, 0, 1]), inet(address: [10, 0, 0, 2])])
 
         try await connection.close()
     }
 
     // MARK: - Helpers
 
+    /// Force-unwrapping constructor for the valid (4- or 16-byte) test addresses, so the failable
+    /// `PostgresInet.init?` doesn't clutter every call site.
+    private func inet(address: [UInt8], prefixLength: UInt8? = nil, isCIDR: Bool = false) -> PostgresInet {
+        PostgresInet(address: address, prefixLength: prefixLength, isCIDR: isCIDR)!
+    }
 }

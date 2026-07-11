@@ -16,10 +16,13 @@ public struct PostgresInet: Sendable, Equatable {
 
     public var isIPv6: Bool { address.count == 16 }
 
+    /// Fails unless `address` is 4 bytes (IPv4) or 16 bytes (IPv6) — the only widths an `inet` or
+    /// `cidr` represents; any other length has neither a valid default prefix nor a wire form.
     /// `prefixLength` defaults to the full address width (`/32` for IPv4, `/128` for IPv6).
-    public init(address: [UInt8], prefixLength: UInt8? = nil, isCIDR: Bool = false) {
+    public init?(address: [UInt8], prefixLength: UInt8? = nil, isCIDR: Bool = false) {
+        guard address.count == 4 || address.count == 16 else { return nil }
         self.address = address
-        self.prefixLength = prefixLength ?? UInt8(address.count * 8)
+        self.prefixLength = prefixLength ?? UInt8(address.count * 8)   // 32 or 128 — both fit in UInt8
         self.isCIDR = isCIDR
     }
 }
@@ -45,7 +48,10 @@ extension PostgresInet: PostgresDecodable {
                 throw postgresDecodeError("inet", oid: oid, format: format, bytes)
             }
             let address = try reader.readBytes(length)
-            return PostgresInet(address: address, prefixLength: bits, isCIDR: isCIDR)
+            guard let value = PostgresInet(address: address, prefixLength: bits, isCIDR: isCIDR) else {
+                throw postgresDecodeError("inet", oid: oid, format: format, bytes)   // length was checked above
+            }
+            return value
         case .text:
             // Text can't tell inet from cidr on its own, so take that from the column's OID.
             guard let value = parsePostgresInet(utf8String(bytes), isCIDR: oid == PostgresOID.cidr) else {
@@ -62,6 +68,9 @@ extension PostgresInet: PostgresArrayDecodable { public typealias ArrayScalar = 
 
 extension PostgresInet: PostgresEncodable {
     public var postgresText: String? {
+        // `address` is a public var, so re-check the width the initializer already enforced: a value
+        // mutated to another length has no text form (and `UInt8(count * 8)` would trap for count ≥ 32).
+        guard address.count == 4 || address.count == 16 else { return nil }
         let full = UInt8(address.count * 8)
         let text = isIPv6 ? formatIPv6(address) : formatIPv4(address)
         // Show the prefix for a cidr, or for an inet that isn't a plain full-width host.
