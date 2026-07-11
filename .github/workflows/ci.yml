@@ -137,8 +137,10 @@ jobs:
 
   # macOS build + unit suite (the unit tests need no server), so the .macOS(.v13) target and the
   # Homebrew OpenSSL path stay covered. (musl / static-linux remains an uncovered target.)
+  # macos-15 is used because its stock Xcode ships Swift 6; macos-14 defaults to Swift 5.10, which
+  # can't even parse this package's swift-tools-version:6.0.
   macos-test:
-    runs-on: macos-14
+    runs-on: macos-15
 
     steps:
       - uses: actions/checkout@v4
