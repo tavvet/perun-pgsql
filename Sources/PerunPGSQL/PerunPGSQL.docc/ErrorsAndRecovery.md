@@ -60,7 +60,7 @@ classifies every error this way:
 | `server` — a SQL error, drained to `ReadyForQuery` before it was reported | `connectionClosed` — EOF mid-message |
 | `decodingFailed`, `unexpectedNull`, `columnNotFound` — the row arrived; decoding is client-side | `ioError` — a raw socket read/write failure (e.g. the peer reset the connection) |
 | `timedOut` — the query was cancelled and drained (see Timeouts) | `protocolViolation` — the server sent something unexpected |
-| `copyMismatch` — `copyOut`/`copyIn` on the wrong kind of statement; its handshake is drained first | `tlsIO`, `tlsHandshakeFailed`, `tlsNotAvailable` — TLS failures |
+| `copyMismatch` — a non-COPY statement, or `copyOut` on a `COPY … FROM STDIN`; its handshake is drained first (but see the note below — many COPY mismatches instead close) | `tlsIO`, `tlsHandshakeFailed`, `tlsNotAvailable` — TLS failures |
 | an error thrown by your own `withConnection` / `withTransaction` closure | `authenticationFailed`, `unsupportedAuthentication` |
 
 With ``PostgresClient`` you never act on this yourself. On release the pool checks the
@@ -73,6 +73,14 @@ error keep using the connection; after a desynchronising one, `close()` it and o
 > Note: raw socket faults on a plaintext connection surface as `ioError` (mapped from the socket
 > layer at the I/O boundary) specifically so they are classified as desynchronising — a broken
 > connection is never handed back out of the pool.
+
+> Note: `copyMismatch` is often **not** reusable. Any COPY run through `query`/`execute`, a
+> pipeline, or `queryStream`, and a `copyIn` on a `COPY … TO STDOUT`, **close** the connection —
+> a COPY-out can't be stopped in band, a COPY-in over the extended protocol can't be
+> resynchronised with `CopyFail`, and the stream may be huge or unbounded, so draining it to keep
+> the connection isn't worth it. The pool discards a connection closed this way. The reusable
+> cases are a non-COPY statement and `copyOut` on a `COPY … FROM STDIN`, which are aborted in band
+> with `CopyFail` and drained.
 
 ## Cancellation
 

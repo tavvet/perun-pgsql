@@ -88,3 +88,67 @@ jobs:
           PGDATABASE: perun
           PGSSLMODE: require   # encrypted, certificate not verified (snakeoil cert)
         run: swift test
+
+  # A third run under .verifyFull, so certificate-chain and hostname verification are exercised:
+  # a throwaway CA signs a server certificate for localhost, and the CA is trusted system-wide.
+  tls-verify-full:
+    runs-on: ubuntu-latest
+    container: swift:6.0
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OpenSSL and PostgreSQL
+        run: apt-get update && apt-get install -y libssl-dev pkg-config postgresql postgresql-client openssl ca-certificates
+
+      - name: Issue a trusted certificate and start PostgreSQL
+        run: |
+          set -eu
+          PG_VER="$(pg_lsclusters -h | awk 'NR==1 {print $1}')"
+          DATA="/var/lib/postgresql/$PG_VER/main"
+          CONF="/etc/postgresql/$PG_VER/main"
+          openssl req -x509 -newkey rsa:2048 -nodes -keyout /tmp/ca.key -out /tmp/ca.crt -days 2 -subj "/CN=Perun Test CA"
+          openssl req -newkey rsa:2048 -nodes -keyout /tmp/server.key -out /tmp/server.csr -subj "/CN=localhost"
+          # A plain file, not process substitution: container jobs run under sh, where <(...) is unavailable.
+          printf 'subjectAltName=DNS:localhost\n' > /tmp/san.ext
+          openssl x509 -req -in /tmp/server.csr -CA /tmp/ca.crt -CAkey /tmp/ca.key -CAcreateserial \
+            -out /tmp/server.crt -days 2 -extfile /tmp/san.ext
+          cp /tmp/server.crt /tmp/server.key "$DATA/"
+          chown postgres:postgres "$DATA/server.crt" "$DATA/server.key"
+          chmod 600 "$DATA/server.key"
+          echo "ssl_cert_file='$DATA/server.crt'" >> "$CONF/postgresql.conf"
+          echo "ssl_key_file='$DATA/server.key'" >> "$CONF/postgresql.conf"
+          cp /tmp/ca.crt /usr/local/share/ca-certificates/perun-ca.crt
+          update-ca-certificates
+          pg_ctlcluster "$PG_VER" main start
+          su postgres -c "psql -c \"CREATE ROLE perun LOGIN SUPERUSER PASSWORD 'perun';\""
+          su postgres -c "psql -c \"CREATE DATABASE perun OWNER perun;\""
+
+      - name: Run tests under verify-full
+        env:
+          PERUN_PGSQL_INTEGRATION: "1"
+          PGHOST: localhost
+          PGPORT: "5432"
+          PGUSER: perun
+          PGPASSWORD: perun
+          PGDATABASE: perun
+          PGSSLMODE: verify-full   # full certificate-chain and hostname verification
+        run: swift test
+
+  # macOS build + unit suite (the unit tests need no server), so the .macOS(.v13) target and the
+  # Homebrew OpenSSL path stay covered. (musl / static-linux remains an uncovered target.)
+  macos-test:
+    runs-on: macos-14
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OpenSSL
+        run: brew install openssl@3 pkg-config
+
+      - name: Build and run the unit suite
+        env:
+          PKG_CONFIG_PATH: /opt/homebrew/opt/openssl@3/lib/pkgconfig
+        run: |
+          swift build
+          swift test
