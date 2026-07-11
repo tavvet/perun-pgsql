@@ -638,23 +638,40 @@ public actor PostgresConnection {
     /// `notifications`, until the task is cancelled or the connection closes.
     /// Holds the wire exclusively for its whole duration (no query can pipeline while
     /// it listens), so run it on a connection you reserve for listening.
+    ///
+    /// The loop spends almost all its time parked in a blocking read, so cancellation can't
+    /// be observed between messages the way a query's can. Cancelling therefore **closes the
+    /// connection** to unblock the read (as `close()` does) and throws `CancellationError`;
+    /// the connection is not reusable afterwards. Open a dedicated connection for listening.
     public func waitForNotifications() async throws {
         try await lock(); defer { unlock() }
-        while true {
-            try Task.checkCancellation()
-            switch try await readMessage() {
-            case let .notificationResponse(processID, channel, payload):
-                notificationContinuation.yield(
-                    PostgresNotification(processID: processID, channel: channel, payload: payload))
-            case let .noticeResponse(notice):
-                noticeHandler?(notice)
-            case let .parameterStatus(name, value):
-                parameters[name] = value
-            case let .errorResponse(error):
-                throw PerunError.server(error)
-            default:
-                continue
+        do {
+            try await withTaskCancellationHandler {
+                while true {
+                    try Task.checkCancellation()
+                    switch try await readMessage() {
+                    case let .notificationResponse(processID, channel, payload):
+                        notificationContinuation.yield(
+                            PostgresNotification(processID: processID, channel: channel, payload: payload))
+                    case let .noticeResponse(notice):
+                        noticeHandler?(notice)
+                    case let .parameterStatus(name, value):
+                        parameters[name] = value
+                    case let .errorResponse(error):
+                        throw PerunError.server(error)
+                    default:
+                        continue
+                    }
+                }
+            } onCancel: {
+                // Parked in recv with nothing to make the server send a byte: close the socket
+                // so the read returns instead of the loop (and its exclusive lock) hanging forever.
+                Task { await self.forceClose() }
             }
+        } catch {
+            // The forceClose above surfaces as connectionClosed; report the cancellation instead.
+            if Task.isCancelled { throw CancellationError() }
+            throw error
         }
     }
 
