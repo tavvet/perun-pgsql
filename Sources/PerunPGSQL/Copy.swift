@@ -22,22 +22,25 @@ public struct PostgresCopyOutSequence: AsyncSequence, Sendable {
 
     private let connection: PostgresConnection
     private let cleanup: CopyOutCleanup
+    private let generation: UInt64
 
     init(connection: PostgresConnection, generation: UInt64) {
         self.connection = connection
+        self.generation = generation
         self.cleanup = CopyOutCleanup(connection: connection, generation: generation)
     }
 
     public func makeAsyncIterator() -> AsyncIterator {
-        AsyncIterator(connection: connection, cleanup: cleanup)
+        AsyncIterator(connection: connection, cleanup: cleanup, generation: generation)
     }
 
     public struct AsyncIterator: AsyncIteratorProtocol {
         let connection: PostgresConnection
         let cleanup: CopyOutCleanup     // retained for the iterator's lifetime; frees the wire on drop
+        let generation: UInt64          // the copy this iterator pulls from; a stale next() reads nothing
 
         public mutating func next() async throws -> [UInt8]? {
-            try await connection.nextCopyData()
+            try await connection.nextCopyData(generation: generation)
         }
     }
 }

@@ -18,22 +18,25 @@ public struct PostgresRowStream: AsyncSequence, Sendable {
 
     private let connection: PostgresConnection
     private let cleanup: StreamCleanup
+    private let generation: UInt64
 
     init(connection: PostgresConnection, generation: UInt64) {
         self.connection = connection
+        self.generation = generation
         self.cleanup = StreamCleanup(connection: connection, generation: generation)
     }
 
     public func makeAsyncIterator() -> AsyncIterator {
-        AsyncIterator(connection: connection, cleanup: cleanup)
+        AsyncIterator(connection: connection, cleanup: cleanup, generation: generation)
     }
 
     public struct AsyncIterator: AsyncIteratorProtocol {
         let connection: PostgresConnection
         let cleanup: StreamCleanup      // retained for the iterator's lifetime; frees the wire on drop
+        let generation: UInt64          // the stream this iterator pulls from; a stale next() reads nothing
 
         public mutating func next() async throws -> PostgresRow? {
-            try await connection.nextStreamRow()
+            try await connection.nextStreamRow(generation: generation)
         }
     }
 }

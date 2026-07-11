@@ -1387,16 +1387,20 @@ public actor PostgresConnection {
     /// so the read unblocks — exactly as an autocommit query does — then tear the stream
     /// down and throw `CancellationError`, so a cancelled `for await` frees the connection
     /// promptly instead of blocking until the next backend message arrives.
-    func nextStreamRow() async throws -> PostgresRow? {
-        guard streamActive else { return nil }
+    func nextStreamRow(generation: UInt64) async throws -> PostgresRow? {
+        // Only the stream this iterator was created for may pull rows. A stale iterator — its
+        // stream already ended, and the connection may have started a new one — reads nothing
+        // rather than silently returning a different stream's rows. The cancellation cleanup
+        // below uses that same captured generation, so a cancelled stale iterator can't tear
+        // down whatever stream is active now.
+        guard streamActive, streamGeneration == generation else { return nil }
         if Task.isCancelled {
             // Already cancelled before we read a byte: abort the running query too, so a
             // slow one (e.g. mid `pg_sleep`) doesn't stall the drain inside finishStream.
-            await cancelStreamInFlight(generation: streamGeneration)
-            await finishStream(generation: streamGeneration)
+            await cancelStreamInFlight(generation: generation)
+            await finishStream(generation: generation)
             throw CancellationError()
         }
-        let generation = streamGeneration
         let outcome: Result<PostgresRow?, Error> = await withTaskCancellationHandler {
             do { return .success(try await readNextStreamRow()) }
             catch { return .failure(error) }
@@ -1404,7 +1408,7 @@ public actor PostgresConnection {
             Task { await self.cancelStreamInFlight(generation: generation) }
         }
         if Task.isCancelled {
-            await finishStream(generation: streamGeneration)   // idempotent; cleans up if a row raced the cancel
+            await finishStream(generation: generation)   // idempotent; cleans up if a row raced the cancel
             throw CancellationError()
         }
         return try outcome.get()
@@ -1578,13 +1582,14 @@ public actor PostgresConnection {
     }
 
     /// The consumer pulled the next COPY chunk. Cancellation-aware like `nextStreamRow`.
-    func nextCopyData() async throws -> [UInt8]? {
-        guard copyOutActive else { return nil }
+    func nextCopyData(generation: UInt64) async throws -> [UInt8]? {
+        // Guard on the iterator's own generation (see nextStreamRow): a stale copy iterator
+        // reads nothing and can't tear down a copy that has since reused the connection.
+        guard copyOutActive, copyOutGeneration == generation else { return nil }
         if Task.isCancelled {
-            await finishCopyOut(generation: copyOutGeneration)   // fires the CancelRequest itself, then drains
+            await finishCopyOut(generation: generation)   // fires the CancelRequest itself, then drains
             throw CancellationError()
         }
-        let generation = copyOutGeneration
         let outcome: Result<[UInt8]?, Error> = await withTaskCancellationHandler {
             do { return .success(try await readNextCopyData()) }
             catch { return .failure(error) }
@@ -1592,7 +1597,7 @@ public actor PostgresConnection {
             Task { await self.cancelCopyOutInFlight(generation: generation) }
         }
         if Task.isCancelled {
-            await finishCopyOut(generation: copyOutGeneration)   // idempotent; cleans up if a chunk raced the cancel
+            await finishCopyOut(generation: generation)   // idempotent; cleans up if a chunk raced the cancel
             throw CancellationError()
         }
         return try outcome.get()
