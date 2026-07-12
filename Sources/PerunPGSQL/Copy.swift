@@ -53,10 +53,13 @@ public struct PostgresCopyOutSequence: AsyncSequence, Sendable {
     }
 }
 
-/// Releases a `COPY … TO STDOUT` that the consumer abandoned before it finished. Dropping the
-/// iterator cancels the COPY server-side (a `CancelRequest`, since the server would otherwise
-/// stream the whole relation), drains to `ReadyForQuery`, and frees the wire. A copy consumed to
-/// its end has already cleaned up, so this is a no-op.
+/// Releases a `COPY … TO STDOUT` that the consumer abandoned before it finished. If the consuming
+/// task was cancelled — including a `CancellationError` thrown from the `for await` *body*, which
+/// unwinds through here rather than through `nextCopyData` — the connection is torn down at once.
+/// Otherwise (a plain `break`) the remainder is drained to `ReadyForQuery`, bounded by
+/// `copyResyncTimeout`: the connection is kept when the remainder is cheap and closed when it isn't.
+/// No `CancelRequest` either way. A copy consumed to its end has already cleaned up, so this is a
+/// no-op.
 final class CopyOutCleanup: @unchecked Sendable {
     private let connection: PostgresConnection
     private let generation: UInt64      // the copy this cleanup belongs to; a stale deinit is a no-op
@@ -69,7 +72,10 @@ final class CopyOutCleanup: @unchecked Sendable {
     deinit {
         let connection = self.connection
         let generation = self.generation
-        Task { await connection.finishCopyOut(generation: generation) }
+        // Captured here, on the (possibly cancelled) task that is unwinding — the detached Task below
+        // starts fresh and would never see the cancellation.
+        let cancelled = Task.isCancelled
+        Task { await connection.endCopyOutFromCleanup(generation: generation, cancelled: cancelled) }
     }
 }
 
@@ -99,7 +105,8 @@ final class CopyOutLifetime: @unchecked Sendable {
         guard !lock.withLock({ iteratorTaken }) else { return }
         let connection = self.connection
         let generation = self.generation
-        Task { await connection.finishCopyOut(generation: generation) }
+        let cancelled = Task.isCancelled
+        Task { await connection.endCopyOutFromCleanup(generation: generation, cancelled: cancelled) }
     }
 }
 

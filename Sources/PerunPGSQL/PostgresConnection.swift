@@ -1933,6 +1933,19 @@ public actor PostgresConnection {
         copyOutActive = false
     }
 
+    /// Route a copyOut teardown from the iterator's `deinit`. If the consuming task was cancelled —
+    /// the common case where a `CancellationError` is thrown from the `for await` *body*, not caught
+    /// inside `nextCopyData` — tear the connection down at once (`cancelled` is captured on the
+    /// unwinding task, since this runs in a detached `Task` that wouldn't see the cancellation).
+    /// Otherwise it was a plain `break`, so take the bounded drain that keeps a cheap remainder.
+    func endCopyOutFromCleanup(generation: UInt64, cancelled: Bool) async {
+        if cancelled {
+            abandonCopyOutOnCancellation(generation: generation)
+        } else {
+            await finishCopyOut(generation: generation)
+        }
+    }
+
     // MARK: - COPY IN (client → server)
     //
     // `copyIn` holds the wire exclusively and reads inline: send the `COPY … FROM STDIN`

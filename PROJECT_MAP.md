@@ -375,10 +375,11 @@ driver — row formatting/parsing belongs to a higher layer. `Copy.swift` holds 
   the `COPY … TO STDOUT` as a Simple Query, consume the `CopyOutResponse` handshake, then pull
   `CopyData` chunks (`nextCopyData`) until `CopyDone` → `CommandComplete` → `ReadyForQuery`
   (no `Sync` — it's Simple Query). It mirrors row streaming exactly: pull-based backpressure,
-  cancellation-aware (`withTaskCancellationHandler` + `CancelRequest`), and a `CopyOutCleanup`
-  `deinit` that stops an abandoned copy. Because COPY has no chunked pause, early termination
-  and cancel both fire a `CancelRequest` (the server would otherwise stream the whole relation)
-  and drain to `ReadyForQuery`.
+  cancellation-aware, and a `CopyOutCleanup` `deinit` that stops an abandoned copy. No
+  `CancelRequest` is used (it is async and per-backend, so it could strike the next borrower's
+  query): a cancelled consumer tears the connection down at once, while a plain `break` drains the
+  remainder to `ReadyForQuery` bounded by `copyResyncTimeout` — keeping the connection when the
+  remainder is cheap and closing it when it isn't.
 - **COPY IN** (`copyIn(_:_:)`, closure-driven): send the `COPY … FROM STDIN`, consume the
   `CopyInResponse`, hand the closure a `PostgresCopyInWriter` whose `write`s are framed as
   `CopyData`, then `CopyDone` and read the result (`CommandComplete` "COPY n"). Throwing from

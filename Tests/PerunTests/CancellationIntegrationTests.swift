@@ -240,6 +240,40 @@ final class CancellationIntegrationTests: XCTestCase {
         try? await connection.close()
     }
 
+    func testCopyOutCancelledInLoopBodyTearsDownPromptly() async throws {
+        // Prompt discard on cancel must also fire when the CancellationError comes from the for-await
+        // *body* (the common case), not only when caught inside nextCopyData. There the iterator's
+        // deinit drives teardown, so it must route on the Task.isCancelled it captures — else the
+        // cancel is mistaken for a break and the connection drains (up to copyResyncTimeout) instead.
+        let connection = try await PostgresConnection.connect(integrationConfiguration())
+        _ = try await connection.query(
+            "CREATE TEMP TABLE copy_body AS SELECT g AS id FROM generate_series(1, 100000) g")
+
+        let inBody = Gate(), release = Gate()
+        let task = Task {
+            for try await _ in try await connection.copyOut("COPY copy_body TO STDOUT") {
+                await inBody.open()          // holding a chunk, inside the loop body
+                await release.wait()
+                try Task.checkCancellation() // observe the cancel here, not in nextCopyData
+            }
+        }
+        await inBody.wait()
+        task.cancel()
+        await release.open()
+
+        do { _ = try await task.value; XCTFail("expected the cancelled copyOut to throw") }
+        catch is CancellationError {}
+
+        // The iterator's deinit tears the connection down; it runs detached, so poll briefly.
+        var closed = false
+        for _ in 0 ..< 40 where !closed {
+            closed = await connection.releaseState.isClosed
+            if !closed { try await Task.sleep(nanoseconds: 50_000_000) }
+        }
+        XCTAssertTrue(closed, "a copyOut cancelled in the loop body must tear the connection down promptly")
+        try? await connection.close()
+    }
+
     // The hand-off (release / unlock) resumes a waiter asynchronously w.r.t.
     // cancellation, so a hand-off can win the race *after* a waiter is cancelled. A
     // waiter cancelled while parked must still fail — never run on the resource it was
