@@ -2374,6 +2374,10 @@ public actor PostgresConnection {
             }
             let frameEnd = pos + 1 + length
             if frameEnd > readBuffer.count { break }           // valid length but body not fully buffered: safe
+            // Fully buffered: framing alone isn't enough — an 'A' with a valid length but an empty payload
+            // frames cleanly yet is no real NotificationResponse. Run it through the same decoder the reader
+            // uses (the single source of protocol truth); a frame it rejects is a desync we must discard.
+            guard frameDecodesAsBenignAsync(pos: pos, frameEnd: frameEnd) else { return false }
             pos = frameEnd
         }
         let fd = self.fd
@@ -2393,6 +2397,21 @@ public actor PostgresConnection {
         }
     }
 
+    /// Whether the fully-buffered frame at `pos ..< frameEnd` decodes — through `BackendMessage.decode`,
+    /// the same decoder the reader uses — as a benign async message (NotificationResponse, NoticeResponse,
+    /// or ParameterStatus). A frame that frames cleanly but the decoder rejects (e.g. an 'A' whose payload
+    /// carries no PID or strings) is a desync, so this returns false and the liveness probe discards it.
+    private func frameDecodesAsBenignAsync(pos: Int, frameEnd: Int) -> Bool {
+        guard let message = try? BackendMessage.decode(tag: readBuffer[pos],
+                                                       payload: readBuffer[(pos + 5) ..< frameEnd]) else {
+            return false
+        }
+        switch message {
+        case .notificationResponse, .noticeResponse, .parameterStatus: return true
+        default: return false
+        }
+    }
+
     #if DEBUG
     /// Test seam: prime the TLS read BIO with `count` bytes to simulate ciphertext the last read
     /// pulled ahead. Returns false on a plaintext connection (nothing to prime).
@@ -2402,15 +2421,17 @@ public actor PostgresConnection {
         return true
     }
 
-    /// Test seam: leave one complete, empty (length-4) message per tag unconsumed in the driver's own
-    /// read buffer, standing in for a read-ahead that pulled trailing messages in alongside the last
-    /// one. Multiple tags stack into one buffer so a test can prime e.g. a benign 'A' before an 'E'.
+    /// Test seam: leave one framing-complete, empty-payload (length-4) message per tag unconsumed in the
+    /// driver's own read buffer, standing in for a read-ahead that pulled trailing messages in alongside
+    /// the last one. Multiple tags stack into one buffer. The empty payload is fine for a tag the probe
+    /// rejects outright (e.g. 'E') or for priming a malformed async frame the decoder must reject; a
+    /// decodable benign message needs a real payload — use `primeReadBufferRawForTest(notificationFrame())`.
     func primeReadBufferForTest(_ tags: [UInt8]) {
         for tag in tags { readBuffer.append(contentsOf: [tag, 0, 0, 0, 4]) }
     }
 
-    /// Test seam: append arbitrary raw bytes to the read buffer, for priming a malformed or oversized
-    /// frame header the well-formed `primeReadBufferForTest` can't express.
+    /// Test seam: append arbitrary raw bytes to the read buffer, for priming a frame the framed
+    /// `primeReadBufferForTest` can't express — a real async payload, or a malformed/oversized header.
     func primeReadBufferRawForTest(_ bytes: [UInt8]) {
         readBuffer.append(contentsOf: bytes)
     }

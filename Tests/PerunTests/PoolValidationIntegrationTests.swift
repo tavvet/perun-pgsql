@@ -42,7 +42,7 @@ final class PoolValidationIntegrationTests: XCTestCase {
         defer { Task { try? await connection.close() } }
         _ = try await connection.query("SELECT 1").rows
 
-        await connection.primeReadBufferForTest([UInt8(ascii: "A"), UInt8(ascii: "E")])
+        await connection.primeReadBufferRawForTest(notificationFrame() + [UInt8(ascii: "E"), 0, 0, 0, 4])
         let alive = await connection.isProbablyAlive()
         XCTAssertFalse(alive, "an 'E' buffered behind a benign 'A' must still make the connection look dead")
     }
@@ -69,9 +69,23 @@ final class PoolValidationIntegrationTests: XCTestCase {
         defer { Task { try? await connection.close() } }
         _ = try await connection.query("SELECT 1").rows
 
-        await connection.primeReadBufferForTest([UInt8(ascii: "A")])   // a buffered NotificationResponse
+        await connection.primeReadBufferRawForTest(notificationFrame())   // a real, decodable NotificationResponse
         let alive = await connection.isProbablyAlive()
         XCTAssertTrue(alive, "a buffered async message must keep the connection alive, not discard it")
+    }
+
+    func testLivenessRejectsAMalformedAsyncPayloadThatTheDecoderWouldReject() async throws {
+        // A frame can pass framing yet be rejected by the message decoder: an 'A' with a valid length but
+        // an empty payload is no real NotificationResponse (no PID, no strings). The probe must run each
+        // full frame through the same decoder the reader uses, or it keeps a connection whose very next
+        // read is a protocol violation.
+        let connection = try await PostgresConnection.connect(integrationConfiguration())
+        defer { Task { try? await connection.close() } }
+        _ = try await connection.query("SELECT 1").rows
+
+        await connection.primeReadBufferForTest([UInt8(ascii: "A")])   // 'A', length 4, empty payload — malformed
+        let alive = await connection.isProbablyAlive()
+        XCTAssertFalse(alive, "a framing-valid but undecodable async frame must read as dead")
     }
 
     func testPooledCopyOutBreakWithCheapRemainderKeepsTheConnection() async throws {
@@ -124,4 +138,15 @@ final class PoolValidationIntegrationTests: XCTestCase {
 
     // MARK: - Helpers
 
+    /// A well-formed NotificationResponse ('A') frame the real decoder accepts: a length header, then an
+    /// Int32 PID and two NUL-terminated strings (channel, payload) — unlike an empty-payload stand-in.
+    private func notificationFrame(pid: Int32 = 42, channel: String = "chan", payload: String = "hi") -> [UInt8] {
+        var body = withUnsafeBytes(of: pid.bigEndian) { Array($0) }
+        body += Array(channel.utf8) + [0]
+        body += Array(payload.utf8) + [0]
+        var frame: [UInt8] = [UInt8(ascii: "A")]
+        frame += withUnsafeBytes(of: Int32(body.count + 4).bigEndian) { Array($0) }   // length includes itself
+        frame += body
+        return frame
+    }
 }
