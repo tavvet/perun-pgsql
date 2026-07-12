@@ -28,10 +28,23 @@ final class PoolValidationIntegrationTests: XCTestCase {
         let aliveWhenDrained = await connection.isProbablyAlive()
         XCTAssertTrue(aliveWhenDrained, "a freshly drained connection must look alive")
 
-        await connection.primeReadBufferForTest(UInt8(ascii: "E"))   // a buffered ErrorResponse (termination)
+        await connection.primeReadBufferForTest([UInt8(ascii: "E")])   // a buffered ErrorResponse (termination)
         let aliveWithBuffered = await connection.isProbablyAlive()
         XCTAssertFalse(aliveWithBuffered,
                        "a buffered non-async message must make the connection look dead")
+    }
+
+    func testLivenessSeesAnErrorHiddenBehindAnAsyncMessage() async throws {
+        // Read-ahead can pull several frames into readBuffer at once. A benign async 'A' first, then a
+        // termination 'E', must NOT read as alive just because the first tag is benign — the walk has
+        // to reach the 'E' behind it, or the next borrower inherits a dead wire.
+        let connection = try await PostgresConnection.connect(integrationConfiguration())
+        defer { Task { try? await connection.close() } }
+        _ = try await connection.query("SELECT 1").rows
+
+        await connection.primeReadBufferForTest([UInt8(ascii: "A"), UInt8(ascii: "E")])
+        let alive = await connection.isProbablyAlive()
+        XCTAssertFalse(alive, "an 'E' buffered behind a benign 'A' must still make the connection look dead")
     }
 
     func testLivenessKeepsConnectionWithBufferedAsyncMessage() async throws {
@@ -41,7 +54,7 @@ final class PoolValidationIntegrationTests: XCTestCase {
         defer { Task { try? await connection.close() } }
         _ = try await connection.query("SELECT 1").rows
 
-        await connection.primeReadBufferForTest(UInt8(ascii: "A"))   // a buffered NotificationResponse
+        await connection.primeReadBufferForTest([UInt8(ascii: "A")])   // a buffered NotificationResponse
         let alive = await connection.isProbablyAlive()
         XCTAssertTrue(alive, "a buffered async message must keep the connection alive, not discard it")
     }

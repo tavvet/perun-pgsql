@@ -2347,18 +2347,28 @@ public actor PostgresConnection {
     func isProbablyAlive() async -> Bool {
         guard !isClosed else { return false }
         // Unconsumed framed bytes already sit *above* the socket: readSlice reads ahead, so a read
-        // carrying ReadyForQuery plus a following message can land wholly in readBuffer while the
-        // socket and OpenSSL below read empty. Classify the first the way isQuiescentOpen does — a
-        // buffered async message (NotificationResponse 'A' / NoticeResponse 'N' / ParameterStatus
+        // carrying ReadyForQuery plus one or more following messages can land wholly in readBuffer
+        // while the socket and OpenSSL below read empty. Classify them the way isQuiescentOpen does —
+        // a buffered async message (NotificationResponse 'A' / NoticeResponse 'N' / ParameterStatus
         // 'S') is benign, the reader consumes it next, so keep; anything else (e.g. a termination
-        // 'E') is a desync. Decoded message bytes, so this holds for TLS too. Checked on the actor.
-        if readBuffer.count - readOffset > 0 {
-            switch readBuffer[readOffset] {
+        // 'E') is a desync. One benign 'A' can shadow a following 'E' in the *same* buffer, so walk
+        // every fully-buffered frame, not just the first tag. A partly-buffered trailing frame is
+        // safe to ignore — the reader will complete it. Decoded bytes, so this holds for TLS too.
+        var pos = readOffset
+        while pos < readBuffer.count {
+            switch readBuffer[pos] {
             case UInt8(ascii: "A"), UInt8(ascii: "N"), UInt8(ascii: "S"):
-                break                      // benign buffered async message — fall through to the socket/TLS peek
+                break                      // benign async tag — advance past this frame and check the next
             default:
-                return false
+                return false               // a non-async message (e.g. a termination 'E') is already queued
             }
+            guard pos + 5 <= readBuffer.count else { break }   // partial header: incomplete trailing frame, safe
+            let length = (Int(readBuffer[pos + 1]) << 24) | (Int(readBuffer[pos + 2]) << 16)
+                       | (Int(readBuffer[pos + 3]) << 8) | Int(readBuffer[pos + 4])
+            guard length >= 4 else { return false }            // malformed length field: treat as a desync
+            let frameEnd = pos + 1 + length
+            if frameEnd > readBuffer.count { break }           // frame body not fully buffered: safe, stop here
+            pos = frameEnd
         }
         let fd = self.fd
         let tls = self.tls
@@ -2386,10 +2396,11 @@ public actor PostgresConnection {
         return true
     }
 
-    /// Test seam: leave a `firstByte`-tagged message unconsumed in the driver's own read buffer,
-    /// standing in for a read-ahead that pulled a trailing message in alongside the last one.
-    func primeReadBufferForTest(_ firstByte: UInt8) {
-        readBuffer.append(contentsOf: [firstByte, 0, 0, 0])
+    /// Test seam: leave one complete, empty (length-4) message per tag unconsumed in the driver's own
+    /// read buffer, standing in for a read-ahead that pulled trailing messages in alongside the last
+    /// one. Multiple tags stack into one buffer so a test can prime e.g. a benign 'A' before an 'E'.
+    func primeReadBufferForTest(_ tags: [UInt8]) {
+        for tag in tags { readBuffer.append(contentsOf: [tag, 0, 0, 0, 4]) }
     }
     #endif
 
