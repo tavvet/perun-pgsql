@@ -207,7 +207,7 @@ public actor PostgresClient {
             closeDuringShutdown(connection)
             return
         }
-        // A copyOut or row stream abandoned by a `break` tears down in a detached Task (Copy.swift /
+        // A copyOut or row stream abandoned by a `break` tears down in an unstructured Task (Copy.swift /
         // RowStream.swift). Wait for it to settle before sampling state, so we read its terminal outcome
         // — a cheap remainder drained and kept (idle, reusable) vs. a large one discarded — instead of
         // racing the drain: release()'s local actor hop beats the network drain, and without this we

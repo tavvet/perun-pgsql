@@ -112,7 +112,7 @@ final class PoolValidationIntegrationTests: XCTestCase {
     }
 
     func testPooledStreamBreakWithCheapRemainderKeepsTheConnection() async throws {
-        // A broken queryStream tears down in a detached Task (finishStream) exactly like copyOut, so the
+        // A broken queryStream tears down in an unstructured Task (finishStream) exactly like copyOut, so the
         // pool must await it before judging the connection — otherwise release()'s local hop beats the
         // drain, reads the stream still active, and discards a connection the cheap drain would keep.
         // Same backend PID before and after proves reuse.

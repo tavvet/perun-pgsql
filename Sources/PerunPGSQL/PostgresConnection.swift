@@ -281,7 +281,7 @@ public actor PostgresConnection {
 
     /// The pool's release path needs the transaction status (to decide whether to keep the
     /// connection), whether it was torn down mid-use, and whether an abandoned `COPY … TO STDOUT` or
-    /// row stream is still tearing down — both tear down in a detached `Task`, so at release time the
+    /// row stream is still tearing down — both tear down in an unstructured `Task`, so at release time the
     /// wire can still be held (`copyOutActive` / `streamActive`) while `transactionStatus` reads a
     /// stale `.idle`. The pool must discard such a connection, not hand a waiter one whose teardown is
     /// still in flight.
@@ -1814,15 +1814,33 @@ public actor PostgresConnection {
         let capped = min(max(teardownResyncTimeout, .zero), .seconds(Int64(Int32.max)))
         let deadline = ContinuousClock().now + capped
         let watchdog = SocketWatchdog(fd: fd, after: capped)
+        teardownWatchdogCounter &+= 1
+        let watchdogID = teardownWatchdogCounter
+        activeTeardownWatchdogs[watchdogID] = watchdog
+        #if DEBUG
+        await boundedTeardownStartedTestHook?()
+        #endif
         var resynced = false
         do { try await drain(deadline); resynced = true }
         catch { /* deadline, watchdog shutdown, or transport error → discard below */ }
         let fired = await watchdog.stop()
+        activeTeardownWatchdogs.removeValue(forKey: watchdogID)
         if resynced, !fired {
             onResynced()
         } else {
             if !isClosed { forceClose() }
             onDiscard()
+        }
+    }
+
+    /// Stop every bounded-teardown watchdog before `close()` frees the fd. The loop is deliberate:
+    /// this actor can admit another runner while `stop()` suspends, and each runner removes only its
+    /// own ID. Once the dictionary is empty, actor isolation makes the following `forceClose()` an
+    /// atomic no-new-watchdog boundary.
+    private func stopActiveTeardownWatchdogs() async {
+        while let (id, watchdog) = activeTeardownWatchdogs.first {
+            await watchdog.stop()
+            activeTeardownWatchdogs.removeValue(forKey: id)
         }
     }
 
@@ -1899,7 +1917,7 @@ public actor PostgresConnection {
         }
     }
 
-    /// The row-stream analogue of `copyOutTeardownBox`: a broken `queryStream` drains in a detached
+    /// The row-stream analogue of `copyOutTeardownBox`: a broken `queryStream` drains in an unstructured
     /// `Task` too, so the pool must await it the same way before judging the connection.
     private let streamTeardownBox = TeardownBox()
 
@@ -1909,7 +1927,7 @@ public actor PostgresConnection {
     }
 
     /// The in-flight teardown tasks the caller must await before sampling wire state (an abandoned
-    /// copyOut or row stream tears down in a detached `Task`). Synchronous and nonisolated so a
+    /// copyOut or row stream tears down in an unstructured `Task`). Synchronous and nonisolated so a
     /// pool `release()`/`close()` pays no actor hop on the common path where nothing is tearing down
     /// (empty array → the caller's `for … await` loop suspends zero times).
     nonisolated func inFlightTeardownTasks() -> [Task<Void, Never>] {
@@ -1922,6 +1940,8 @@ public actor PostgresConnection {
     /// *cancellation* doesn't drain at all. Internal, not public config — it governs a rare abandonment
     /// path and can be promoted to configuration additively if real demand appears.
     private static let defaultTeardownResyncTimeout: Duration = .seconds(5)
+    private var teardownWatchdogCounter: UInt64 = 0
+    private var activeTeardownWatchdogs: [UInt64: SocketWatchdog] = [:]
     private var teardownResyncTimeout: Duration {
         #if DEBUG
         return teardownResyncTimeoutOverride ?? Self.defaultTeardownResyncTimeout
@@ -1932,6 +1952,11 @@ public actor PostgresConnection {
     #if DEBUG
     private var teardownResyncTimeoutOverride: Duration?
     func setTeardownResyncTimeout(_ timeout: Duration) { teardownResyncTimeoutOverride = timeout }
+    private var boundedTeardownStartedTestHook: (@Sendable () async -> Void)?
+    func setBoundedTeardownStartedTestHook(_ hook: @escaping @Sendable () async -> Void) {
+        boundedTeardownStartedTestHook = hook
+    }
+    var activeTeardownWatchdogCountForTest: Int { activeTeardownWatchdogs.count }
     /// Test seam: invoked in `nextCopyData` after the pre-read cancellation check but before the
     /// read, so a test can park there, cancel, and release — landing the cancel in the read window
     /// deterministically instead of racing `Task.sleep`.
@@ -2183,7 +2208,7 @@ public actor PostgresConnection {
     /// read — e.g. a `waitForNotifications` loop parked waiting for the next
     /// notification — so a listening connection can always be shut down.
     public func close() async throws {
-        // Let an abandoned copyOut / row stream finish tearing down first. Its detached teardown Task
+        // Let an abandoned copyOut / row stream finish tearing down first. Its unstructured teardown Task
         // armed a watchdog that captured this fd; closing here frees the fd number (forceClose →
         // disconnect → close(fd)), so racing the teardown could let its watchdog `shutdownBoth` a
         // descriptor the OS has since reused for another connection. Awaiting the teardown guarantees
@@ -2202,6 +2227,11 @@ public actor PostgresConnection {
             try? await send(FrontendMessage.terminate())
             await watchdog.stop()                                       // finish touching fd before forceClose
         }
+        // A cancellation path can run finishStream inline rather than from a deinit-recorded Task, so
+        // inFlightTeardownTasks() above cannot see every watchdog. Stop the actor-local registry too;
+        // no await separates its empty check from forceClose(), hence no runner can arm a new watchdog
+        // before the fd is queued for close.
+        await stopActiveTeardownWatchdogs()
         forceClose()
     }
 

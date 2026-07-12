@@ -343,13 +343,17 @@ for the next chunk, a `CommandComplete` closes the portal (`Close` + `Sync`) —
 socket buffer fills and the server blocks on its write. Memory is bounded to about one chunk.
 
 Early termination is clean because chunking gives the server natural stop points: dropping the
-stream (a `break`, or letting it go) runs `finishStream` from the `StreamCleanup` `deinit`,
+stream (a `break`, or letting it go) runs `finishStream` from the mode-tagged
+`AbandonedSequenceCleanup` `deinit`,
 which `Close`s the portal, `Sync`s, and drains the in-flight chunk (≤ `chunkSize` rows) to
 `ReadyForQuery`, then frees the wire — so the connection is immediately reusable. That drain is
 bounded by `teardownResyncTimeout` (a deadline plus a `SocketWatchdog`, exactly like `copyOut`):
 a server that stalls after `Close`+`Sync` closes and discards the connection instead of parking
 the teardown forever — the pool's `release` and `close` both await this teardown, so an unbounded
-one would hang them. A mid-stream server error is handled the same way (drain to `ReadyForQuery`,
+one would hang them. Each bounded runner also registers its watchdog actor-locally; immediately
+before freeing the fd, `close` stops that registry as well as awaiting deinit-recorded tasks. This
+covers inline stream-cancellation teardown, whose still-live iterator has not recorded a task yet.
+A mid-stream server error is handled the same way (drain to `ReadyForQuery`,
 then throw). `endStream` releases the exclusive hold; a wire/IO failure tears the connection down
 instead. Streaming
 inside `withTransaction` on the same connection would deadlock on `lock`, so it is a top-level
@@ -364,7 +368,7 @@ begins), so `finishStream`'s drain doesn't stall behind a still-running query ei
 `streamGeneration` guard makes a late cancel a no-op once its stream has ended (so it can never
 cancel the query of a *later* stream that now holds the wire) — the streaming analogue of the
 shared path's `currentRead === op` check. The same generation is captured by
-`StreamCleanup`/`CopyOutCleanup` and re-checked in `finishStream`/`finishCopyOut`, so a late
+`AbandonedSequenceCleanup` and re-checked in `finishStream`/`finishCopyOut`, so a late
 `deinit` from a fully-consumed stream is a no-op too — it can't `Close`+`Sync` a *newer* stream's
 portal out from under it. Without the cancel guard, a cancelled `for await` on a slow stream would
 keep the exclusive hold until the server replied.
@@ -379,7 +383,7 @@ driver — row formatting/parsing belongs to a higher layer. `Copy.swift` holds 
   the `COPY … TO STDOUT` as a Simple Query, consume the `CopyOutResponse` handshake, then pull
   `CopyData` chunks (`nextCopyData`) until `CopyDone` → `CommandComplete` → `ReadyForQuery`
   (no `Sync` — it's Simple Query). It mirrors row streaming exactly: pull-based backpressure,
-  cancellation-aware, and a `CopyOutCleanup` `deinit` that stops an abandoned copy. No
+  cancellation-aware, and an `AbandonedSequenceCleanup` `deinit` that stops an abandoned copy. No
   `CancelRequest` is used (it is async and per-backend, so it could strike the next borrower's
   query): a cancelled consumer tears the connection down at once, while a plain `break` drains the
   remainder to `ReadyForQuery` bounded by `teardownResyncTimeout` (shared with row-stream teardown)
@@ -1040,7 +1044,8 @@ environment variables.
 - `CancellationIntegrationTests`: cancelling a task parked for a pool slot or for the
   wire lock fails it with `CancellationError` and leaves the pool / connection usable;
   includes a looped test that races a cancel against a pool hand-off (proven to catch a
-  missing re-check); and cancelling an in-flight query stops it early via `CancelRequest`.
+  missing re-check); cancelling an in-flight query stops it early via `CancelRequest`; and
+  concurrent `close` stops an inline stream-teardown watchdog before freeing its fd.
 - `PipeliningIntegrationTests`: concurrent queries / executes on one connection each get
   their own reply (correlation under pipelining); a batch pipelines with queries yet stays
   atomic; and a transaction pins a concurrent query out until it commits.

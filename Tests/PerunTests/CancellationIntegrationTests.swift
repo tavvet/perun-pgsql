@@ -264,7 +264,7 @@ final class CancellationIntegrationTests: XCTestCase {
         do { _ = try await task.value; XCTFail("expected the cancelled copyOut to throw") }
         catch is CancellationError {}
 
-        // The iterator's deinit tears the connection down; it runs detached, so poll briefly.
+        // The iterator's deinit tears the connection down in an unstructured task, so poll briefly.
         var closed = false
         for _ in 0 ..< 40 where !closed {
             closed = await connection.releaseState.isClosed
@@ -274,8 +274,52 @@ final class CancellationIntegrationTests: XCTestCase {
         try? await connection.close()
     }
 
+    func testCloseStopsInlineStreamTeardownWatchdogBeforeFreeingFD() async throws {
+        // Stream cancellation calls finishStream inline, while the driving iterator is still alive,
+        // so there is no deinit-recorded teardown Task for close() to await. Park the bounded runner
+        // after it arms its watchdog and prove close() stops the actor-registered watchdog anyway
+        // before freeing the fd.
+        let connection = try await PostgresConnection.connect(integrationConfiguration())
+        let readyToRead = Gate(), startRead = Gate()
+        let teardownStarted = Gate(), releaseTeardown = Gate()
+        await connection.setBoundedTeardownStartedTestHook {
+            await teardownStarted.open()
+            await releaseTeardown.wait()
+        }
+
+        let streaming = Task {
+            var iterator = try await connection.queryStream("SELECT pg_sleep(3)").makeAsyncIterator()
+            await readyToRead.open()
+            await startRead.wait()
+            _ = try await iterator.next()    // enters the already-cancelled fast path
+        }
+        await readyToRead.wait()
+        streaming.cancel()
+        await startRead.open()
+        await teardownStarted.wait()
+
+        do {
+            try await connection.close()
+        } catch {
+            await releaseTeardown.open()
+            _ = try? await streaming.value
+            throw error
+        }
+        let watchdogCount = await connection.activeTeardownWatchdogCountForTest
+        XCTAssertEqual(watchdogCount, 0,
+                       "close() must stop every teardown watchdog before it frees the fd")
+
+        await releaseTeardown.open()
+        do {
+            _ = try await streaming.value
+            XCTFail("the cancelled stream should throw")
+        } catch is CancellationError {
+            // expected
+        }
+    }
+
     func testPoolDoesNotHandAWaiterAMidTeardownCopyOut() async throws {
-        // A broken copyOut tears down in a detached Task; its wire stays held while it drains. The
+        // A broken copyOut tears down in an unstructured Task; its wire stays held while it drains. The
         // pool's release must not hand that still-tearing-down connection to a queued waiter — the
         // waiter would park on the held lock and then fail as the teardown closes the socket. Drive
         // it deterministically: one pooled connection, held mid-copy, a waiter parked behind it, then

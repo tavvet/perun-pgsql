@@ -402,7 +402,7 @@ final class CopyIntegrationTests: XCTestCase {
     }
 
     func testCloseWaitsForAnInFlightTeardown() async throws {
-        // close() must let an abandoned copyOut/stream's detached teardown settle before it frees the
+        // close() must let an abandoned copyOut/stream's unstructured teardown settle before it frees the
         // fd — the teardown's watchdog captured this fd, and freeing it mid-teardown could let that
         // watchdog shut down a descriptor the OS has since reused. The fd-reuse race can't be provoked
         // deterministically, so we test the mechanism directly: record a still-running teardown (the
