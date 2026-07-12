@@ -221,6 +221,13 @@ public actor PostgresClient {
             await discardAndReplaceIfNeeded(connection)
             return
         }
+        // Likewise if a copyOut is still tearing down (its cleanup runs in a detached Task, so the
+        // wire may still be held while `transactionStatus` reads a stale `.idle`): handing this to a
+        // waiter would park it on the held lock and then fail it when the teardown closes the socket.
+        if state.copyActive {
+            await discardAndReplaceIfNeeded(connection)
+            return
+        }
         guard state.status == .idle else {
             await discardAndReplaceIfNeeded(connection)
             return

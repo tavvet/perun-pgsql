@@ -197,9 +197,14 @@ public actor PostgresConnection {
     /// Whether this connection is running over an encrypted TLS channel.
     public var isSecure: Bool { tls != nil }
 
-    /// The pool's release path needs both the transaction status (to decide whether to keep the
-    /// connection) and whether it was torn down mid-use (e.g. an abandoned COPY), in one hop.
-    var releaseState: (status: TransactionStatus, isClosed: Bool) { (transactionStatus, isClosed) }
+    /// The pool's release path needs the transaction status (to decide whether to keep the
+    /// connection), whether it was torn down mid-use, and whether a `COPY … TO STDOUT` is still
+    /// active — an abandoned copyOut tears down in a detached `Task`, so at release time the wire can
+    /// still be held (`copyOutActive`) while `transactionStatus` reads a stale `.idle`. The pool must
+    /// discard such a connection, not hand a waiter one whose teardown is still in flight.
+    var releaseState: (status: TransactionStatus, isClosed: Bool, copyActive: Bool) {
+        (transactionStatus, isClosed, copyOutActive)
+    }
 
     #if DEBUG
     /// Test seam (debug builds only): invoked inside `copyIn` right after `CopyInResponse` is read

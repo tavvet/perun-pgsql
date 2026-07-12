@@ -274,6 +274,49 @@ final class CancellationIntegrationTests: XCTestCase {
         try? await connection.close()
     }
 
+    func testPoolDoesNotHandAWaiterAMidTeardownCopyOut() async throws {
+        // A broken copyOut tears down in a detached Task; its wire stays held while it drains. The
+        // pool's release must not hand that still-tearing-down connection to a queued waiter — the
+        // waiter would park on the held lock and then fail as the teardown closes the socket. Drive
+        // it deterministically: one pooled connection, held mid-copy, a waiter parked behind it, then
+        // a break whose bounded drain (shortened via the seam) discards.
+        let pool = PostgresClient(configuration: try integrationConfiguration(), maxConnections: 1)
+        _ = try await pool.query("DROP TABLE IF EXISTS copy_pool_teardown")
+        _ = try await pool.query(
+            "CREATE TABLE copy_pool_teardown AS SELECT g AS id FROM generate_series(1, 2000000) g")
+
+        let inCopy = Gate(), proceed = Gate()
+        let holder = Task {
+            try await pool.withConnection { conn in
+                await conn.setCopyResyncTimeout(.milliseconds(500))   // the remainder can't drain this fast → discard
+                for try await _ in try await conn.copyOut("COPY copy_pool_teardown TO STDOUT") {
+                    await inCopy.open()          // holding the pool's only connection, mid-copy
+                    await proceed.wait()
+                    break                        // abandon → teardown drains, then discards at 500 ms
+                }
+            }
+        }
+        await inCopy.wait()
+        // A second borrower parks as a waiter (the one connection is held by `holder`).
+        let waiter = Task {
+            try await withTimeout(.seconds(3)) {
+                try await pool.query("SELECT 7 AS n").rows[0].decode("n", as: Int.self)
+            }
+        }
+        try await Task.sleep(nanoseconds: 200_000_000)   // let the waiter park
+        await proceed.open()                             // holder breaks → release() decides the waiter's fate
+
+        // With the fix, release discards the tearing-down connection and the pump serves the waiter a
+        // fresh one, promptly. Without it, the waiter is handed the held connection, stalls on its
+        // lock through the drain, then fails as it is closed (or times out on the stall).
+        let answer = try await waiter.value
+        XCTAssertEqual(answer, 7, "a waiter must be served a healthy connection, not a mid-teardown copyOut")
+
+        try await holder.value
+        _ = try await pool.query("DROP TABLE IF EXISTS copy_pool_teardown")
+        await pool.shutdown()
+    }
+
     // The hand-off (release / unlock) resumes a waiter asynchronously w.r.t.
     // cancellation, so a hand-off can win the race *after* a waiter is cancelled. A
     // waiter cancelled while parked must still fail — never run on the resource it was
