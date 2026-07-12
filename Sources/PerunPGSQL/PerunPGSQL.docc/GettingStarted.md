@@ -33,7 +33,7 @@ No extra configuration is needed — the package's `pkg-config` files land in a 
 ```swift
 // Package.swift
 dependencies: [
-    .package(url: "https://github.com/tavvet/perun-pgsql", from: "0.2.0"),
+    .package(url: "https://github.com/tavvet/perun-pgsql", from: "0.2.1"),
 ],
 targets: [
     .target(
