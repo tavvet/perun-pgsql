@@ -1710,6 +1710,13 @@ public actor PostgresConnection {
     /// tear down a newer stream that has since reused the connection.
     func finishStream(generation: UInt64) async {
         guard streamActive, streamGeneration == generation else { return }
+        // Never arm the watchdog on a closed connection: forceClose() leaves streamActive set while it
+        // frees the fd (disconnect → close(fd), which the OS can reuse), so a late teardown that reaches
+        // here *after* close() must not capture that fd in a SocketWatchdog — a starved teardown task
+        // could then let the timer shutdownBoth() a descriptor another connection now owns. send()/
+        // receive() already refuse a closed wire; the watchdog is the only raw-fd path that bypasses
+        // isClosed, so gate it here (invariant: closed ⇒ no watchdog, no fd access).
+        guard !isClosed else { streamActive = false; return }
         // Bound the drain exactly like finishCopyOut, or a server that stops responding after Close+Sync
         // would park this task in readMessage() forever — and since release()/close() now await this
         // teardown, that would hang them too. Two bounds: the in-loop deadline stops a slow *streaming*
@@ -1978,6 +1985,10 @@ public actor PostgresConnection {
     /// makes a late `deinit` a no-op once this copy has ended, so it can't tear down a newer copy.
     func finishCopyOut(generation: UInt64) async {
         guard copyOutActive, copyOutGeneration == generation else { return }
+        // Never arm the watchdog on a closed connection (see finishStream): a late teardown that reaches
+        // here after close() must not capture a freed/reused fd in a SocketWatchdog whose timer could
+        // shutdownBoth() a descriptor another connection now owns. Invariant: closed ⇒ no watchdog.
+        guard !isClosed else { copyOutActive = false; return }
         copyOutTerminating = true
         let capped = min(max(teardownResyncTimeout, .zero), .seconds(Int64(Int32.max)))
         let deadline = ContinuousClock().now + capped
