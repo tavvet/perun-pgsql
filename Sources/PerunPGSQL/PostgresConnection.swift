@@ -1710,55 +1710,58 @@ public actor PostgresConnection {
     /// tear down a newer stream that has since reused the connection.
     func finishStream(generation: UInt64) async {
         guard streamActive, streamGeneration == generation else { return }
-        // Never arm the watchdog on a closed connection: forceClose() leaves streamActive set while it
-        // frees the fd (disconnect → close(fd), which the OS can reuse), so a late teardown that reaches
-        // here *after* close() must not capture that fd in a SocketWatchdog — a starved teardown task
-        // could then let the timer shutdownBoth() a descriptor another connection now owns. send()/
-        // receive() already refuse a closed wire; the watchdog is the only raw-fd path that bypasses
-        // isClosed, so gate it here (invariant: closed ⇒ no watchdog, no fd access).
-        guard !isClosed else { streamActive = false; return }
-        // Bound the drain exactly like finishCopyOut, or a server that stops responding after Close+Sync
-        // would park this task in readMessage() forever — and since release()/close() now await this
-        // teardown, that would hang them too. Two bounds: the in-loop deadline stops a slow *streaming*
-        // drain (rows trickling but never reaching ReadyForQuery); the watchdog's socket shutdown unblocks
-        // a read *parked* with no data at all. The watchdog's stop() cancels AND awaits before any
-        // forceClose (so it can't shut a reused fd), and a fired watchdog forces a discard.
-        let capped = min(max(teardownResyncTimeout, .zero), .seconds(Int64(Int32.max)))
-        let deadline = ContinuousClock().now + capped
-        let watchdog = SocketWatchdog(fd: fd, after: capped)
-        var reachedReadyForQuery = false
-        do {
-            if !streamTerminating {
-                streamTerminating = true
-                try await send(FrontendMessage.close(.portal, name: streamPortal) + FrontendMessage.sync())
+        await runBoundedTeardown(drain: { deadline in
+            if !self.streamTerminating {
+                self.streamTerminating = true
+                try await self.send(FrontendMessage.close(.portal, name: self.streamPortal) + FrontendMessage.sync())
             }
-            drain: while true {
+            while true {
                 if ContinuousClock().now >= deadline { throw PerunError.timedOut }
-                switch try await readMessage() {
+                switch try await self.readMessage() {
                 case let .readyForQuery(status):
-                    transactionStatus = status
-                    reachedReadyForQuery = true
-                    break drain
+                    self.transactionStatus = status
+                    return                            // reached ReadyForQuery → resynced
                 case let .parameterStatus(name, value):
-                    parameters[name] = value
+                    self.parameters[name] = value
                 case let .noticeResponse(notice):
-                    noticeHandler?(notice)
+                    self.noticeHandler?(notice)
                 case let .notificationResponse(processID, channel, payload):
-                    notificationContinuation.yield(
+                    self.notificationContinuation.yield(
                         PostgresNotification(processID: processID, channel: channel, payload: payload))
                 default:
                     continue                          // discard the remaining rows / acknowledgements
                 }
             }
-        } catch {
-            // deadline, watchdog shutdown, or a transport error → discard below
-        }
+        }, onResynced: { self.endStream() }, onDiscard: { self.streamActive = false })
+    }
+
+    /// The shared bounded-teardown runner for an abandoned copyOut / row stream. Bounds `drain` two
+    /// ways — an in-loop deadline the drain honors, plus a `SocketWatchdog` whose socket shutdown
+    /// unblocks a read parked with no data — then keeps the connection (`onResynced`) only if the drain
+    /// cleanly reached ReadyForQuery on a live socket, else `forceClose`s and discards (`onDiscard`).
+    /// Never touches the fd on a closed connection: a late teardown reaching here after `close()` must
+    /// not arm a watchdog on a freed/reused fd (see the callers). `stop()` cancels AND awaits the
+    /// watchdog before any `forceClose`, so it can never shut a reused fd, and a fired watchdog forces a
+    /// discard even if the drain "reached" ReadyForQuery on a dead socket. `drain` returns normally on
+    /// ReadyForQuery and throws on deadline / watchdog shutdown / transport error.
+    private func runBoundedTeardown(
+        drain: (_ deadline: ContinuousClock.Instant) async throws -> Void,
+        onResynced: () -> Void,
+        onDiscard: () -> Void
+    ) async {
+        guard !isClosed else { onDiscard(); return }
+        let capped = min(max(teardownResyncTimeout, .zero), .seconds(Int64(Int32.max)))
+        let deadline = ContinuousClock().now + capped
+        let watchdog = SocketWatchdog(fd: fd, after: capped)
+        var resynced = false
+        do { try await drain(deadline); resynced = true }
+        catch { /* deadline, watchdog shutdown, or transport error → discard below */ }
         let fired = await watchdog.stop()
-        if reachedReadyForQuery, !fired {
-            endStream()                               // reached ReadyForQuery on a healthy socket: reusable
+        if resynced, !fired {
+            onResynced()
         } else {
-            if !isClosed { forceClose() }             // stalled/slow drain, or the watchdog shut it: discard
-            streamActive = false
+            if !isClosed { forceClose() }
+            onDiscard()
         }
     }
 
@@ -1985,29 +1988,10 @@ public actor PostgresConnection {
     /// makes a late `deinit` a no-op once this copy has ended, so it can't tear down a newer copy.
     func finishCopyOut(generation: UInt64) async {
         guard copyOutActive, copyOutGeneration == generation else { return }
-        // Never arm the watchdog on a closed connection (see finishStream): a late teardown that reaches
-        // here after close() must not capture a freed/reused fd in a SocketWatchdog whose timer could
-        // shutdownBoth() a descriptor another connection now owns. Invariant: closed ⇒ no watchdog.
-        guard !isClosed else { copyOutActive = false; return }
-        copyOutTerminating = true
-        let capped = min(max(teardownResyncTimeout, .zero), .seconds(Int64(Int32.max)))
-        let deadline = ContinuousClock().now + capped
-        // Two bounds: `drainToReadyForQuery`'s in-loop deadline stops a fast *streaming* drain; the
-        // watchdog's shutdown unblocks a *stalled* read. The watchdog's stop() cancels AND awaits before
-        // any forceClose (so it can never shut a reused fd), and a fired watchdog forces a discard even
-        // if the drain "reached" ReadyForQuery on the dead socket.
-        let watchdog = SocketWatchdog(fd: fd, after: capped)
-
-        var resynced = false
-        do { try await drainToReadyForQuery(deadline: deadline); resynced = true }
-        catch { /* deadline, watchdog shutdown, or transport error → discard below */ }
-        let fired = await watchdog.stop()
-        if resynced, !fired {
-            endCopyOut()                          // reached ReadyForQuery on a healthy socket: reusable
-        } else {
-            if !isClosed { forceClose() }         // large/slow remainder, or the watchdog shut it: discard
-            copyOutActive = false
-        }
+        await runBoundedTeardown(drain: { deadline in
+            self.copyOutTerminating = true                       // ignore any trailing CopyData while draining
+            try await self.drainToReadyForQuery(deadline: deadline)
+        }, onResynced: { self.endCopyOut() }, onDiscard: { self.copyOutActive = false })
     }
 
     private func endCopyOut() {
