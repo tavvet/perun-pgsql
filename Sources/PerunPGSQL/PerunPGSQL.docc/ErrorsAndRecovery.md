@@ -97,9 +97,11 @@ Cancellation is **best-effort**, and this matters for correctness:
 
 A ``PostgresCopyOutSequence`` is the exception: a COPY-out can't be stopped in band, so cancelling
 one (including via a wrapping ``withTimeout(_:_:)``) **tears the connection down and discards it**
-rather than draining and keeping it — the pool transparently opens a replacement. Breaking out of a
-copyOut *without* cancelling instead drains the remainder to keep the connection (closing it if the
-remainder is large); neither path sends a `CancelRequest`.
+rather than draining and keeping it — the pool opens a replacement when a caller is waiting (an idle
+pool just shrinks until the next acquire). Breaking out of a copyOut *without* cancelling instead
+drains the remainder to keep the connection (closing it if the remainder is large); neither path
+sends a `CancelRequest`, so the server-side COPY keeps running until its next write to the closed
+socket fails.
 
 ## Timeouts
 

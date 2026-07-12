@@ -392,9 +392,10 @@ driver — row formatting/parsing belongs to a higher layer. `Copy.swift` holds 
 
 Each handshake reader rejects a **wrong-direction** statement instead of misbehaving: `copyOut`
 of a `FROM STDIN` (the server would then wait for client data and the read would hang) aborts
-the copy with `CopyFail`, drains, and throws; `copyIn` of a `TO STDOUT` (the server streams to
-us — potentially the whole relation) fires a `CancelRequest`, drains, and throws. Both use a
-shared `drainToReadyForQuery`.
+the copy with `CopyFail`, drains via the shared `drainToReadyForQuery`, and throws — leaving the
+connection reusable. `copyIn` of a `TO STDOUT` (the server streams to us — potentially the whole
+relation, which a COPY-out can't be stopped in band to drain) instead `forceClose`s the
+connection and throws; the pool discards it.
 
 ### Simple Query
 
@@ -758,13 +759,16 @@ Acquire behavior:
    the server may have closed it while it sat idle (a shutdown, `pg_terminate_backend`, or an
    idle timeout leaves a termination `ErrorResponse` + socket close that no background reader was
    running to notice).
-   The probe
-   is a cheap non-blocking `MSG_PEEK` (`SystemSocket.isQuiescentOpen`, run on the read queue so
-   it can't race the reader): a drained connection has nothing waiting, so `EWOULDBLOCK` means
-   healthy, while EOF or unexpected pending bytes means dead. A dead one is discarded
-   (`openCount -= 1`, closed) and the next idle connection is tried, so a borrower never gets a
-   connection whose first query would fail. Best-effort — it can still die right after — with
-   the borrower's own error path as the backstop; TLS is probed at the TCP level.
+   The probe checks three layers, top down: any frame the driver already read *above* the socket
+   (`readBuffer`) is walked and decoded — a benign async message (`A`/`N`/`S`) is kept, anything
+   else (e.g. a termination `E`) is dead; then, for TLS, bytes OpenSSL already pulled off the
+   socket (`TLSConnection.pendingBytes` — decrypted or ciphertext in the read BIO) mean dead; then
+   a cheap non-blocking `MSG_PEEK` (`SystemSocket.isQuiescentOpen`, on the read queue so it can't
+   race the reader) — `EWOULDBLOCK` (nothing waiting) is healthy, while EOF *or any pending byte*
+   is dead (one peeked byte can't safely classify what a whole frame the readBuffer walk already
+   handled could). A dead one is discarded (`openCount -= 1`, closed) and the next idle connection
+   is tried, so a borrower never gets a connection whose first query would fail. Best-effort — it
+   can still die right after — with the borrower's own error path as the backstop.
 3. Open a new connection if under capacity.
 4. Otherwise enqueue a waiter. An enqueued waiter is cancellation-aware — the same
    pattern as the wire lock: if its task is cancelled it leaves the queue and

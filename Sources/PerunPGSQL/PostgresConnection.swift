@@ -481,8 +481,11 @@ public actor PostgresConnection {
     /// Stream the payload of a `COPY … TO STDOUT` as raw `CopyData` chunks — an
     /// `AsyncSequence` of `[UInt8]` in the COPY statement's format (text/CSV/binary),
     /// opaque to the driver. Like `queryStream` it holds the connection exclusively until
-    /// consumed and frees it on early stop (`break`, error, or cancellation), which
-    /// cancels the COPY server-side. `COPY (SELECT …) TO STDOUT` works too.
+    /// consumed. Stopping early sends **no** `CancelRequest`: a `break` (or an error) drains the
+    /// remainder to resync and keep the connection — closing it instead if the remainder is large —
+    /// while cancelling the task (including via ``withTimeout(_:_:)``) tears the connection down and
+    /// discards it. On either discard path the server-side COPY isn't stopped in band, so it runs
+    /// until its next write to the now-closed socket fails. `COPY (SELECT …) TO STDOUT` works too.
     public func copyOut(_ sql: String) async throws -> PostgresCopyOutSequence {
         try await lock()                         // exclusive; released when the copy ends
         do {
