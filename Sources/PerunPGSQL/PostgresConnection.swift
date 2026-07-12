@@ -113,6 +113,67 @@ final class TeardownBox: @unchecked Sendable {
     func currentTask() -> Task<Void, Never>? { lock.withLock { entry?.task } }
 }
 
+/// Which abandoned exclusive-wire sequence a teardown belongs to. Tagged onto the cleanup so the one
+/// scheduler routes a `deinit` to the right per-mode teardown (and, for copyOut, the right cancel
+/// policy). `Sendable` so it can cross the `deinit`-on-any-thread boundary.
+enum TeardownMode: Sendable {
+    case copyOut
+    case stream
+}
+
+/// Releases an abandoned exclusive-wire async sequence (a `COPY … TO STDOUT` or a row stream) when its
+/// **driving iterator** is dropped — a `break`, the loop ending, or a `CancellationError` unwinding
+/// through the `for await` body. Routing and the record-for-the-pool live on the connection's shared
+/// `scheduleTeardownFromDeinit` (`Task.isCancelled` must be read there, synchronously on this unwinding
+/// task). A sequence consumed to its end already cleaned up, so the scheduled teardown is a
+/// generation-guarded no-op.
+final class AbandonedSequenceCleanup: @unchecked Sendable {
+    private let connection: PostgresConnection
+    private let generation: UInt64      // the sequence this cleanup belongs to; a stale deinit is a no-op
+    private let mode: TeardownMode
+
+    init(connection: PostgresConnection, generation: UInt64, mode: TeardownMode) {
+        self.connection = connection
+        self.generation = generation
+        self.mode = mode
+    }
+
+    deinit {
+        connection.scheduleTeardownFromDeinit(generation: generation, mode: mode)
+    }
+}
+
+/// Frees a sequence that was **created but never iterated** (the sequence value dropped without a
+/// `for await`). Once iteration begins the iterator's `AbandonedSequenceCleanup` owns teardown, so a
+/// sequence temporary released mid-iteration is a no-op here.
+final class AbandonedSequenceLifetime: @unchecked Sendable {
+    private let connection: PostgresConnection
+    private let generation: UInt64
+    private let mode: TeardownMode
+    private let lock = POSIXLock()
+    private var iteratorTaken = false
+
+    init(connection: PostgresConnection, generation: UInt64, mode: TeardownMode) {
+        self.connection = connection
+        self.generation = generation
+        self.mode = mode
+    }
+
+    /// Claim the single driving iterator; returns true for the first caller only. Thread-safe.
+    func claimIterator() -> Bool {
+        lock.withLock {
+            guard !iteratorTaken else { return false }
+            iteratorTaken = true
+            return true
+        }
+    }
+
+    deinit {
+        guard !lock.withLock({ iteratorTaken }) else { return }   // an iterator owns teardown
+        connection.scheduleTeardownFromDeinit(generation: generation, mode: mode)
+    }
+}
+
 /// A single connection to a PostgreSQL server.
 ///
 /// The connection is an `actor`, so its socket buffer and protocol state are
@@ -1816,17 +1877,26 @@ public actor PostgresConnection {
         copyOutTeardownBox.record(generation: generation, task: task)
     }
 
-    /// Spawn and record the teardown of an abandoned copyOut from an iterator/sequence `deinit`, so
-    /// both cleanups (`CopyOutCleanup`, `CopyOutLifetime`) share one authority. `Task.isCancelled` is
-    /// read *here*, synchronously on the (possibly cancelled) unwinding task — the detached Task starts
-    /// fresh and would never see it — to route a cancel to a prompt discard and a plain break to the
-    /// bounded drain. It selects *policy*, not correctness: both routes are wire-safe, so a misread only
-    /// picks a suboptimal keep/discard, never a desync.
-    nonisolated func scheduleCopyOutTeardownFromDeinit(generation: UInt64) {
+    /// Spawn and record the teardown of an abandoned copyOut / row stream from an iterator/sequence
+    /// `deinit`, so both modes and both cleanup classes share one authority. `Task.isCancelled` is read
+    /// *here*, synchronously on the (possibly cancelled) unwinding task — the unstructured `Task` below
+    /// starts fresh and would never see it. For **copyOut** it routes a cancel to a prompt discard and a
+    /// plain break to the bounded drain (policy, not correctness — both routes are wire-safe). A
+    /// **stream** abandon always takes the same bounded `finishStream`: there is no cancel-vs-break
+    /// policy to capture here, because a stream cancel already fired its `CancelRequest` in
+    /// `nextStreamRow`. The per-mode box's `generation` guard drops a stale iterator's late write.
+    nonisolated func scheduleTeardownFromDeinit(generation: UInt64, mode: TeardownMode) {
         let cancelled = Task.isCancelled
-        recordCopyOutTeardown(
-            generation: generation,
-            task: Task { await self.endCopyOutFromCleanup(generation: generation, cancelled: cancelled) })
+        switch mode {
+        case .copyOut:
+            recordCopyOutTeardown(
+                generation: generation,
+                task: Task { await self.endCopyOutFromCleanup(generation: generation, cancelled: cancelled) })
+        case .stream:
+            recordStreamTeardown(
+                generation: generation,
+                task: Task { await self.finishStream(generation: generation) })
+        }
     }
 
     /// The row-stream analogue of `copyOutTeardownBox`: a broken `queryStream` drains in a detached
@@ -1836,15 +1906,6 @@ public actor PostgresConnection {
     /// Record a stream teardown Task from the iterator's `deinit`, like `recordCopyOutTeardown`.
     nonisolated func recordStreamTeardown(generation: UInt64, task: Task<Void, Never>) {
         streamTeardownBox.record(generation: generation, task: task)
-    }
-
-    /// Spawn and record the teardown of an abandoned row stream from a `deinit`, so both cleanups
-    /// (`StreamCleanup`, `StreamLifetime`) share one authority. Unlike copyOut, a stream abandon always
-    /// takes the same bounded `finishStream` drain — there is no cancel-vs-break policy to capture.
-    nonisolated func scheduleStreamTeardownFromDeinit(generation: UInt64) {
-        recordStreamTeardown(
-            generation: generation,
-            task: Task { await self.finishStream(generation: generation) })
     }
 
     /// The in-flight teardown tasks the caller must await before sampling wire state (an abandoned

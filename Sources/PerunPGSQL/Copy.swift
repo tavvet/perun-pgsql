@@ -24,12 +24,12 @@ public struct PostgresCopyOutSequence: AsyncSequence, Sendable {
 
     private let connection: PostgresConnection
     private let generation: UInt64
-    private let lifetime: CopyOutLifetime
+    private let lifetime: AbandonedSequenceLifetime
 
     init(connection: PostgresConnection, generation: UInt64) {
         self.connection = connection
         self.generation = generation
-        self.lifetime = CopyOutLifetime(connection: connection, generation: generation)
+        self.lifetime = AbandonedSequenceLifetime(connection: connection, generation: generation, mode: .copyOut)
     }
 
     public func makeAsyncIterator() -> AsyncIterator {
@@ -38,7 +38,7 @@ public struct PostgresCopyOutSequence: AsyncSequence, Sendable {
         // is retained; a second iterator is inert (no cleanup, generation 0).
         if lifetime.claimIterator() {
             return AsyncIterator(connection: connection,
-                                 cleanup: CopyOutCleanup(connection: connection, generation: generation),
+                                 cleanup: AbandonedSequenceCleanup(connection: connection, generation: generation, mode: .copyOut),
                                  generation: generation)
         }
         return AsyncIterator(connection: connection, cleanup: nil, generation: 0)
@@ -46,63 +46,12 @@ public struct PostgresCopyOutSequence: AsyncSequence, Sendable {
 
     public struct AsyncIterator: AsyncIteratorProtocol {
         let connection: PostgresConnection
-        let cleanup: CopyOutCleanup?    // frees the wire when the driving iterator is dropped; nil if inert
+        let cleanup: AbandonedSequenceCleanup?   // frees the wire when the driving iterator is dropped; nil if inert
         let generation: UInt64          // 0 for an inert duplicate iterator, so next() yields nothing
 
         public mutating func next() async throws -> [UInt8]? {
             try await connection.nextCopyData(generation: generation)
         }
-    }
-}
-
-/// Releases a `COPY … TO STDOUT` that the consumer abandoned before it finished. If the consuming
-/// task was cancelled — including a `CancellationError` thrown from the `for await` *body*, which
-/// unwinds through here rather than through `nextCopyData` — the connection is torn down at once.
-/// Otherwise (a plain `break`) the remainder is drained to `ReadyForQuery`, bounded by
-/// `teardownResyncTimeout`: the connection is kept when the remainder is cheap and closed when it isn't.
-/// No `CancelRequest` either way. A copy consumed to its end has already cleaned up, so this is a
-/// no-op.
-final class CopyOutCleanup: @unchecked Sendable {
-    private let connection: PostgresConnection
-    private let generation: UInt64      // the copy this cleanup belongs to; a stale deinit is a no-op
-
-    init(connection: PostgresConnection, generation: UInt64) {
-        self.connection = connection
-        self.generation = generation
-    }
-
-    deinit {
-        // Routing (cancel → discard, break → drain) and the record-for-the-pool live on the shared
-        // scheduler; Task.isCancelled must be read there, synchronously on this unwinding task.
-        connection.scheduleCopyOutTeardownFromDeinit(generation: generation)
-    }
-}
-
-/// Frees a copy that was created but never iterated. Once iteration begins the iterator's
-/// `CopyOutCleanup` owns teardown, so a sequence temporary released mid-iteration is a no-op here.
-final class CopyOutLifetime: @unchecked Sendable {
-    private let connection: PostgresConnection
-    private let generation: UInt64
-    private let lock = POSIXLock()
-    private var iteratorTaken = false
-
-    init(connection: PostgresConnection, generation: UInt64) {
-        self.connection = connection
-        self.generation = generation
-    }
-
-    /// Claim the single driving iterator; returns true for the first caller only. Thread-safe.
-    func claimIterator() -> Bool {
-        lock.withLock {
-            guard !iteratorTaken else { return false }
-            iteratorTaken = true
-            return true
-        }
-    }
-
-    deinit {
-        guard !lock.withLock({ iteratorTaken }) else { return }   // an iterator owns teardown
-        connection.scheduleCopyOutTeardownFromDeinit(generation: generation)
     }
 }
 

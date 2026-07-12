@@ -162,8 +162,8 @@ final class StreamingIntegrationTests: XCTestCase {
         let connection = try await PostgresConnection.connect(integrationConfiguration())
         defer { Task { try? await connection.close() } }
 
-        // Consume stream A to completion but keep its iterator alive, so A's StreamCleanup.deinit
-        // — which enqueues the stale finishStream — has not run yet.
+        // Consume stream A to completion but keep its iterator alive, so A's AbandonedSequenceCleanup
+        // deinit — which enqueues the stale finishStream — has not run yet.
         var iteratorA: PostgresRowStream.AsyncIterator? =
             try await connection.queryStream("SELECT g FROM generate_series(1, 10) g").makeAsyncIterator()
         var aRows = 0
@@ -176,7 +176,7 @@ final class StreamingIntegrationTests: XCTestCase {
         let firstB = try await iteratorB.next()         // B is active; the generation is now B's
         XCTAssertNotNil(firstB)
 
-        // Drop A's iterator → StreamCleanup.deinit → finishStream(generation: A) while B is live.
+        // Drop A's iterator → AbandonedSequenceCleanup deinit → finishStream(generation: A) while B is live.
         // The generation guard must make it a no-op; without it, it closes B's portal and steals rows.
         iteratorA = nil
         try await Task.sleep(for: .milliseconds(50))    // give the deinit's Task time to run

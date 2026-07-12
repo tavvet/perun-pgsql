@@ -19,12 +19,12 @@ public struct PostgresRowStream: AsyncSequence, Sendable {
 
     private let connection: PostgresConnection
     private let generation: UInt64
-    private let lifetime: StreamLifetime
+    private let lifetime: AbandonedSequenceLifetime
 
     init(connection: PostgresConnection, generation: UInt64) {
         self.connection = connection
         self.generation = generation
-        self.lifetime = StreamLifetime(connection: connection, generation: generation)
+        self.lifetime = AbandonedSequenceLifetime(connection: connection, generation: generation, mode: .stream)
     }
 
     public func makeAsyncIterator() -> AsyncIterator {
@@ -35,7 +35,7 @@ public struct PostgresRowStream: AsyncSequence, Sendable {
         // an active stream — so it can neither pull rows nor tear down the first iterator's stream.
         if lifetime.claimIterator() {
             return AsyncIterator(connection: connection,
-                                 cleanup: StreamCleanup(connection: connection, generation: generation),
+                                 cleanup: AbandonedSequenceCleanup(connection: connection, generation: generation, mode: .stream),
                                  generation: generation)
         }
         return AsyncIterator(connection: connection, cleanup: nil, generation: 0)
@@ -43,7 +43,7 @@ public struct PostgresRowStream: AsyncSequence, Sendable {
 
     public struct AsyncIterator: AsyncIteratorProtocol {
         let connection: PostgresConnection
-        let cleanup: StreamCleanup?     // frees the wire when the driving iterator is dropped; nil if inert
+        let cleanup: AbandonedSequenceCleanup?   // frees the wire when the driving iterator is dropped; nil if inert
         let generation: UInt64          // 0 for an inert duplicate iterator, so next() yields nothing
 
         public mutating func next() async throws -> PostgresRow? {
@@ -52,52 +52,3 @@ public struct PostgresRowStream: AsyncSequence, Sendable {
     }
 }
 
-/// Releases a stream that the consumer abandoned before it finished. When the iterator is
-/// dropped — a `break` out of the loop, the loop ending, or simply letting it go — this `deinit`
-/// asks the connection to close the portal, drain the remaining rows of the current chunk, and
-/// free the wire, so the connection is immediately reusable. A stream consumed to its end has
-/// already cleaned up, so the connection call is a no-op.
-final class StreamCleanup: @unchecked Sendable {
-    private let connection: PostgresConnection
-    private let generation: UInt64      // the stream this cleanup belongs to; a stale deinit is a no-op
-
-    init(connection: PostgresConnection, generation: UInt64) {
-        self.connection = connection
-        self.generation = generation
-    }
-
-    deinit {
-        // The shared scheduler spawns finishStream and hands the pool a handle, so release() awaits it
-        // settling instead of racing the drain and handing a waiter a mid-teardown wire.
-        connection.scheduleStreamTeardownFromDeinit(generation: generation)
-    }
-}
-
-/// Frees a stream that was created but never iterated (the sequence value was dropped without a
-/// `for await`). Once iteration begins, the iterator's `StreamCleanup` owns teardown and this
-/// becomes a no-op, so a sequence *temporary* released mid-iteration can't tear down the live stream.
-final class StreamLifetime: @unchecked Sendable {
-    private let connection: PostgresConnection
-    private let generation: UInt64
-    private let lock = POSIXLock()
-    private var iteratorTaken = false
-
-    init(connection: PostgresConnection, generation: UInt64) {
-        self.connection = connection
-        self.generation = generation
-    }
-
-    /// Claim the single driving iterator; returns true for the first caller only. Thread-safe.
-    func claimIterator() -> Bool {
-        lock.withLock {
-            guard !iteratorTaken else { return false }
-            iteratorTaken = true
-            return true
-        }
-    }
-
-    deinit {
-        guard !lock.withLock({ iteratorTaken }) else { return }   // an iterator owns teardown
-        connection.scheduleStreamTeardownFromDeinit(generation: generation)
-    }
-}
