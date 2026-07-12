@@ -72,17 +72,9 @@ final class CopyOutCleanup: @unchecked Sendable {
     }
 
     deinit {
-        let connection = self.connection
-        let generation = self.generation
-        // Captured here, on the (possibly cancelled) task that is unwinding — the detached Task below
-        // starts fresh and would never see the cancellation. This selects *policy* (discard vs.
-        // bounded drain), not correctness: both routes are wire-safe, so a misread on some unusual
-        // release context only picks a suboptimal keep/discard, never a desync.
-        let cancelled = Task.isCancelled
-        let task = Task { await connection.endCopyOutFromCleanup(generation: generation, cancelled: cancelled) }
-        // Hand the pool a handle to this teardown: release() awaits it before judging the connection,
-        // so a cheap-remainder `break` drain that keeps the connection isn't lost to a race (Finding).
-        connection.recordCopyOutTeardown(generation: generation, task: task)
+        // Routing (cancel → discard, break → drain) and the record-for-the-pool live on the shared
+        // scheduler; Task.isCancelled must be read there, synchronously on this unwinding task.
+        connection.scheduleCopyOutTeardownFromDeinit(generation: generation)
     }
 }
 
@@ -109,12 +101,8 @@ final class CopyOutLifetime: @unchecked Sendable {
     }
 
     deinit {
-        guard !lock.withLock({ iteratorTaken }) else { return }
-        let connection = self.connection
-        let generation = self.generation
-        let cancelled = Task.isCancelled
-        let task = Task { await connection.endCopyOutFromCleanup(generation: generation, cancelled: cancelled) }
-        connection.recordCopyOutTeardown(generation: generation, task: task)   // racing release() awaits it
+        guard !lock.withLock({ iteratorTaken }) else { return }   // an iterator owns teardown
+        connection.scheduleCopyOutTeardownFromDeinit(generation: generation)
     }
 }
 

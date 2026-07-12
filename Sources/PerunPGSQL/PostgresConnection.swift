@@ -1788,6 +1788,19 @@ public actor PostgresConnection {
         copyOutTeardownBox.record(generation: generation, task: task)
     }
 
+    /// Spawn and record the teardown of an abandoned copyOut from an iterator/sequence `deinit`, so
+    /// both cleanups (`CopyOutCleanup`, `CopyOutLifetime`) share one authority. `Task.isCancelled` is
+    /// read *here*, synchronously on the (possibly cancelled) unwinding task — the detached Task starts
+    /// fresh and would never see it — to route a cancel to a prompt discard and a plain break to the
+    /// bounded drain. It selects *policy*, not correctness: both routes are wire-safe, so a misread only
+    /// picks a suboptimal keep/discard, never a desync.
+    nonisolated func scheduleCopyOutTeardownFromDeinit(generation: UInt64) {
+        let cancelled = Task.isCancelled
+        recordCopyOutTeardown(
+            generation: generation,
+            task: Task { await self.endCopyOutFromCleanup(generation: generation, cancelled: cancelled) })
+    }
+
     /// The row-stream analogue of `copyOutTeardownBox`: a broken `queryStream` drains in a detached
     /// `Task` too, so the pool must await it the same way before judging the connection.
     private let streamTeardownBox = TeardownBox()
@@ -1795,6 +1808,15 @@ public actor PostgresConnection {
     /// Record a stream teardown Task from the iterator's `deinit`, like `recordCopyOutTeardown`.
     nonisolated func recordStreamTeardown(generation: UInt64, task: Task<Void, Never>) {
         streamTeardownBox.record(generation: generation, task: task)
+    }
+
+    /// Spawn and record the teardown of an abandoned row stream from a `deinit`, so both cleanups
+    /// (`StreamCleanup`, `StreamLifetime`) share one authority. Unlike copyOut, a stream abandon always
+    /// takes the same bounded `finishStream` drain — there is no cancel-vs-break policy to capture.
+    nonisolated func scheduleStreamTeardownFromDeinit(generation: UInt64) {
+        recordStreamTeardown(
+            generation: generation,
+            task: Task { await self.finishStream(generation: generation) })
     }
 
     /// The in-flight teardown tasks the caller must await before sampling wire state (an abandoned
