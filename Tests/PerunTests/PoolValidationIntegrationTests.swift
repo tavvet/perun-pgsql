@@ -17,6 +17,23 @@ final class PoolValidationIntegrationTests: XCTestCase {
         await pool.shutdown()
     }
 
+    func testLivenessCheckSeesDriverBufferedBytes() async throws {
+        // readSlice reads ahead, so a read can leave trailing bytes in the driver's own readBuffer
+        // that the socket and OpenSSL peeks can't see. A pooled connection carrying such bytes must
+        // be judged dead — otherwise the next borrower gets a stale, out-of-sync wire.
+        let connection = try await PostgresConnection.connect(integrationConfiguration())
+        defer { Task { try? await connection.close() } }
+        _ = try await connection.query("SELECT 1").rows          // steady state, drained to RFQ
+
+        let aliveWhenDrained = await connection.isProbablyAlive()
+        XCTAssertTrue(aliveWhenDrained, "a freshly drained connection must look alive")
+
+        await connection.primeReadBufferForTest(4)
+        let aliveWithBuffered = await connection.isProbablyAlive()
+        XCTAssertFalse(aliveWithBuffered,
+                       "unconsumed bytes in the driver read buffer must make the connection look dead")
+    }
+
     func testTerminatedIdleConnectionIsReplaced() async throws {
         let configuration = try integrationConfiguration()
         let pool = PostgresClient(configuration: configuration, maxConnections: 1)

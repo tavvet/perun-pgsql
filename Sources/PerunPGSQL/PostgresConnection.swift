@@ -2296,6 +2296,10 @@ public actor PostgresConnection {
     /// it cannot race the background reader.
     func isProbablyAlive() async -> Bool {
         guard !isClosed else { return false }
+        // Unconsumed framed bytes already sit *above* the socket: readSlice reads ahead, so a read
+        // carrying ReadyForQuery plus a following termination/error can land wholly in readBuffer
+        // while the socket and OpenSSL below read empty. Check that first, on the actor.
+        guard readBuffer.count - readOffset == 0 else { return false }
         let fd = self.fd
         let tls = self.tls
         let plaintext = (tls == nil)
@@ -2320,6 +2324,12 @@ public actor PostgresConnection {
         guard let tls else { return false }
         tls.primeReadBIOForTest(count)
         return true
+    }
+
+    /// Test seam: leave `count` bytes unconsumed in the driver's own read buffer, standing in for a
+    /// read-ahead that pulled trailing bytes in alongside the last message.
+    func primeReadBufferForTest(_ count: Int) {
+        readBuffer.append(contentsOf: [UInt8](repeating: 0, count: count))
     }
     #endif
 
