@@ -18,9 +18,9 @@ final class PoolValidationIntegrationTests: XCTestCase {
     }
 
     func testLivenessCheckSeesDriverBufferedBytes() async throws {
-        // readSlice reads ahead, so a read can leave trailing bytes in the driver's own readBuffer
-        // that the socket and OpenSSL peeks can't see. A pooled connection carrying such bytes must
-        // be judged dead — otherwise the next borrower gets a stale, out-of-sync wire.
+        // readSlice reads ahead, so a read can leave a trailing message in the driver's own readBuffer
+        // that the socket and OpenSSL peeks can't see. A pooled connection carrying a buffered
+        // termination/error must be judged dead — otherwise the next borrower gets a stale wire.
         let connection = try await PostgresConnection.connect(integrationConfiguration())
         defer { Task { try? await connection.close() } }
         _ = try await connection.query("SELECT 1").rows          // steady state, drained to RFQ
@@ -28,10 +28,22 @@ final class PoolValidationIntegrationTests: XCTestCase {
         let aliveWhenDrained = await connection.isProbablyAlive()
         XCTAssertTrue(aliveWhenDrained, "a freshly drained connection must look alive")
 
-        await connection.primeReadBufferForTest(4)
+        await connection.primeReadBufferForTest(UInt8(ascii: "E"))   // a buffered ErrorResponse (termination)
         let aliveWithBuffered = await connection.isProbablyAlive()
         XCTAssertFalse(aliveWithBuffered,
-                       "unconsumed bytes in the driver read buffer must make the connection look dead")
+                       "a buffered non-async message must make the connection look dead")
+    }
+
+    func testLivenessKeepsConnectionWithBufferedAsyncMessage() async throws {
+        // A benign async message read into the buffer (NotificationResponse) must NOT discard the
+        // connection — the reader consumes it next — matching isQuiescentOpen's plaintext A/N/S rule.
+        let connection = try await PostgresConnection.connect(integrationConfiguration())
+        defer { Task { try? await connection.close() } }
+        _ = try await connection.query("SELECT 1").rows
+
+        await connection.primeReadBufferForTest(UInt8(ascii: "A"))   // a buffered NotificationResponse
+        let alive = await connection.isProbablyAlive()
+        XCTAssertTrue(alive, "a buffered async message must keep the connection alive, not discard it")
     }
 
     func testTerminatedIdleConnectionIsReplaced() async throws {

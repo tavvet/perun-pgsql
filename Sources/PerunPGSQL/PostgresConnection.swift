@@ -2315,9 +2315,19 @@ public actor PostgresConnection {
     func isProbablyAlive() async -> Bool {
         guard !isClosed else { return false }
         // Unconsumed framed bytes already sit *above* the socket: readSlice reads ahead, so a read
-        // carrying ReadyForQuery plus a following termination/error can land wholly in readBuffer
-        // while the socket and OpenSSL below read empty. Check that first, on the actor.
-        guard readBuffer.count - readOffset == 0 else { return false }
+        // carrying ReadyForQuery plus a following message can land wholly in readBuffer while the
+        // socket and OpenSSL below read empty. Classify the first the way isQuiescentOpen does — a
+        // buffered async message (NotificationResponse 'A' / NoticeResponse 'N' / ParameterStatus
+        // 'S') is benign, the reader consumes it next, so keep; anything else (e.g. a termination
+        // 'E') is a desync. Decoded message bytes, so this holds for TLS too. Checked on the actor.
+        if readBuffer.count - readOffset > 0 {
+            switch readBuffer[readOffset] {
+            case UInt8(ascii: "A"), UInt8(ascii: "N"), UInt8(ascii: "S"):
+                break                      // benign buffered async message — fall through to the socket/TLS peek
+            default:
+                return false
+            }
+        }
         let fd = self.fd
         let tls = self.tls
         let plaintext = (tls == nil)
@@ -2344,10 +2354,10 @@ public actor PostgresConnection {
         return true
     }
 
-    /// Test seam: leave `count` bytes unconsumed in the driver's own read buffer, standing in for a
-    /// read-ahead that pulled trailing bytes in alongside the last message.
-    func primeReadBufferForTest(_ count: Int) {
-        readBuffer.append(contentsOf: [UInt8](repeating: 0, count: count))
+    /// Test seam: leave a `firstByte`-tagged message unconsumed in the driver's own read buffer,
+    /// standing in for a read-ahead that pulled a trailing message in alongside the last one.
+    func primeReadBufferForTest(_ firstByte: UInt8) {
+        readBuffer.append(contentsOf: [firstByte, 0, 0, 0])
     }
     #endif
 
