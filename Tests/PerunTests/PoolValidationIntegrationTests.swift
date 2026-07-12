@@ -47,6 +47,21 @@ final class PoolValidationIntegrationTests: XCTestCase {
         XCTAssertFalse(alive, "an 'E' buffered behind a benign 'A' must still make the connection look dead")
     }
 
+    func testLivenessRejectsAMalformedAsyncFrameLengthHidingAnError() async throws {
+        // The walk must validate the frame length like the framing decoder: a garbage length (0xFFFFFFFF,
+        // a negative Int32) must read as a desync, not a benign "incomplete" frame — otherwise a
+        // termination 'E' queued right behind such an 'A' hides and the connection looks alive.
+        let connection = try await PostgresConnection.connect(integrationConfiguration())
+        defer { Task { try? await connection.close() } }
+        _ = try await connection.query("SELECT 1").rows
+
+        // 'A' with length 0xFFFFFFFF (a negative Int32), then a well-formed empty 'E' behind it.
+        await connection.primeReadBufferRawForTest([UInt8(ascii: "A"), 0xFF, 0xFF, 0xFF, 0xFF,
+                                                    UInt8(ascii: "E"), 0, 0, 0, 4])
+        let alive = await connection.isProbablyAlive()
+        XCTAssertFalse(alive, "a malformed async frame length must read as dead, not hide the 'E' behind it")
+    }
+
     func testLivenessKeepsConnectionWithBufferedAsyncMessage() async throws {
         // A benign async message read into the buffer (NotificationResponse) must NOT discard the
         // connection — the reader consumes it next — matching isQuiescentOpen's plaintext A/N/S rule.

@@ -2363,11 +2363,17 @@ public actor PostgresConnection {
                 return false               // a non-async message (e.g. a termination 'E') is already queued
             }
             guard pos + 5 <= readBuffer.count else { break }   // partial header: incomplete trailing frame, safe
-            let length = (Int(readBuffer[pos + 1]) << 24) | (Int(readBuffer[pos + 2]) << 16)
-                       | (Int(readBuffer[pos + 3]) << 8) | Int(readBuffer[pos + 4])
-            guard length >= 4 else { return false }            // malformed length field: treat as a desync
+            // Read the length as a signed Int32 and validate it exactly as the framing decoder does, so a
+            // garbage value (the negative that 0xFFFFFFFF decodes to, or one past maxMessageSize) reads as
+            // a desync — not a benign "incomplete" frame that would let a following 'E' hide behind it.
+            let raw = (UInt32(readBuffer[pos + 1]) << 24) | (UInt32(readBuffer[pos + 2]) << 16)
+                    | (UInt32(readBuffer[pos + 3]) << 8) | UInt32(readBuffer[pos + 4])
+            let length = Int(Int32(bitPattern: raw))
+            guard (try? Self.payloadLength(forMessageLength: length, maxMessageSize: maxMessageSize)) != nil else {
+                return false
+            }
             let frameEnd = pos + 1 + length
-            if frameEnd > readBuffer.count { break }           // frame body not fully buffered: safe, stop here
+            if frameEnd > readBuffer.count { break }           // valid length but body not fully buffered: safe
             pos = frameEnd
         }
         let fd = self.fd
@@ -2401,6 +2407,12 @@ public actor PostgresConnection {
     /// one. Multiple tags stack into one buffer so a test can prime e.g. a benign 'A' before an 'E'.
     func primeReadBufferForTest(_ tags: [UInt8]) {
         for tag in tags { readBuffer.append(contentsOf: [tag, 0, 0, 0, 4]) }
+    }
+
+    /// Test seam: append arbitrary raw bytes to the read buffer, for priming a malformed or oversized
+    /// frame header the well-formed `primeReadBufferForTest` can't express.
+    func primeReadBufferRawForTest(_ bytes: [UInt8]) {
+        readBuffer.append(contentsOf: bytes)
     }
     #endif
 
