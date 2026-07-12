@@ -345,9 +345,13 @@ socket buffer fills and the server blocks on its write. Memory is bounded to abo
 Early termination is clean because chunking gives the server natural stop points: dropping the
 stream (a `break`, or letting it go) runs `finishStream` from the `StreamCleanup` `deinit`,
 which `Close`s the portal, `Sync`s, and drains the in-flight chunk (≤ `chunkSize` rows) to
-`ReadyForQuery`, then frees the wire — so the connection is immediately reusable. A mid-stream
-server error is handled the same way (drain to `ReadyForQuery`, then throw). `endStream`
-releases the exclusive hold; a wire/IO failure tears the connection down instead. Streaming
+`ReadyForQuery`, then frees the wire — so the connection is immediately reusable. That drain is
+bounded by `teardownResyncTimeout` (a deadline plus a `SocketWatchdog`, exactly like `copyOut`):
+a server that stalls after `Close`+`Sync` closes and discards the connection instead of parking
+the teardown forever — the pool's `release` and `close` both await this teardown, so an unbounded
+one would hang them. A mid-stream server error is handled the same way (drain to `ReadyForQuery`,
+then throw). `endStream` releases the exclusive hold; a wire/IO failure tears the connection down
+instead. Streaming
 inside `withTransaction` on the same connection would deadlock on `lock`, so it is a top-level
 connection operation.
 
@@ -378,8 +382,8 @@ driver — row formatting/parsing belongs to a higher layer. `Copy.swift` holds 
   cancellation-aware, and a `CopyOutCleanup` `deinit` that stops an abandoned copy. No
   `CancelRequest` is used (it is async and per-backend, so it could strike the next borrower's
   query): a cancelled consumer tears the connection down at once, while a plain `break` drains the
-  remainder to `ReadyForQuery` bounded by `copyResyncTimeout` — keeping the connection when the
-  remainder is cheap and closing it when it isn't.
+  remainder to `ReadyForQuery` bounded by `teardownResyncTimeout` (shared with row-stream teardown)
+  — keeping the connection when the remainder is cheap and closing it when it isn't.
 - **COPY IN** (`copyIn(_:_:)`, closure-driven): send the `COPY … FROM STDIN`, consume the
   `CopyInResponse`, hand the closure a `PostgresCopyInWriter` whose `write`s are framed as
   `CopyData`, then `CopyDone` and read the result (`CommandComplete` "COPY n"). Throwing from
