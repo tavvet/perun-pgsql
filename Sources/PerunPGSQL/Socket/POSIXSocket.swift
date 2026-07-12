@@ -251,3 +251,28 @@ enum SystemSocket {
         _ = shutdown(fd, shutRDWR)
     }
 }
+
+/// A one-shot socket watchdog: after `duration`, shut `fd` down (both directions) to unblock a read or
+/// write parked on it. The safety-critical discipline is `stop()` — **cancel and await** the timer
+/// before closing the fd, so a late fire can never `shutdownBoth` a descriptor the OS has since reused
+/// for another connection. Used wherever a blocking wire step needs a deadline: connect, the graceful
+/// close Terminate, a TLS `CancelRequest`, and a copyOut resync drain.
+struct SocketWatchdog {
+    private let task: Task<Bool, Never>
+
+    /// Arm the watchdog. `duration` is clamped to a non-negative span the sleep can represent, so a
+    /// caller can pass a raw remaining-time (possibly negative) or an unbounded value without care.
+    init(fd: Int32, after duration: Duration) {
+        let capped = min(max(duration, .zero), .seconds(Int64(Int32.max)))
+        task = Task {
+            do { try await Task.sleep(for: capped) } catch { return false }   // cancelled: finished in time
+            SystemSocket.shutdownBoth(fd: fd)
+            return true                                                       // fired: the fd is shut down
+        }
+    }
+
+    /// Stop the watchdog and report whether it already fired (shut the socket down). Awaits the timer,
+    /// so once this returns the fd is safe to close.
+    @discardableResult
+    func stop() async -> Bool { task.cancel(); return await task.value }
+}

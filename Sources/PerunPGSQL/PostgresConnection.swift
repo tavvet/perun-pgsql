@@ -305,19 +305,12 @@ public actor PostgresConnection {
         // It reports whether it fired; if it did — even in the rare case startup raced to finish at
         // the same instant — connect() discards the (now shut-down) connection and reports a
         // timeout, so a broken connection is never returned. Cancelled the moment we're ready.
-        let watchdog: Task<Bool, Never>? = configuration.connectTimeout.map { timeout in
-            Task {
-                let remaining = timeout - (ContinuousClock().now - start)
-                let capped = min(max(remaining, .zero), .seconds(Int64(Int32.max)))
-                do { try await Task.sleep(for: capped) } catch { return false }   // cancelled before the deadline
-                SystemSocket.shutdownBoth(fd: fd)
-                return true                                                       // fired: the fd is shut down
-            }
+        let watchdog: SocketWatchdog? = configuration.connectTimeout.map { timeout in
+            SocketWatchdog(fd: fd, after: timeout - (ContinuousClock().now - start))
         }
         /// Stop the watchdog and report whether it had already fired.
         func stopWatchdog() async -> Bool {
-            watchdog?.cancel()
-            return await watchdog?.value ?? false
+            await watchdog?.stop() ?? false
         }
 
         // The same absolute deadline the watchdog arms, handed to the startup path: the watchdog
@@ -899,17 +892,11 @@ public actor PostgresConnection {
         // forever (the original query and any wrapping withTimeout would keep waiting on it). The
         // watchdog shuts the socket down when the deadline passes so a parked recv/handshake/send
         // returns. A nil connectTimeout means no bound, matching connect().
-        let watchdog: Task<Void, Never>? = timeout.map { total in
-            Task {
-                let remaining = total - (ContinuousClock().now - start)
-                let capped = min(max(remaining, .zero), .seconds(Int64(Int32.max)))
-                do { try await Task.sleep(for: capped) } catch { return }   // cancelled: finished in time
-                SystemSocket.shutdownBoth(fd: fd)
-            }
+        let watchdog: SocketWatchdog? = timeout.map { total in
+            SocketWatchdog(fd: fd, after: total - (ContinuousClock().now - start))
         }
         func stopWatchdog() async {
-            watchdog?.cancel()
-            _ = await watchdog?.value   // let it finish touching fd before we close it
+            _ = await watchdog?.stop()   // let it finish touching fd before we close it
         }
         do {
             try await withBlockingIO(on: cancelQueue) {
@@ -1952,24 +1939,18 @@ public actor PostgresConnection {
     func finishCopyOut(generation: UInt64) async {
         guard copyOutActive, copyOutGeneration == generation else { return }
         copyOutTerminating = true
-        let fd = self.fd
         let capped = min(max(copyResyncTimeout, .zero), .seconds(Int64(Int32.max)))
         let deadline = ContinuousClock().now + capped
         // Two bounds: `drainToReadyForQuery`'s in-loop deadline stops a fast *streaming* drain; the
-        // watchdog's shutdown unblocks a *stalled* read. Mirrors connect()'s watchdog — cancel AND
-        // await its value before any forceClose (so it can never shut a reused fd), and a fired
-        // watchdog forces a discard even if the drain "reached" ReadyForQuery on the dead socket.
-        let watchdog = Task<Bool, Never> {
-            do { try await Task.sleep(for: capped) } catch { return false }
-            SystemSocket.shutdownBoth(fd: fd)
-            return true
-        }
-        func stopWatchdog() async -> Bool { watchdog.cancel(); return await watchdog.value }
+        // watchdog's shutdown unblocks a *stalled* read. The watchdog's stop() cancels AND awaits before
+        // any forceClose (so it can never shut a reused fd), and a fired watchdog forces a discard even
+        // if the drain "reached" ReadyForQuery on the dead socket.
+        let watchdog = SocketWatchdog(fd: fd, after: capped)
 
         var resynced = false
         do { try await drainToReadyForQuery(deadline: deadline); resynced = true }
         catch { /* deadline, watchdog shutdown, or transport error → discard below */ }
-        let fired = await stopWatchdog()
+        let fired = await watchdog.stop()
         if resynced, !fired {
             endCopyOut()                          // reached ReadyForQuery on a healthy socket: reusable
         } else {
@@ -2121,14 +2102,9 @@ public actor PostgresConnection {
         // the socket down after a short grace to make it return. Either way, forceClose then tears
         // the connection down — an immediate, out-of-band shutdown that never waits on the wire.
         if !isClosed {
-            let fd = self.fd
-            let watchdog = Task {
-                do { try await Task.sleep(for: .seconds(2)) } catch { return }   // sent in time: nothing to unblock
-                SystemSocket.shutdownBoth(fd: fd)                                 // make the parked Terminate return
-            }
+            let watchdog = SocketWatchdog(fd: fd, after: .seconds(2))   // unblock a parked Terminate send
             try? await send(FrontendMessage.terminate())
-            watchdog.cancel()
-            _ = await watchdog.value                                             // finish touching fd before forceClose
+            await watchdog.stop()                                       // finish touching fd before forceClose
         }
         forceClose()
     }
