@@ -216,17 +216,16 @@ enum SystemSocket {
         return buffer
     }
 
-    /// Non-blocking liveness probe: peek one byte without consuming it. A fully-drained,
-    /// quiescent connection has nothing waiting, so `EWOULDBLOCK`/`EAGAIN` (no data) means it is
-    /// still open and healthy; `0` bytes is EOF (the peer closed).
-    ///
-    /// If a byte *is* waiting on a plaintext connection it is a backend message tag, and a
-    /// pooled connection sits at a message boundary — so an unsolicited async message
-    /// (NotificationResponse `A`, NoticeResponse `N`, ParameterStatus `S`) means the connection
-    /// is healthy and the reader will consume it later, while anything else (typically a
-    /// termination `ErrorResponse` `E`) means discard it. Over TLS the byte is ciphertext we
-    /// can't classify, so any pending data is treated as suspect.
-    static func isQuiescentOpen(fd: Int32, plaintextProtocol: Bool) -> Bool {
+    /// Non-blocking liveness probe: peek one byte without consuming it. Returns true only when the
+    /// socket is quiescent and open — nothing is waiting (`EWOULDBLOCK`/`EAGAIN`). Any pending byte
+    /// means it is *not* quiescent, so discard: on a pooled-idle connection no reader is running, so
+    /// unsolicited data is either an async message the driver never consumed or a termination — and one
+    /// peeked byte can neither tell them apart nor see what follows it (a benign `A` can shadow a
+    /// trailing termination `E`; after a partly-buffered driver frame the next byte is mid-payload, not
+    /// a message tag). Benign async messages the driver *did* buffer are already classified upstream by
+    /// the readBuffer frame walk; here, at the raw socket, any byte is suspect. `0` bytes is EOF. This
+    /// matches the TLS path, where pending ciphertext is likewise treated as not quiescent.
+    static func isQuiescentOpen(fd: Int32) -> Bool {
         var byte: UInt8 = 0
         while true {
             let n = withUnsafeMutablePointer(to: &byte) {
@@ -234,14 +233,9 @@ enum SystemSocket {
             }
             if n < 0 {
                 if errno == EINTR { continue }
-                return errno == EWOULDBLOCK || errno == EAGAIN   // no data waiting: quiescent and open
+                return errno == EWOULDBLOCK || errno == EAGAIN   // nothing waiting: quiescent and open
             }
-            if n == 0 { return false }                            // EOF: the peer closed the socket
-            guard plaintextProtocol else { return false }         // ciphertext: can't classify, so discard
-            switch byte {
-            case UInt8(ascii: "A"), UInt8(ascii: "N"), UInt8(ascii: "S"): return true
-            default: return false
-            }
+            return false                                          // EOF, or unsolicited data we won't classify
         }
     }
 

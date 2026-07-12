@@ -2380,11 +2380,12 @@ public actor PostgresConnection {
         guard !isClosed else { return false }
         // Unconsumed framed bytes already sit *above* the socket: readSlice reads ahead, so a read
         // carrying ReadyForQuery plus one or more following messages can land wholly in readBuffer
-        // while the socket and OpenSSL below read empty. Classify them the way isQuiescentOpen does —
-        // a buffered async message (NotificationResponse 'A' / NoticeResponse 'N' / ParameterStatus
-        // 'S') is benign, the reader consumes it next, so keep; anything else (e.g. a termination
-        // 'E') is a desync. One benign 'A' can shadow a following 'E' in the *same* buffer, so walk
-        // every fully-buffered frame, not just the first tag. A partly-buffered trailing frame is
+        // while the socket and OpenSSL below read empty. These are decoded frames, so — unlike the raw
+        // socket peek below — we *can* classify them: a buffered async message (NotificationResponse
+        // 'A' / NoticeResponse 'N' / ParameterStatus 'S') is benign, the reader consumes it next, so
+        // keep; anything else (e.g. a termination 'E') is a desync. One benign 'A' can shadow a
+        // following 'E' in the *same* buffer, so walk every fully-buffered frame, not just the first
+        // tag. A partly-buffered trailing frame is
         // safe to ignore — the reader will complete it. Decoded bytes, so this holds for TLS too.
         var pos = readOffset
         while pos < readBuffer.count {
@@ -2414,7 +2415,6 @@ public actor PostgresConnection {
         }
         let fd = self.fd
         let tls = self.tls
-        let plaintext = (tls == nil)
         return await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
             readQueue.async {
                 // Over TLS the raw peek can't see bytes OpenSSL already pulled off the socket — decrypted
@@ -2423,7 +2423,7 @@ public actor PostgresConnection {
                 if let tls, tls.pendingBytes() != 0 {
                     continuation.resume(returning: false)
                 } else {
-                    continuation.resume(returning: SystemSocket.isQuiescentOpen(fd: fd, plaintextProtocol: plaintext))
+                    continuation.resume(returning: SystemSocket.isQuiescentOpen(fd: fd))
                 }
             }
         }

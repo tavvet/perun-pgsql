@@ -63,8 +63,8 @@ final class PoolValidationIntegrationTests: XCTestCase {
     }
 
     func testLivenessKeepsConnectionWithBufferedAsyncMessage() async throws {
-        // A benign async message read into the buffer (NotificationResponse) must NOT discard the
-        // connection — the reader consumes it next — matching isQuiescentOpen's plaintext A/N/S rule.
+        // A benign async message the driver already read into readBuffer (NotificationResponse) must NOT
+        // discard the connection — the frame walk classifies it and the reader consumes it next.
         let connection = try await PostgresConnection.connect(integrationConfiguration())
         defer { Task { try? await connection.close() } }
         _ = try await connection.query("SELECT 1").rows
@@ -72,6 +72,27 @@ final class PoolValidationIntegrationTests: XCTestCase {
         await connection.primeReadBufferRawForTest(notificationFrame())   // a real, decodable NotificationResponse
         let alive = await connection.isProbablyAlive()
         XCTAssertTrue(alive, "a buffered async message must keep the connection alive, not discard it")
+    }
+
+    func testLivenessDiscardsAKernelBufferedMessageBehindTheSocket() async throws {
+        // Same shadow as the readBuffer walk, one layer down: a NotificationResponse 'A' followed by a
+        // termination 'E' sitting in the *kernel* buffer (readBuffer empty, no reader consuming). A raw
+        // one-byte peek sees the benign 'A' and can't see the 'E' behind it, so the probe must treat any
+        // pending kernel data as suspect and read the connection as dead.
+        let connection = try await PostgresConnection.connect(integrationConfiguration())
+        defer { Task { try? await connection.close() } }
+        let pid = try await connection.query("SELECT pg_backend_pid() AS p").rows[0].decode("p", as: Int.self)
+        _ = try await connection.query("LISTEN perun_liveness_chan").rows   // so a NOTIFY reaches this backend
+
+        let other = try await PostgresConnection.connect(integrationConfiguration())
+        _ = try await other.query("NOTIFY perun_liveness_chan, 'x'").rows   // 'A' lands in this socket's kernel buffer
+        try await Task.sleep(nanoseconds: 100_000_000)                      // let the 'A' land before the 'E'
+        _ = try await other.query("SELECT pg_terminate_backend(\(pid))").rows   // 'E' + close land behind it
+        try await other.close()
+        try await Task.sleep(nanoseconds: 300_000_000)                      // let both settle in the kernel buffer
+
+        let alive = await connection.isProbablyAlive()
+        XCTAssertFalse(alive, "a kernel-buffered async message shadowing a termination must read as dead")
     }
 
     func testLivenessRejectsAMalformedAsyncPayloadThatTheDecoderWouldReject() async throws {
