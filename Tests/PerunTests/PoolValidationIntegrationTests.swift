@@ -46,6 +46,30 @@ final class PoolValidationIntegrationTests: XCTestCase {
         XCTAssertTrue(alive, "a buffered async message must keep the connection alive, not discard it")
     }
 
+    func testPooledCopyOutBreakWithCheapRemainderKeepsTheConnection() async throws {
+        // Breaking out of a pooled copyOut with a cheap remainder must KEEP the connection (the bounded
+        // drain resyncs it), not churn it. release() has to await the teardown instead of racing it: its
+        // local actor hop otherwise beats the network drain and discards a connection the drain was about
+        // to keep, forcing a fresh TLS/SCRAM handshake. Same backend PID before and after proves reuse.
+        let pool = PostgresClient(configuration: try integrationConfiguration(), maxConnections: 1)
+
+        let pid0 = try await pool.query("SELECT pg_backend_pid() AS p").rows[0].decode("p", as: Int.self)
+
+        // A per-row pg_sleep makes the remainder take ~0.15s to drain — long enough that release() would
+        // win the race and discard without the fix, yet far under the 5s resync timeout so it is kept.
+        try await pool.withConnection { connection in
+            for try await _ in try await connection.copyOut(
+                "COPY (SELECT g, pg_sleep(0.05) FROM generate_series(1, 4) g) TO STDOUT") {
+                break                                   // stop after the first chunk; 3 rows still to come
+            }
+        }
+
+        let pid1 = try await pool.query("SELECT pg_backend_pid() AS p").rows[0].decode("p", as: Int.self)
+        XCTAssertEqual(pid1, pid0, "a cheap-remainder break must keep the pooled connection, not churn it")
+
+        await pool.shutdown()
+    }
+
     func testTerminatedIdleConnectionIsReplaced() async throws {
         let configuration = try integrationConfiguration()
         let pool = PostgresClient(configuration: configuration, maxConnections: 1)

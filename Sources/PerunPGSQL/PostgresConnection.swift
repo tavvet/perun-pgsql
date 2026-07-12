@@ -92,6 +92,17 @@ public struct ConnectionConfiguration: Sendable {
     }
 }
 
+/// A thread-safe holder for the in-flight copyOut teardown Task. The iterator's `deinit` writes it
+/// (from any thread, synchronously at the `break`); the pool's `release()` reads and awaits it before
+/// sampling wire state, so it observes the settled outcome instead of racing the drain. Lives outside
+/// the actor because the `deinit` can't hop onto it synchronously and `release()` must not have to.
+final class CopyOutTeardownBox: @unchecked Sendable {
+    private let lock = POSIXLock()
+    private var task: Task<Void, Never>?
+    func set(_ task: Task<Void, Never>?) { lock.withLock { self.task = task } }
+    func current() -> Task<Void, Never>? { lock.withLock { task } }
+}
+
 /// A single connection to a PostgreSQL server.
 ///
 /// The connection is an `actor`, so its socket buffer and protocol state are
@@ -480,6 +491,7 @@ public actor PostgresConnection {
             copyOutGeneration += 1
             copyOutTerminating = false
             copyOutPendingError = nil
+            copyOutTeardownBox.set(nil)              // drop any prior copy's settled teardown handle
             return PostgresCopyOutSequence(connection: self, generation: copyOutGeneration)
         } catch {
             forceCloseIfDesynced(error)              // readCopyOutResponse desynced: don't leave it open
@@ -1758,6 +1770,26 @@ public actor PostgresConnection {
     private var copyOutTerminating = false
     private var copyOutPendingError: PostgresServerError?
     private var copyOutGeneration: UInt64 = 0
+
+    /// Holds the in-flight copyOut teardown Task so the pool's `release()` can await it settling
+    /// (kept vs. discarded) instead of racing the bounded drain: release()'s local actor hop otherwise
+    /// beats the network drain and discards a connection a cheap-remainder drain would have kept.
+    /// Lock-guarded — written from the iterator's `deinit` (any thread), cleared on the actor when a
+    /// new copyOut starts, read by `release()`.
+    private let copyOutTeardownBox = CopyOutTeardownBox()
+
+    /// Record the teardown Task the iterator's `deinit` just spawned, so a concurrent `release()` can
+    /// await it. Nonisolated and lock-guarded: the deinit runs synchronously at the `break` — before
+    /// `withConnection` returns and calls `release()` — so the handle is always in place in time.
+    nonisolated func recordCopyOutTeardown(_ task: Task<Void, Never>) {
+        copyOutTeardownBox.set(task)
+    }
+
+    /// Await any in-flight copyOut teardown, so the caller samples the *settled* wire state. A no-op
+    /// when no copyOut was abandoned (box empty) or it already finished (awaiting a done Task is free).
+    nonisolated func awaitCopyOutTeardownSettled() async {
+        await copyOutTeardownBox.current()?.value
+    }
 
     /// How long a *break* out of a copyOut may spend draining the server's remaining stream to keep
     /// the connection reusable. A small remainder finishes well under this; a large or slow one hits
