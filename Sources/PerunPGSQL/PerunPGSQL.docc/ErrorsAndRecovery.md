@@ -84,11 +84,10 @@ error keep using the connection; after a desynchronising one, `close()` it and o
 
 ## Cancellation
 
-PerunPGSQL is cancellation-aware. Cancelling the task running a query sends the server a
-`CancelRequest`, so a statement blocked in the backend — a long `pg_sleep`, a lock wait — unblocks
-promptly instead of running to completion. The same holds for a `for await` over a
-``PostgresRowStream`` or a ``PostgresCopyOutSequence``: cancelling frees the connection's wire
-quickly rather than after the next backend message.
+PerunPGSQL is cancellation-aware. Cancelling the task running a query — or a `for await` over a
+``PostgresRowStream`` — sends the server a `CancelRequest`, so a statement blocked in the backend (a
+long `pg_sleep`, a lock wait) unblocks promptly instead of running to completion, and the response is
+drained to `ReadyForQuery` so the connection is left in sync and stays reusable.
 
 Cancellation is **best-effort**, and this matters for correctness:
 
@@ -96,8 +95,11 @@ Cancellation is **best-effort**, and this matters for correctness:
 > run". The request races the query — it can arrive after the statement already committed, or
 > before it even reached the server. Treat a cancelled write as *unknown*, not *rolled back*.
 
-Either way the response is drained to `ReadyForQuery`, so the connection is left in sync and stays
-reusable.
+A ``PostgresCopyOutSequence`` is the exception: a COPY-out can't be stopped in band, so cancelling
+one (including via a wrapping ``withTimeout(_:_:)``) **tears the connection down and discards it**
+rather than draining and keeping it — the pool transparently opens a replacement. Breaking out of a
+copyOut *without* cancelling instead drains the remainder to keep the connection (closing it if the
+remainder is large); neither path sends a `CancelRequest`.
 
 ## Timeouts
 
@@ -115,7 +117,8 @@ let report = try await withTimeout(.seconds(5)) {
 On a timeout the underlying query is cancelled (a `CancelRequest`) and its response drained to
 `ReadyForQuery` **before** `withTimeout` returns — so the connection is left in sync and stays
 reusable (`timedOut` is not a desynchronising error). The best-effort caveat from cancellation
-applies unchanged: a timed-out statement may still have run.
+applies unchanged: a timed-out statement may still have run. (Timing out a `copyOut` is the
+exception noted under Cancellation — it tears the connection down rather than keeping it.)
 
 ## Transactions and failure
 

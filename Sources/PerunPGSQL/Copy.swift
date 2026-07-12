@@ -15,8 +15,10 @@
 /// but the protocol may split or combine rows, so treat the stream as a byte stream, not a
 /// row sequence. Like `queryStream`, it holds the connection's wire **exclusively** until it
 /// is consumed, delivers chunks on demand (a slow consumer throttles the server), and frees
-/// the wire when it ends. Stopping early — a `break`, an error, or cancelling the task —
-/// cancels the COPY server-side and releases the connection, even if the sequence value is held.
+/// the wire when it ends. Stopping early — even while the sequence value is held — is handled two
+/// ways, neither sending a `CancelRequest`: a `break` or an error drains the remainder to resync and
+/// keep the connection (bounded, so a large remainder closes it instead), while cancelling the task
+/// tears the connection down at once.
 public struct PostgresCopyOutSequence: AsyncSequence, Sendable {
     public typealias Element = [UInt8]
 

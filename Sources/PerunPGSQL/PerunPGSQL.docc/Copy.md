@@ -39,5 +39,7 @@ not a row sequence.
 ## Wire hold
 
 Like streaming, both directions hold the connection's wire **exclusively** for the duration and
-free it on early stop or error (`copyOut` also cancels the copy server-side). The payload is the
-format's own encoding — parsing or formatting rows is your job, not the driver's.
+free it on early stop or error. Abandoning a `copyOut` sends no `CancelRequest`: a `break` drains the
+remainder to keep the connection (closing it instead if the remainder is large), while cancelling the
+task tears the connection down. The payload is the format's own encoding — parsing or formatting rows
+is your job, not the driver's.
