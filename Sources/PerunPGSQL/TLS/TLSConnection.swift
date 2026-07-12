@@ -192,6 +192,10 @@ final class TLSConnection: @unchecked Sendable {
     /// 64 KiB at a time — that still sits undecrypted in the read BIO (`BIO_ctrl_pending`). A drained,
     /// healthy connection has none; any here are unexpected server data. Unlike a direct-fd engine,
     /// where such bytes stay in the kernel buffer, the memory-BIO design needs the read-BIO term too.
+    /// A rare benign control record (a TLS 1.3 NewSessionTicket/KeyUpdate coalesced into the last
+    /// read) would also count and discard the connection — but that is safe: the liveness probe is
+    /// best-effort and errs toward discard (the pool opens a replacement), never toward keeping a
+    /// dead one.
     func pendingBytes() -> Int {
         engineLock.withLock {
             guard !closed else { return 0 }

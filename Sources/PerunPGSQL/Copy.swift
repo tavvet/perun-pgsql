@@ -75,7 +75,9 @@ final class CopyOutCleanup: @unchecked Sendable {
         let connection = self.connection
         let generation = self.generation
         // Captured here, on the (possibly cancelled) task that is unwinding — the detached Task below
-        // starts fresh and would never see the cancellation.
+        // starts fresh and would never see the cancellation. This selects *policy* (discard vs.
+        // bounded drain), not correctness: both routes are wire-safe, so a misread on some unusual
+        // release context only picks a suboptimal keep/discard, never a desync.
         let cancelled = Task.isCancelled
         Task { await connection.endCopyOutFromCleanup(generation: generation, cancelled: cancelled) }
     }

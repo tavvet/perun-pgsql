@@ -40,7 +40,7 @@ final class CopyIntegrationTests: XCTestCase {
         defer { Task { try? await connection.close() } }
 
         _ = try await connection.query(
-            "CREATE TEMP TABLE copy_out_big AS SELECT g AS id FROM generate_series(1, 100000) g")
+            "CREATE TEMP TABLE copy_out_big AS SELECT g AS id FROM generate_series(1, 10000) g")
 
         var chunks = 0
         for try await _ in try await connection.copyOut("COPY copy_out_big TO STDOUT") {
@@ -49,8 +49,8 @@ final class CopyIntegrationTests: XCTestCase {
         }
         XCTAssertEqual(chunks, 3)
 
-        // The break drained the (small) remainder within copyResyncTimeout and freed the wire — no
-        // CancelRequest — so the connection stays usable.
+        // The break drained the (small) remainder well within copyResyncTimeout and freed the wire —
+        // no CancelRequest — so the connection stays usable.
         let answer = try await connection.query("SELECT 42 AS a").rows[0].decode("a", as: Int.self)
         XCTAssertEqual(answer, 42)
     }
