@@ -244,7 +244,7 @@ final class CancellationIntegrationTests: XCTestCase {
         // Prompt discard on cancel must also fire when the CancellationError comes from the for-await
         // *body* (the common case), not only when caught inside nextCopyData. There the iterator's
         // deinit drives teardown, so it must route on the Task.isCancelled it captures — else the
-        // cancel is mistaken for a break and the connection drains (up to copyResyncTimeout) instead.
+        // cancel is mistaken for a break and the connection drains (up to teardownResyncTimeout) instead.
         let connection = try await PostgresConnection.connect(integrationConfiguration())
         _ = try await connection.query(
             "CREATE TEMP TABLE copy_body AS SELECT g AS id FROM generate_series(1, 100000) g")
@@ -288,7 +288,7 @@ final class CancellationIntegrationTests: XCTestCase {
         let inCopy = Gate(), proceed = Gate()
         let holder = Task {
             try await pool.withConnection { conn in
-                await conn.setCopyResyncTimeout(.milliseconds(500))   // the remainder can't drain this fast → discard
+                await conn.setTeardownResyncTimeout(.milliseconds(500))   // the remainder can't drain this fast → discard
                 for try await _ in try await conn.copyOut("COPY copy_pool_teardown TO STDOUT") {
                     await inCopy.open()          // holding the pool's only connection, mid-copy
                     await proceed.wait()

@@ -59,7 +59,7 @@ public struct PostgresCopyOutSequence: AsyncSequence, Sendable {
 /// task was cancelled — including a `CancellationError` thrown from the `for await` *body*, which
 /// unwinds through here rather than through `nextCopyData` — the connection is torn down at once.
 /// Otherwise (a plain `break`) the remainder is drained to `ReadyForQuery`, bounded by
-/// `copyResyncTimeout`: the connection is kept when the remainder is cheap and closed when it isn't.
+/// `teardownResyncTimeout`: the connection is kept when the remainder is cheap and closed when it isn't.
 /// No `CancelRequest` either way. A copy consumed to its end has already cleaned up, so this is a
 /// no-op.
 final class CopyOutCleanup: @unchecked Sendable {

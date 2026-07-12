@@ -1710,16 +1710,28 @@ public actor PostgresConnection {
     /// tear down a newer stream that has since reused the connection.
     func finishStream(generation: UInt64) async {
         guard streamActive, streamGeneration == generation else { return }
+        // Bound the drain exactly like finishCopyOut, or a server that stops responding after Close+Sync
+        // would park this task in readMessage() forever — and since release()/close() now await this
+        // teardown, that would hang them too. Two bounds: the in-loop deadline stops a slow *streaming*
+        // drain (rows trickling but never reaching ReadyForQuery); the watchdog's socket shutdown unblocks
+        // a read *parked* with no data at all. The watchdog's stop() cancels AND awaits before any
+        // forceClose (so it can't shut a reused fd), and a fired watchdog forces a discard.
+        let capped = min(max(teardownResyncTimeout, .zero), .seconds(Int64(Int32.max)))
+        let deadline = ContinuousClock().now + capped
+        let watchdog = SocketWatchdog(fd: fd, after: capped)
+        var reachedReadyForQuery = false
         do {
             if !streamTerminating {
                 streamTerminating = true
                 try await send(FrontendMessage.close(.portal, name: streamPortal) + FrontendMessage.sync())
             }
-            while streamActive {
+            drain: while true {
+                if ContinuousClock().now >= deadline { throw PerunError.timedOut }
                 switch try await readMessage() {
                 case let .readyForQuery(status):
                     transactionStatus = status
-                    endStream()
+                    reachedReadyForQuery = true
+                    break drain
                 case let .parameterStatus(name, value):
                     parameters[name] = value
                 case let .noticeResponse(notice):
@@ -1732,7 +1744,13 @@ public actor PostgresConnection {
                 }
             }
         } catch {
-            if !isClosed { forceClose() }
+            // deadline, watchdog shutdown, or a transport error → discard below
+        }
+        let fired = await watchdog.stop()
+        if reachedReadyForQuery, !fired {
+            endStream()                               // reached ReadyForQuery on a healthy socket: reusable
+        } else {
+            if !isClosed { forceClose() }             // stalled/slow drain, or the watchdog shut it: discard
             streamActive = false
         }
     }
@@ -1827,22 +1845,22 @@ public actor PostgresConnection {
         [copyOutTeardownBox.currentTask(), streamTeardownBox.currentTask()].compactMap { $0 }
     }
 
-    /// How long a *break* out of a copyOut may spend draining the server's remaining stream to keep
-    /// the connection reusable. A small remainder finishes well under this; a large or slow one hits
-    /// it and the connection is closed+discarded instead. Task *cancellation* doesn't drain at all.
-    /// Internal, not public config — it governs one rare abandonment path and can be promoted to
-    /// configuration additively if real demand appears.
-    private static let defaultCopyResyncTimeout: Duration = .seconds(5)
-    private var copyResyncTimeout: Duration {
+    /// How long an abandoned copyOut or row stream may spend draining the server's remainder to keep the
+    /// connection reusable. A small remainder finishes well under this; a large or slow one — or a server
+    /// that stops responding — hits it and the connection is closed+discarded instead. Task
+    /// *cancellation* doesn't drain at all. Internal, not public config — it governs a rare abandonment
+    /// path and can be promoted to configuration additively if real demand appears.
+    private static let defaultTeardownResyncTimeout: Duration = .seconds(5)
+    private var teardownResyncTimeout: Duration {
         #if DEBUG
-        return copyResyncTimeoutOverride ?? Self.defaultCopyResyncTimeout
+        return teardownResyncTimeoutOverride ?? Self.defaultTeardownResyncTimeout
         #else
-        return Self.defaultCopyResyncTimeout
+        return Self.defaultTeardownResyncTimeout
         #endif
     }
     #if DEBUG
-    private var copyResyncTimeoutOverride: Duration?
-    func setCopyResyncTimeout(_ timeout: Duration) { copyResyncTimeoutOverride = timeout }
+    private var teardownResyncTimeoutOverride: Duration?
+    func setTeardownResyncTimeout(_ timeout: Duration) { teardownResyncTimeoutOverride = timeout }
     /// Test seam: invoked in `nextCopyData` after the pre-read cancellation check but before the
     /// read, so a test can park there, cancel, and release — landing the cancel in the read window
     /// deterministically instead of racing `Task.sleep`.
@@ -1954,14 +1972,14 @@ public actor PostgresConnection {
 
     /// The consumer *broke out of* the copy (its `deinit`), rather than cancelling. Drain the
     /// server's remaining stream to resync and keep the connection — but bounded by
-    /// `copyResyncTimeout`: a small remainder drains fast and the connection stays reusable; a large
+    /// `teardownResyncTimeout`: a small remainder drains fast and the connection stays reusable; a large
     /// or slow one hits the bound and it is closed+discarded. No `CancelRequest` — it is async and
     /// per-backend and could strike the *next* borrower's query. Idempotent; the `generation` guard
     /// makes a late `deinit` a no-op once this copy has ended, so it can't tear down a newer copy.
     func finishCopyOut(generation: UInt64) async {
         guard copyOutActive, copyOutGeneration == generation else { return }
         copyOutTerminating = true
-        let capped = min(max(copyResyncTimeout, .zero), .seconds(Int64(Int32.max)))
+        let capped = min(max(teardownResyncTimeout, .zero), .seconds(Int64(Int32.max)))
         let deadline = ContinuousClock().now + capped
         // Two bounds: `drainToReadyForQuery`'s in-loop deadline stops a fast *streaming* drain; the
         // watchdog's shutdown unblocks a *stalled* read. The watchdog's stop() cancels AND awaits before

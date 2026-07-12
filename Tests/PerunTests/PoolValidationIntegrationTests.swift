@@ -135,6 +135,30 @@ final class PoolValidationIntegrationTests: XCTestCase {
         await pool.shutdown()
     }
 
+    func testStalledStreamTeardownIsBoundedNotAwaitedForever() async throws {
+        // finishStream drains to ReadyForQuery; a server that stops answering after Close+Sync would park
+        // it in readMessage forever — and release()/close() now await this teardown, so it would hang them
+        // too. The teardown must be bounded like copyOut's. A short bound plus a stream whose first row is
+        // far away (pg_sleep) exercises the stall: finishStream parks waiting for the busy server.
+        let connection = try await PostgresConnection.connect(integrationConfiguration())
+        await connection.setTeardownResyncTimeout(.milliseconds(200))
+
+        // Create the stream and abandon it without reading, through a closure boundary so the sequence is
+        // destroyed (spawning finishStream) before we await the teardown below.
+        func abandonWithoutReading() async throws {
+            _ = try await connection.queryStream("SELECT pg_sleep(3)")
+        }
+        try await abandonWithoutReading()
+
+        let start = ContinuousClock().now
+        for teardown in connection.inFlightTeardownTasks() { await teardown.value }
+        let elapsed = ContinuousClock().now - start
+        XCTAssertLessThan(elapsed, .seconds(2),
+                          "a stalled stream teardown must hit the resync bound, not wait out (or hang on) the server")
+
+        try? await connection.close()
+    }
+
     func testStaleCopyIteratorDeinitDoesNotClobberANewerTeardown() async throws {
         // The teardown box is one slot. A stale iterator held past its copy, dropped after a newer copy
         // recorded its real drain task, must NOT overwrite that handle with its own (generation-guarded

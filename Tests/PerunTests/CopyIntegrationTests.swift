@@ -49,7 +49,7 @@ final class CopyIntegrationTests: XCTestCase {
         }
         XCTAssertEqual(chunks, 3)
 
-        // The break drained the (small) remainder well within copyResyncTimeout and freed the wire —
+        // The break drained the (small) remainder well within teardownResyncTimeout and freed the wire —
         // no CancelRequest — so the connection stays usable.
         let answer = try await connection.query("SELECT 42 AS a").rows[0].decode("a", as: Int.self)
         XCTAssertEqual(answer, 42)
@@ -82,7 +82,7 @@ final class CopyIntegrationTests: XCTestCase {
         // timeout must close+discard the connection rather than read the whole relation.
         let connection = try await PostgresConnection.connect(integrationConfiguration())
         defer { Task { try? await connection.close() } }
-        await connection.setCopyResyncTimeout(.milliseconds(50))
+        await connection.setTeardownResyncTimeout(.milliseconds(50))
         _ = try await connection.query(
             "CREATE TEMP TABLE copy_huge AS SELECT g AS id FROM generate_series(1, 2000000) g")
 
