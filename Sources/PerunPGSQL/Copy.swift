@@ -82,7 +82,7 @@ final class CopyOutCleanup: @unchecked Sendable {
         let task = Task { await connection.endCopyOutFromCleanup(generation: generation, cancelled: cancelled) }
         // Hand the pool a handle to this teardown: release() awaits it before judging the connection,
         // so a cheap-remainder `break` drain that keeps the connection isn't lost to a race (Finding).
-        connection.recordCopyOutTeardown(task)
+        connection.recordCopyOutTeardown(generation: generation, task: task)
     }
 }
 
@@ -114,7 +114,7 @@ final class CopyOutLifetime: @unchecked Sendable {
         let generation = self.generation
         let cancelled = Task.isCancelled
         let task = Task { await connection.endCopyOutFromCleanup(generation: generation, cancelled: cancelled) }
-        connection.recordCopyOutTeardown(task)   // so a racing pool release() awaits it settling
+        connection.recordCopyOutTeardown(generation: generation, task: task)   // racing release() awaits it
     }
 }
 

@@ -112,6 +112,36 @@ final class PoolValidationIntegrationTests: XCTestCase {
         await pool.shutdown()
     }
 
+    func testStaleCopyIteratorDeinitDoesNotClobberANewerTeardown() async throws {
+        // The teardown box is one slot. A stale iterator held past its copy, dropped after a newer copy
+        // recorded its real drain task, must NOT overwrite that handle with its own (generation-guarded
+        // no-op) task — or release() awaits the no-op, samples the wire mid-drain, and discards a
+        // connection the cheap drain was about to keep. Same-PID reuse proves the newer teardown won.
+        let pool = PostgresClient(configuration: try integrationConfiguration(), maxConnections: 1)
+
+        let pid0 = try await pool.query("SELECT pg_backend_pid() AS p").rows[0].decode("p", as: Int.self)
+
+        try await pool.withConnection { connection in
+            // Copy 1 (older generation): consume it fully via a manually held iterator.
+            var iterator = try await connection.copyOut("COPY (SELECT 1) TO STDOUT").makeAsyncIterator()
+            while try await iterator.next() != nil {}
+            // Copy 2 (newer generation): break with a cheap-but-slow (pg_sleep) remainder — records its
+            // real drain task.
+            for try await _ in try await connection.copyOut(
+                "COPY (SELECT g, pg_sleep(0.05) FROM generate_series(1, 4) g) TO STDOUT") {
+                break
+            }
+            // Keep copy 1's iterator alive until *after* copy 2 recorded, so its deinit (a stale-generation
+            // no-op) fires last and must not clobber copy 2's teardown handle.
+            _ = iterator
+        }
+
+        let pid1 = try await pool.query("SELECT pg_backend_pid() AS p").rows[0].decode("p", as: Int.self)
+        XCTAssertEqual(pid1, pid0, "a stale iterator's late deinit must not clobber the newer teardown and churn the connection")
+
+        await pool.shutdown()
+    }
+
     func testTerminatedIdleConnectionIsReplaced() async throws {
         let configuration = try integrationConfiguration()
         let pool = PostgresClient(configuration: configuration, maxConnections: 1)

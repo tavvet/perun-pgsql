@@ -92,15 +92,25 @@ public struct ConnectionConfiguration: Sendable {
     }
 }
 
-/// A thread-safe holder for the in-flight copyOut teardown Task. The iterator's `deinit` writes it
-/// (from any thread, synchronously at the `break`); the pool's `release()` reads and awaits it before
-/// sampling wire state, so it observes the settled outcome instead of racing the drain. Lives outside
-/// the actor because the `deinit` can't hop onto it synchronously and `release()` must not have to.
-final class CopyOutTeardownBox: @unchecked Sendable {
+/// A thread-safe holder for the in-flight teardown Task of an abandoned copyOut or row stream. The
+/// iterator's `deinit` writes it (from any thread, synchronously at the `break`); the pool's
+/// `release()` (and `close()`) read and await it before touching the wire, so they observe the settled
+/// outcome instead of racing the drain. Lives outside the actor because the `deinit` can't hop onto it
+/// synchronously and the readers must not have to. Tagged with the teardown's generation so a stale
+/// iterator's late `deinit` can't clobber a newer teardown's handle with its own (no-op) task.
+final class TeardownBox: @unchecked Sendable {
     private let lock = POSIXLock()
-    private var task: Task<Void, Never>?
-    func set(_ task: Task<Void, Never>?) { lock.withLock { self.task = task } }
-    func current() -> Task<Void, Never>? { lock.withLock { task } }
+    private var entry: (generation: UInt64, task: Task<Void, Never>)?
+    /// Record `task` for `generation` unless a same-or-newer generation is already held — a late deinit
+    /// from an older copy/stream must not replace the current teardown's handle.
+    func record(generation: UInt64, task: Task<Void, Never>) {
+        lock.withLock {
+            if let entry, entry.generation >= generation { return }
+            entry = (generation, task)
+        }
+    }
+    func clear() { lock.withLock { entry = nil } }
+    func currentTask() -> Task<Void, Never>? { lock.withLock { entry?.task } }
 }
 
 /// A single connection to a PostgreSQL server.
@@ -491,7 +501,7 @@ public actor PostgresConnection {
             copyOutGeneration += 1
             copyOutTerminating = false
             copyOutPendingError = nil
-            copyOutTeardownBox.set(nil)              // drop any prior copy's settled teardown handle
+            copyOutTeardownBox.clear()               // drop any prior copy's settled teardown handle
             return PostgresCopyOutSequence(connection: self, generation: copyOutGeneration)
         } catch {
             forceCloseIfDesynced(error)              // readCopyOutResponse desynced: don't leave it open
@@ -1776,19 +1786,22 @@ public actor PostgresConnection {
     /// beats the network drain and discards a connection a cheap-remainder drain would have kept.
     /// Lock-guarded — written from the iterator's `deinit` (any thread), cleared on the actor when a
     /// new copyOut starts, read by `release()`.
-    private let copyOutTeardownBox = CopyOutTeardownBox()
+    private let copyOutTeardownBox = TeardownBox()
 
     /// Record the teardown Task the iterator's `deinit` just spawned, so a concurrent `release()` can
     /// await it. Nonisolated and lock-guarded: the deinit runs synchronously at the `break` — before
-    /// `withConnection` returns and calls `release()` — so the handle is always in place in time.
-    nonisolated func recordCopyOutTeardown(_ task: Task<Void, Never>) {
-        copyOutTeardownBox.set(task)
+    /// `withConnection` returns and calls `release()` — so the handle is always in place in time. The
+    /// `generation` guard drops a stale iterator's late write, so it can't clobber a newer copy's task.
+    nonisolated func recordCopyOutTeardown(generation: UInt64, task: Task<Void, Never>) {
+        copyOutTeardownBox.record(generation: generation, task: task)
     }
 
-    /// Await any in-flight copyOut teardown, so the caller samples the *settled* wire state. A no-op
-    /// when no copyOut was abandoned (box empty) or it already finished (awaiting a done Task is free).
-    nonisolated func awaitCopyOutTeardownSettled() async {
-        await copyOutTeardownBox.current()?.value
+    /// The in-flight teardown tasks the caller must await before sampling wire state (an abandoned
+    /// copyOut or row stream tears down in a detached `Task`). Synchronous and nonisolated so a
+    /// pool `release()`/`close()` pays no actor hop on the common path where nothing is tearing down
+    /// (empty array → the caller's `for … await` loop suspends zero times).
+    nonisolated func inFlightTeardownTasks() -> [Task<Void, Never>] {
+        [copyOutTeardownBox.currentTask()].compactMap { $0 }
     }
 
     /// How long a *break* out of a copyOut may spend draining the server's remaining stream to keep

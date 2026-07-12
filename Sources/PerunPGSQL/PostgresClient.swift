@@ -207,13 +207,14 @@ public actor PostgresClient {
             closeDuringShutdown(connection)
             return
         }
-        // A copyOut abandoned by a `break` tears down in a detached Task (Copy.swift). Wait for it to
-        // settle before sampling state, so we read its terminal outcome — a cheap remainder drained and
-        // kept (idle, reusable) vs. a large one discarded — instead of racing the drain: release()'s
-        // local actor hop beats the network drain, and without this we would discard a connection the
-        // drain was about to keep, churning connections (and their TLS/SCRAM handshakes). No-op unless a
-        // copyOut was abandoned.
-        await connection.awaitCopyOutTeardownSettled()
+        // A copyOut or row stream abandoned by a `break` tears down in a detached Task (Copy.swift /
+        // RowStream.swift). Wait for it to settle before sampling state, so we read its terminal outcome
+        // — a cheap remainder drained and kept (idle, reusable) vs. a large one discarded — instead of
+        // racing the drain: release()'s local actor hop beats the network drain, and without this we
+        // would discard a connection the drain was about to keep, churning connections (and their
+        // TLS/SCRAM handshakes). The accessor is synchronous, so this costs nothing unless a teardown is
+        // in flight.
+        for teardown in connection.inFlightTeardownTasks() { await teardown.value }
         let state = await connection.releaseState
         // Re-check: shutdown() may have run — and drained `idle` — while we were
         // suspended on the await above. Without this we would append to an
