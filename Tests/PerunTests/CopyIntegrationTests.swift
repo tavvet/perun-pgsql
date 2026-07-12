@@ -401,6 +401,24 @@ final class CopyIntegrationTests: XCTestCase {
         XCTAssertEqual(after, before, "a wire-synced COPY misuse must not churn the pooled connection")
     }
 
+    func testCloseWaitsForAnInFlightTeardown() async throws {
+        // close() must let an abandoned copyOut/stream's detached teardown settle before it frees the
+        // fd — the teardown's watchdog captured this fd, and freeing it mid-teardown could let that
+        // watchdog shut down a descriptor the OS has since reused. The fd-reuse race can't be provoked
+        // deterministically, so we test the mechanism directly: record a still-running teardown (the
+        // same handle a break's deinit records) and assert close() blocks until it settles rather than
+        // racing it. Without the await, close() returns near-instantly.
+        let connection = try await PostgresConnection.connect(integrationConfiguration())
+        connection.recordCopyOutTeardown(
+            generation: 1, task: Task { try? await Task.sleep(for: .milliseconds(300)) })
+
+        let start = ContinuousClock().now
+        try await connection.close()
+        let elapsed = ContinuousClock().now - start
+        XCTAssertGreaterThan(elapsed, .milliseconds(150),
+                             "close() must wait for the in-flight teardown to settle before freeing the fd")
+    }
+
     // MARK: - Helpers
 
 }

@@ -2103,6 +2103,14 @@ public actor PostgresConnection {
     /// read — e.g. a `waitForNotifications` loop parked waiting for the next
     /// notification — so a listening connection can always be shut down.
     public func close() async throws {
+        // Let an abandoned copyOut / row stream finish tearing down first. Its detached teardown Task
+        // armed a watchdog that captured this fd; closing here frees the fd number (forceClose →
+        // disconnect → close(fd)), so racing the teardown could let its watchdog `shutdownBoth` a
+        // descriptor the OS has since reused for another connection. Awaiting the teardown guarantees
+        // its watchdog is stopped before we free the fd. Synchronous accessor, so a no-op when nothing
+        // is tearing down. (release() awaits the same tasks; this covers close() from every other path
+        // — pool shutdown, discardAndReplaceIfNeeded, a direct caller.)
+        for teardown in inFlightTeardownTasks() { await teardown.value }
         // A best-effort graceful Terminate lets the server do a clean backend exit instead of
         // logging "unexpected EOF on client connection" — but it must never stall teardown. If the
         // wire is wedged (the peer stopped reading, the send buffer is full, or the io queue is
