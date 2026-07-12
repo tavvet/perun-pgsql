@@ -229,11 +229,12 @@ public actor PostgresClient {
             await discardAndReplaceIfNeeded(connection)
             return
         }
-        // Defensive: after awaiting the teardown above this is normally settled (copyActive false).
-        // If a copyOut somehow still reads active — a teardown that wasn't recorded, or one still in
-        // flight — the wire may be held and `transactionStatus` a stale `.idle`; discard rather than
-        // hand a waiter a connection it would park on the held lock and then fail when the socket closes.
-        if state.copyActive {
+        // Defensive: after awaiting the teardown above this is normally settled (teardownActive false).
+        // If an abandoned copyOut or row stream somehow still reads active — a teardown that wasn't
+        // recorded, or one still in flight — the wire may be held and `transactionStatus` a stale
+        // `.idle`; discard rather than hand a waiter a connection it would park on the held lock and
+        // then fail when the socket closes.
+        if state.teardownActive {
             await discardAndReplaceIfNeeded(connection)
             return
         }

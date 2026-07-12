@@ -219,12 +219,13 @@ public actor PostgresConnection {
     public var isSecure: Bool { tls != nil }
 
     /// The pool's release path needs the transaction status (to decide whether to keep the
-    /// connection), whether it was torn down mid-use, and whether a `COPY … TO STDOUT` is still
-    /// active — an abandoned copyOut tears down in a detached `Task`, so at release time the wire can
-    /// still be held (`copyOutActive`) while `transactionStatus` reads a stale `.idle`. The pool must
-    /// discard such a connection, not hand a waiter one whose teardown is still in flight.
-    var releaseState: (status: TransactionStatus, isClosed: Bool, copyActive: Bool) {
-        (transactionStatus, isClosed, copyOutActive)
+    /// connection), whether it was torn down mid-use, and whether an abandoned `COPY … TO STDOUT` or
+    /// row stream is still tearing down — both tear down in a detached `Task`, so at release time the
+    /// wire can still be held (`copyOutActive` / `streamActive`) while `transactionStatus` reads a
+    /// stale `.idle`. The pool must discard such a connection, not hand a waiter one whose teardown is
+    /// still in flight.
+    var releaseState: (status: TransactionStatus, isClosed: Bool, teardownActive: Bool) {
+        (transactionStatus, isClosed, copyOutActive || streamActive)
     }
 
     #if DEBUG
@@ -468,6 +469,7 @@ public actor PostgresConnection {
             streamColumnIndex = [:]
             streamTerminating = false
             streamPendingError = nil
+            streamTeardownBox.clear()               // drop any prior stream's settled teardown handle
             return PostgresRowStream(connection: self, generation: streamGeneration)
         } catch {
             forceCloseIfDesynced(error)              // a failed send here leaves the wire out of sync
@@ -1796,12 +1798,21 @@ public actor PostgresConnection {
         copyOutTeardownBox.record(generation: generation, task: task)
     }
 
+    /// The row-stream analogue of `copyOutTeardownBox`: a broken `queryStream` drains in a detached
+    /// `Task` too, so the pool must await it the same way before judging the connection.
+    private let streamTeardownBox = TeardownBox()
+
+    /// Record a stream teardown Task from the iterator's `deinit`, like `recordCopyOutTeardown`.
+    nonisolated func recordStreamTeardown(generation: UInt64, task: Task<Void, Never>) {
+        streamTeardownBox.record(generation: generation, task: task)
+    }
+
     /// The in-flight teardown tasks the caller must await before sampling wire state (an abandoned
     /// copyOut or row stream tears down in a detached `Task`). Synchronous and nonisolated so a
     /// pool `release()`/`close()` pays no actor hop on the common path where nothing is tearing down
     /// (empty array → the caller's `for … await` loop suspends zero times).
     nonisolated func inFlightTeardownTasks() -> [Task<Void, Never>] {
-        [copyOutTeardownBox.currentTask()].compactMap { $0 }
+        [copyOutTeardownBox.currentTask(), streamTeardownBox.currentTask()].compactMap { $0 }
     }
 
     /// How long a *break* out of a copyOut may spend draining the server's remaining stream to keep

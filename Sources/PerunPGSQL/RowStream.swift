@@ -69,7 +69,10 @@ final class StreamCleanup: @unchecked Sendable {
     deinit {
         let connection = self.connection
         let generation = self.generation
-        Task { await connection.finishStream(generation: generation) }
+        let task = Task { await connection.finishStream(generation: generation) }
+        // Hand the pool a handle to this teardown so release() awaits it settling before judging the
+        // connection, instead of racing the drain and handing a waiter a mid-teardown wire.
+        connection.recordStreamTeardown(generation: generation, task: task)
     }
 }
 
@@ -100,6 +103,7 @@ final class StreamLifetime: @unchecked Sendable {
         guard !lock.withLock({ iteratorTaken }) else { return }   // an iterator owns teardown
         let connection = self.connection
         let generation = self.generation
-        Task { await connection.finishStream(generation: generation) }
+        let task = Task { await connection.finishStream(generation: generation) }
+        connection.recordStreamTeardown(generation: generation, task: task)   // racing release() awaits it
     }
 }

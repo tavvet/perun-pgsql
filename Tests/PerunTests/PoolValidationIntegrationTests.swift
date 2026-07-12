@@ -112,6 +112,30 @@ final class PoolValidationIntegrationTests: XCTestCase {
         await pool.shutdown()
     }
 
+    func testPooledStreamBreakWithCheapRemainderKeepsTheConnection() async throws {
+        // A broken queryStream tears down in a detached Task (finishStream) exactly like copyOut, so the
+        // pool must await it before judging the connection — otherwise release()'s local hop beats the
+        // drain, reads the stream still active, and discards a connection the cheap drain would keep.
+        // Same backend PID before and after proves reuse.
+        let pool = PostgresClient(configuration: try integrationConfiguration(), maxConnections: 1)
+
+        let pid0 = try await pool.query("SELECT pg_backend_pid() AS p").rows[0].decode("p", as: Int.self)
+
+        // chunkSize (512) covers all rows in one Execute, so breaking after the first leaves the rest
+        // still trickling in behind a per-row pg_sleep — a cheap-but-slow remainder for finishStream.
+        try await pool.withConnection { connection in
+            for try await _ in try await connection.queryStream(
+                "SELECT g, pg_sleep(0.05) FROM generate_series(1, 4) g") {
+                break
+            }
+        }
+
+        let pid1 = try await pool.query("SELECT pg_backend_pid() AS p").rows[0].decode("p", as: Int.self)
+        XCTAssertEqual(pid1, pid0, "a cheap-remainder stream break must keep the pooled connection, not churn it")
+
+        await pool.shutdown()
+    }
+
     func testStaleCopyIteratorDeinitDoesNotClobberANewerTeardown() async throws {
         // The teardown box is one slot. A stale iterator held past its copy, dropped after a newer copy
         // recorded its real drain task, must NOT overwrite that handle with its own (generation-guarded
