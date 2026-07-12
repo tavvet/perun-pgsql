@@ -2397,13 +2397,13 @@ public actor PostgresConnection {
                 return false               // a non-async message (e.g. a termination 'E') is already queued
             }
             guard pos + 5 <= readBuffer.count else { break }   // partial header: incomplete trailing frame, safe
-            // Read the length as a signed Int32 and validate it exactly as the framing decoder does, so a
-            // garbage value (the negative that 0xFFFFFFFF decodes to, or one past maxMessageSize) reads as
-            // a desync — not a benign "incomplete" frame that would let a following 'E' hide behind it.
-            let raw = (UInt32(readBuffer[pos + 1]) << 24) | (UInt32(readBuffer[pos + 2]) << 16)
-                    | (UInt32(readBuffer[pos + 3]) << 8) | UInt32(readBuffer[pos + 4])
-            let length = Int(Int32(bitPattern: raw))
-            guard (try? Self.payloadLength(forMessageLength: length, maxMessageSize: maxMessageSize)) != nil else {
+            // Read the length with the decoder's own reader (a signed Int32) and validate it exactly as
+            // the framing decoder does (`payloadLength`), so a garbage value (the negative that 0xFFFFFFFF
+            // decodes to, or one past maxMessageSize) reads as a desync — not a benign "incomplete" frame
+            // that would let a following 'E' hide behind it.
+            var lengthReader = ByteReader(readBuffer[(pos + 1) ..< (pos + 5)])
+            guard let length = (try? lengthReader.readInt32()).map(Int.init),   // 4 bytes guaranteed above
+                  (try? Self.payloadLength(forMessageLength: length, maxMessageSize: maxMessageSize)) != nil else {
                 return false
             }
             let frameEnd = pos + 1 + length
@@ -2454,17 +2454,9 @@ public actor PostgresConnection {
         return true
     }
 
-    /// Test seam: leave one framing-complete, empty-payload (length-4) message per tag unconsumed in the
-    /// driver's own read buffer, standing in for a read-ahead that pulled trailing messages in alongside
-    /// the last one. Multiple tags stack into one buffer. The empty payload is fine for a tag the probe
-    /// rejects outright (e.g. 'E') or for priming a malformed async frame the decoder must reject; a
-    /// decodable benign message needs a real payload — use `primeReadBufferRawForTest(notificationFrame())`.
-    func primeReadBufferForTest(_ tags: [UInt8]) {
-        for tag in tags { readBuffer.append(contentsOf: [tag, 0, 0, 0, 4]) }
-    }
-
-    /// Test seam: append arbitrary raw bytes to the read buffer, for priming a frame the framed
-    /// `primeReadBufferForTest` can't express — a real async payload, or a malformed/oversized header.
+    /// Test seam: append arbitrary raw bytes to the driver's own read buffer, standing in for a read-ahead
+    /// that pulled trailing messages in alongside the last one — a real async payload, an empty-payload
+    /// stand-in the decoder rejects, or a malformed/oversized header.
     func primeReadBufferRawForTest(_ bytes: [UInt8]) {
         readBuffer.append(contentsOf: bytes)
     }

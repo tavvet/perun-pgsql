@@ -28,7 +28,7 @@ final class PoolValidationIntegrationTests: XCTestCase {
         let aliveWhenDrained = await connection.isProbablyAlive()
         XCTAssertTrue(aliveWhenDrained, "a freshly drained connection must look alive")
 
-        await connection.primeReadBufferForTest([UInt8(ascii: "E")])   // a buffered ErrorResponse (termination)
+        await connection.primeReadBufferRawForTest([UInt8(ascii: "E"), 0, 0, 0, 4])   // a buffered ErrorResponse
         let aliveWithBuffered = await connection.isProbablyAlive()
         XCTAssertFalse(aliveWithBuffered,
                        "a buffered non-async message must make the connection look dead")
@@ -38,12 +38,7 @@ final class PoolValidationIntegrationTests: XCTestCase {
         // Read-ahead can pull several frames into readBuffer at once. A benign async 'A' first, then a
         // termination 'E', must NOT read as alive just because the first tag is benign — the walk has
         // to reach the 'E' behind it, or the next borrower inherits a dead wire.
-        let connection = try await PostgresConnection.connect(integrationConfiguration())
-        defer { Task { try? await connection.close() } }
-        _ = try await connection.query("SELECT 1").rows
-
-        await connection.primeReadBufferRawForTest(notificationFrame() + [UInt8(ascii: "E"), 0, 0, 0, 4])
-        let alive = await connection.isProbablyAlive()
+        let alive = try await isAliveAfterPrimingReadBuffer(notificationFrame() + [UInt8(ascii: "E"), 0, 0, 0, 4])
         XCTAssertFalse(alive, "an 'E' buffered behind a benign 'A' must still make the connection look dead")
     }
 
@@ -51,26 +46,23 @@ final class PoolValidationIntegrationTests: XCTestCase {
         // The walk must validate the frame length like the framing decoder: a garbage length (0xFFFFFFFF,
         // a negative Int32) must read as a desync, not a benign "incomplete" frame — otherwise a
         // termination 'E' queued right behind such an 'A' hides and the connection looks alive.
-        let connection = try await PostgresConnection.connect(integrationConfiguration())
-        defer { Task { try? await connection.close() } }
-        _ = try await connection.query("SELECT 1").rows
-
-        // 'A' with length 0xFFFFFFFF (a negative Int32), then a well-formed empty 'E' behind it.
-        await connection.primeReadBufferRawForTest([UInt8(ascii: "A"), 0xFF, 0xFF, 0xFF, 0xFF,
-                                                    UInt8(ascii: "E"), 0, 0, 0, 4])
-        let alive = await connection.isProbablyAlive()
+        let alive = try await isAliveAfterPrimingReadBuffer([UInt8(ascii: "A"), 0xFF, 0xFF, 0xFF, 0xFF,
+                                                             UInt8(ascii: "E"), 0, 0, 0, 4])
         XCTAssertFalse(alive, "a malformed async frame length must read as dead, not hide the 'E' behind it")
+    }
+
+    func testLivenessRejectsAMalformedAsyncPayloadThatTheDecoderWouldReject() async throws {
+        // A frame can pass framing yet be rejected by the message decoder: an 'A' with a valid length but
+        // an empty payload is no real NotificationResponse. The probe must run each full frame through the
+        // same decoder the reader uses, or it keeps a connection whose very next read is a protocol violation.
+        let alive = try await isAliveAfterPrimingReadBuffer([UInt8(ascii: "A"), 0, 0, 0, 4])   // valid length, empty payload
+        XCTAssertFalse(alive, "a framing-valid but undecodable async frame must read as dead")
     }
 
     func testLivenessKeepsConnectionWithBufferedAsyncMessage() async throws {
         // A benign async message the driver already read into readBuffer (NotificationResponse) must NOT
         // discard the connection — the frame walk classifies it and the reader consumes it next.
-        let connection = try await PostgresConnection.connect(integrationConfiguration())
-        defer { Task { try? await connection.close() } }
-        _ = try await connection.query("SELECT 1").rows
-
-        await connection.primeReadBufferRawForTest(notificationFrame())   // a real, decodable NotificationResponse
-        let alive = await connection.isProbablyAlive()
+        let alive = try await isAliveAfterPrimingReadBuffer(notificationFrame())   // a real, decodable one
         XCTAssertTrue(alive, "a buffered async message must keep the connection alive, not discard it")
     }
 
@@ -93,20 +85,6 @@ final class PoolValidationIntegrationTests: XCTestCase {
 
         let alive = await connection.isProbablyAlive()
         XCTAssertFalse(alive, "a kernel-buffered async message shadowing a termination must read as dead")
-    }
-
-    func testLivenessRejectsAMalformedAsyncPayloadThatTheDecoderWouldReject() async throws {
-        // A frame can pass framing yet be rejected by the message decoder: an 'A' with a valid length but
-        // an empty payload is no real NotificationResponse (no PID, no strings). The probe must run each
-        // full frame through the same decoder the reader uses, or it keeps a connection whose very next
-        // read is a protocol violation.
-        let connection = try await PostgresConnection.connect(integrationConfiguration())
-        defer { Task { try? await connection.close() } }
-        _ = try await connection.query("SELECT 1").rows
-
-        await connection.primeReadBufferForTest([UInt8(ascii: "A")])   // 'A', length 4, empty payload — malformed
-        let alive = await connection.isProbablyAlive()
-        XCTAssertFalse(alive, "a framing-valid but undecodable async frame must read as dead")
     }
 
     func testPooledCopyOutBreakWithCheapRemainderKeepsTheConnection() async throws {
@@ -213,15 +191,26 @@ final class PoolValidationIntegrationTests: XCTestCase {
 
     // MARK: - Helpers
 
+    /// Connect, drain to a steady ReadyForQuery, prime `bytes` into the driver's read buffer, and return
+    /// the liveness verdict — the shared scaffold for the readBuffer-priming liveness cases above.
+    private func isAliveAfterPrimingReadBuffer(_ bytes: [UInt8]) async throws -> Bool {
+        let connection = try await PostgresConnection.connect(integrationConfiguration())
+        defer { Task { try? await connection.close() } }
+        _ = try await connection.query("SELECT 1").rows
+        await connection.primeReadBufferRawForTest(bytes)
+        return await connection.isProbablyAlive()
+    }
+
     /// A well-formed NotificationResponse ('A') frame the real decoder accepts: a length header, then an
     /// Int32 PID and two NUL-terminated strings (channel, payload) — unlike an empty-payload stand-in.
+    /// Built with the driver's own `ByteWriter`, so the framing matches what the wire encoder produces.
     private func notificationFrame(pid: Int32 = 42, channel: String = "chan", payload: String = "hi") -> [UInt8] {
-        var body = withUnsafeBytes(of: pid.bigEndian) { Array($0) }
-        body += Array(channel.utf8) + [0]
-        body += Array(payload.utf8) + [0]
-        var frame: [UInt8] = [UInt8(ascii: "A")]
-        frame += withUnsafeBytes(of: Int32(body.count + 4).bigEndian) { Array($0) }   // length includes itself
-        frame += body
-        return frame
+        var writer = ByteWriter()
+        let lengthOffset = writer.beginFrame(tag: UInt8(ascii: "A"))
+        writer.writeInt32(pid)
+        writer.writeCString(channel)
+        writer.writeCString(payload)
+        writer.endFrame(lengthOffset: lengthOffset)
+        return writer.bytes
     }
 }
