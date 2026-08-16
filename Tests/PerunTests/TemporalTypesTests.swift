@@ -44,20 +44,22 @@ final class TemporalTypesTests: XCTestCase {
 
     func testTimeEncoding() {
         XCTAssertEqual(PostgresTime(microseconds: 1).postgresBinary(), [0, 0, 0, 0, 0, 0, 0, 1])
-        XCTAssertEqual(PostgresTime(hour: 4, minute: 5, second: 6, microsecond: 789).postgresText,
+        XCTAssertEqual(PostgresTime(hour: 4, minute: 5, second: 6, microsecond: 789)!.postgresText,
                        "04:05:06.000789")
-        XCTAssertEqual(PostgresTime(hour: 4, minute: 5, second: 6, microsecond: 789).postgresTypeOID, 1083)
+        XCTAssertEqual(PostgresTime(hour: 4, minute: 5, second: 6, microsecond: 789)!.postgresTypeOID, 1083)
+        XCTAssertNil(PostgresTime(hour: Int.max, minute: 0, second: 0))
+        XCTAssertNil(PostgresTime(hour: 24, minute: 0, second: 1))
     }
 
     func testTimeDecoding() throws {
         let binary = try PostgresTime.decode([0, 0, 0, 0, 0, 0, 0, 1], oid: 1083, format: .binary)
         XCTAssertEqual(binary, PostgresTime(microseconds: 1))
         let text = try PostgresTime.decode(Array("04:05:06.000789".utf8), oid: 1083, format: .text)
-        XCTAssertEqual(text, PostgresTime(hour: 4, minute: 5, second: 6, microsecond: 789))
+        XCTAssertEqual(text, PostgresTime(hour: 4, minute: 5, second: 6, microsecond: 789)!)
     }
 
     func testTimeTzEncoding() {
-        let value = PostgresTimeTz(time: PostgresTime(hour: 12, minute: 34, second: 56), zoneOffsetSeconds: 18000)
+        let value = PostgresTimeTz(time: PostgresTime(hour: 12, minute: 34, second: 56)!, zoneOffsetSeconds: 18000)
         XCTAssertEqual(value.postgresText, "12:34:56.000000+05:00")
         XCTAssertEqual(value.postgresTypeOID, 1266)
         // Binary: int64 microseconds, int32 zone (seconds *west* = negated offset).
@@ -67,7 +69,7 @@ final class TemporalTypesTests: XCTestCase {
 
     func testTimeTzDecoding() throws {
         let text = try PostgresTimeTz.decode(Array("12:34:56.789+05:30".utf8), oid: 1266, format: .text)
-        XCTAssertEqual(text, PostgresTimeTz(time: PostgresTime(hour: 12, minute: 34, second: 56, microsecond: 789_000),
+        XCTAssertEqual(text, PostgresTimeTz(time: PostgresTime(hour: 12, minute: 34, second: 56, microsecond: 789_000)!,
                                             zoneOffsetSeconds: 19800))
         let binary = try PostgresTimeTz.decode(
             [0, 0, 0, 0, 0, 0, 0, 1, 0xFF, 0xFF, 0xB9, 0xB0], oid: 1266, format: .binary)
@@ -100,6 +102,15 @@ final class TemporalTypesTests: XCTestCase {
         // The same guard protects interval's time part.
         XCTAssertThrowsError(try PostgresInterval.decode(
             Array("99999999999999:00:00".utf8), oid: 1186, format: .text))
+        XCTAssertThrowsError(try PostgresInterval.decode(
+            Array("9223372036854775807 years".utf8), oid: 1186, format: .text))
+        XCTAssertThrowsError(try PostgresInterval.decode(
+            Array("9223372036854775807 mons 1 mon".utf8), oid: 1186, format: .text))
+        XCTAssertThrowsError(try PostgresInterval.decode(
+            Array("9223372036854 secs 1 sec".utf8), oid: 1186, format: .text))
+        XCTAssertThrowsError(try PostgresInterval.decode(
+            Array("2562047789:00:00".utf8), oid: 1186, format: .text))
+        XCTAssertThrowsError(try time("00:00:00.1234567"))
     }
 
     // MARK: - Live round-trip
@@ -114,14 +125,14 @@ final class TemporalTypesTests: XCTestCase {
             XCTAssertEqual(back, interval, "interval round-trip (\(format))")
         }
 
-        let time = PostgresTime(hour: 13, minute: 14, second: 15, microsecond: 678_900)
+        let time = PostgresTime(hour: 13, minute: 14, second: 15, microsecond: 678_900)!
         for format in [PostgresFormat.text, .binary] {
             let back: PostgresTime = try await connection.query(
                 "SELECT $1::time AS v", [time], resultFormat: format).rows[0].decode("v")
             XCTAssertEqual(back, time, "time round-trip (\(format))")
         }
 
-        let timetz = PostgresTimeTz(time: PostgresTime(hour: 13, minute: 14, second: 15, microsecond: 678_900),
+        let timetz = PostgresTimeTz(time: PostgresTime(hour: 13, minute: 14, second: 15, microsecond: 678_900)!,
                                     zoneOffsetSeconds: 19800)   // +05:30
         for format in [PostgresFormat.text, .binary] {
             let back: PostgresTimeTz = try await connection.query(

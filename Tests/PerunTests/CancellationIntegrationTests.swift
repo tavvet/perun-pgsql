@@ -68,6 +68,39 @@ final class CancellationIntegrationTests: XCTestCase {
         try await connection.close()
     }
 
+    func testCancellationAfterCommitIsReportedWithoutRollingBackCommittedWork() async throws {
+        let connection = try await PostgresConnection.connect(integrationConfiguration())
+        _ = try await connection.query("CREATE TEMP TABLE perun_cancel_after_commit (id int)")
+
+        let commitConfirmed = Gate()
+        let allowReturn = Gate()
+        await connection.setTransactionAfterCommitTestHook {
+            await commitConfirmed.open()
+            await allowReturn.wait()
+        }
+
+        let transaction = Task {
+            try await connection.withTransaction { tx in
+                _ = try await tx.query("INSERT INTO perun_cancel_after_commit VALUES (1)")
+            }
+        }
+        await commitConfirmed.wait()
+        transaction.cancel()
+        await allowReturn.open()
+
+        do {
+            try await transaction.value
+            XCTFail("cancellation after COMMIT should still be reported")
+        } catch is CancellationError {
+            // Expected: PostgreSQL committed, while the cancelled caller still observes cancellation.
+        }
+
+        let count = try await connection.query("SELECT count(*)::int AS n FROM perun_cancel_after_commit")
+            .rows[0].decode("n", as: Int.self)
+        XCTAssertEqual(count, 1, "confirmed COMMIT must not be followed by a spurious ROLLBACK")
+        try await connection.close()
+    }
+
     func testInFlightQueryCancellationStopsTheQuery() async throws {
         let connection = try await PostgresConnection.connect(integrationConfiguration())
 

@@ -295,6 +295,12 @@ public actor PostgresConnection {
     /// `onCancelledAfterSuccess` covers instead of racing `cancel()` against the handshake.
     private var copyInHandshakeTestHook: (@Sendable () async -> Void)?
     func setCopyInHandshakeTestHook(_ hook: @escaping @Sendable () async -> Void) { copyInHandshakeTestHook = hook }
+
+    /// Invoked after PostgreSQL confirms COMMIT but before cancellation is reported to the caller.
+    private var transactionAfterCommitTestHook: (@Sendable () async -> Void)?
+    func setTransactionAfterCommitTestHook(_ hook: @escaping @Sendable () async -> Void) {
+        transactionAfterCommitTestHook = hook
+    }
     #endif
 
     /// Backend PID + secret key, needed later to issue query cancellation.
@@ -746,6 +752,7 @@ public actor PostgresConnection {
             forceCloseIfDesynced(error)
             throw error
         }
+        var committed = false
         do {
             let result = try await body(Transaction(connection: self, contextID: contextID))
             // A cancel or timeout observed after the body finished but before COMMIT must roll back,
@@ -754,8 +761,16 @@ public actor PostgresConnection {
             // — it runs uncancellable to completion, so a cancel racing it may still commit.
             try Task.checkCancellation()
             _ = try await runSimpleQuery("COMMIT")
+            committed = true
+            #if DEBUG
+            await transactionAfterCommitTestHook?()
+            #endif
+            // COMMIT is complete, so cancellation can only be reported; it must not enter the
+            // rollback path below and issue a new command outside the completed transaction.
+            try Task.checkCancellation()
             return result
         } catch {
+            if committed { throw error }
             // A desynced wire can't carry a ROLLBACK: reading its bogus reply could hang on a
             // garbage length. Tear the connection down instead (the server rolls the aborted
             // transaction back on disconnect). Otherwise the wire is in sync — roll back, and

@@ -42,18 +42,17 @@ extension Date: PostgresDecodable {
             case PostgresOID.timestamp, PostgresOID.timestamptz:
                 guard bytes.count == 8 else { throw postgresDecodeError("Date", oid: oid, format: format, bytes) }
                 let microseconds = Int64(bitPattern: WireBinary.uint64(bytes))
-                // PostgreSQL encodes ±infinity as the Int64 extremes. `Date` can't hold infinity,
-                // so map them to its distant sentinels (as the text path does) rather than
-                // silently decode Int64.max µs into a finite date around year 294247.
-                if microseconds == Int64.max { return .distantFuture }
-                if microseconds == Int64.min { return .distantPast }
+                // PostgreSQL encodes ±infinity as the Int64 extremes. Preserve them as
+                // non-finite Dates rather than colliding with Foundation's finite distant values.
+                if microseconds == Int64.max { return Date(timeIntervalSince1970: .infinity) }
+                if microseconds == Int64.min { return Date(timeIntervalSince1970: -.infinity) }
                 let seconds = Double(microseconds) / 1_000_000
                 return Date(timeIntervalSinceReferenceDate: seconds - pgEpochToReferenceDate)
             case PostgresOID.date:
                 guard bytes.count == 4 else { throw postgresDecodeError("Date", oid: oid, format: format, bytes) }
                 let days = Int32(bitPattern: WireBinary.uint32(bytes))
-                if days == Int32.max { return .distantFuture }        // 'infinity'::date
-                if days == Int32.min { return .distantPast }          // '-infinity'::date
+                if days == Int32.max { return Date(timeIntervalSince1970: .infinity) }
+                if days == Int32.min { return Date(timeIntervalSince1970: -.infinity) }
                 return Date(timeIntervalSinceReferenceDate: Double(days) * 86_400 - pgEpochToReferenceDate)
             default:
                 throw postgresDecodeError("Date", oid: oid, format: format, bytes)
@@ -127,10 +126,9 @@ extension Decimal: PostgresDecodable {
 /// `timestamptz`, e.g. `2026-07-07`, `2026-07-07 20:50:24.123456`, or
 /// `2026-07-07 20:50:24.123456+00`. Returns nil if it doesn't match.
 func parsePostgresTimestamp(_ string: String) -> Date? {
-    // PostgreSQL renders ±infinity literally; `Date` has no infinity, so use its sentinels
-    // (the binary decoder maps Int64.max/min the same way).
-    if string == "infinity" { return .distantFuture }
-    if string == "-infinity" { return .distantPast }
+    // Keep PostgreSQL infinity distinct from Foundation's finite distantPast/distantFuture dates.
+    if string == "infinity" { return Date(timeIntervalSince1970: .infinity) }
+    if string == "-infinity" { return Date(timeIntervalSince1970: -.infinity) }
 
     let scalars = Array(string.utf8)
     var index = 0
@@ -238,13 +236,31 @@ extension UUID: PostgresEncodable {
 
 extension Date: PostgresEncodable {
     /// A `Date` is an instant, so it maps to `timestamptz`.
-    public var postgresText: String? { postgresTimestampText(self) }
+    public var postgresText: String? {
+        switch postgresTimestampEncoding(self) {
+        case .positiveInfinity: return "infinity"
+        case .negativeInfinity: return "-infinity"
+        case let .finite(microseconds): return postgresTimestampText(microsecondsSincePostgresEpoch: microseconds)
+        case .invalid: return nil
+        }
+    }
     public var postgresTypeOID: Int32 { PostgresOID.timestamptz }
     public func postgresBinary() -> [UInt8]? {
-        // Microseconds since 2000-01-01 UTC (PostgreSQL's epoch), which is
-        // 31_622_400 s after Swift's 2001-01-01 reference date. Big-endian int8.
-        let secondsSinceEpoch = timeIntervalSinceReferenceDate + 31_622_400
-        return bigEndianBytes(Int64((secondsSinceEpoch * 1_000_000).rounded()))
+        switch postgresTimestampEncoding(self) {
+        case .positiveInfinity: return bigEndianBytes(Int64.max)
+        case .negativeInfinity: return bigEndianBytes(Int64.min)
+        case let .finite(microseconds): return bigEndianBytes(microseconds)
+        case .invalid: return nil
+        }
+    }
+}
+
+extension Date: PostgresEncodingValidatable {
+    var postgresEncodingFailureReason: String? {
+        if case .invalid = postgresTimestampEncoding(self) {
+            return "Date is NaN or outside PostgreSQL's timestamp range"
+        }
+        return nil
     }
 }
 
@@ -315,21 +331,50 @@ private func postgresNumericBinary(_ text: String) -> [UInt8]? {
     return out
 }
 
-/// Render a `Date` as PostgreSQL `timestamptz` text at UTC, microsecond precision:
-/// `YYYY-MM-DD HH:MM:SS.ffffff+00`. (Used for the text parameter path; binary is exact.)
-private func postgresTimestampText(_ date: Date) -> String {
-    let totalMicros = Int64((date.timeIntervalSince1970 * 1_000_000).rounded())
+private enum PostgresTimestampEncoding {
+    case finite(microseconds: Int64)
+    case positiveInfinity
+    case negativeInfinity
+    case invalid
+}
+
+/// PostgreSQL's finite timestamp range, in microseconds since 2000-01-01. Values outside
+/// this half-open interval are rejected by the server; Int64.min/max are infinity sentinels.
+private let postgresMinimumTimestamp: Int64 = -211_813_488_000_000_000
+private let postgresEndTimestamp: Int64 = 9_223_371_331_200_000_000
+
+private func postgresTimestampEncoding(_ date: Date) -> PostgresTimestampEncoding {
+    let unixSeconds = date.timeIntervalSince1970
+    if unixSeconds == .infinity { return .positiveInfinity }
+    if unixSeconds == -.infinity { return .negativeInfinity }
+    guard unixSeconds.isFinite else { return .invalid }
+
+    // PostgreSQL's epoch is 31_622_400 seconds before Swift's 2001 reference date.
+    let secondsSincePostgresEpoch = date.timeIntervalSinceReferenceDate + 31_622_400
+    guard let microseconds = Int64(exactly: (secondsSincePostgresEpoch * 1_000_000).rounded()),
+          microseconds >= postgresMinimumTimestamp,
+          microseconds < postgresEndTimestamp else { return .invalid }
+    return .finite(microseconds: microseconds)
+}
+
+/// Render finite PostgreSQL-epoch microseconds as `timestamptz` text at UTC:
+/// `YYYY-MM-DD HH:MM:SS.ffffff+00`. The day conversion avoids adding the epoch offset
+/// at microsecond scale, which would overflow near PostgreSQL's upper timestamp bound.
+private func postgresTimestampText(microsecondsSincePostgresEpoch totalMicros: Int64) -> String {
     var seconds = totalMicros / 1_000_000
-    var micros = totalMicros - seconds * 1_000_000
+    var micros = totalMicros % 1_000_000
     if micros < 0 { micros += 1_000_000; seconds -= 1 }        // floor toward negative infinity
-    let days = Int((Double(seconds) / 86_400).rounded(.down))
-    let secondOfDay = Int(seconds - Int64(days) * 86_400)
-    let (year, month, day) = civilFromDays(days)
+
+    var daysSincePostgresEpoch = seconds / 86_400
+    var secondOfDay = seconds % 86_400
+    if secondOfDay < 0 { secondOfDay += 86_400; daysSincePostgresEpoch -= 1 }
+    let daysSinceUnixEpoch = Int(daysSincePostgresEpoch + 10_957)
+    let (year, month, day) = civilFromDays(daysSinceUnixEpoch)
     let displayYear = year <= 0 ? 1 - year : year               // no year zero: 0 → 1 BC
     let eraSuffix = year <= 0 ? " BC" : ""
     return String(format: "%04d-%02d-%02d %02d:%02d:%02d.%06d+00",
                   displayYear, month, day,
-                  secondOfDay / 3600, (secondOfDay % 3600) / 60, secondOfDay % 60,
+                  Int(secondOfDay) / 3600, Int(secondOfDay % 3600) / 60, Int(secondOfDay % 60),
                   Int(micros)) + eraSuffix
 }
 

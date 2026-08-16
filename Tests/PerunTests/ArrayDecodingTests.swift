@@ -20,7 +20,7 @@ final class ArrayDecodingTests: XCTestCase {
         // {{},{}} that PostgreSQL rejects).
         XCTAssertEqual(PostgresArray([[Int]]([[], []])).postgresText, "{}")
         // With a known element type, binary encodes the canonical empty array (ndim = 0).
-        let typed = PostgresArray(dimensions: [2, 0], elements: [], elementTypeOID: PostgresOID.int8)
+        let typed = PostgresArray(dimensions: [2, 0], elements: [], elementTypeOID: PostgresOID.int8)!
         XCTAssertEqual(typed.postgresText, "{}")
         XCTAssertEqual(typed.postgresBinary()?.prefix(4), [0, 0, 0, 0])   // ndim = 0
     }
@@ -195,7 +195,8 @@ final class ArrayDecodingTests: XCTestCase {
 
         // A three-dimensional parameter round-trips through the server.
         let cubeParam = PostgresArray(dimensions: [2, 1, 2],
-                                      elements: [1, 2, 3, 4] as [PostgresEncodable?], elementTypeOID: PostgresOID.int8)
+                                      elements: [1, 2, 3, 4] as [PostgresEncodable?],
+                                      elementTypeOID: PostgresOID.int8)!
         let cubeBack: [[[Int]]] = try await connection.query("SELECT $1::int8[] AS a", [cubeParam])
             .rows[0].decodeArray("a", of: Int.self)
         XCTAssertEqual(cubeBack, [[[1, 2]], [[3, 4]]])

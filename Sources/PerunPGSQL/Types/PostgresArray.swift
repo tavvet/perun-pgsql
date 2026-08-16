@@ -23,10 +23,26 @@ public struct PostgresArray: PostgresEncodable {
     public private(set) var elementTypeOID: Int32
 
     /// A multi-dimensional array from a flat, row-major element list and an explicit
-    /// shape. `dimensions` must multiply to `elements.count`.
-    public init(dimensions: [Int], elements: [PostgresEncodable?], elementTypeOID: Int32) {
-        precondition(dimensions.reduce(1, *) == elements.count,
-                     "PostgresArray dimensions \(dimensions) don't match \(elements.count) elements")
+    /// shape. Returns `nil` unless there are 1...6 non-negative, Int32-sized dimensions
+    /// whose product is exactly `elements.count`.
+    public init?(dimensions: [Int], elements: [PostgresEncodable?], elementTypeOID: Int32) {
+        guard (1 ... 6).contains(dimensions.count) else { return nil }
+        var elementCount = 1
+        for dimension in dimensions {
+            guard dimension >= 0, dimension <= Int(Int32.max) else { return nil }
+            let (product, overflow) = elementCount.multipliedReportingOverflow(by: dimension)
+            guard !overflow else { return nil }
+            elementCount = product
+        }
+        guard elementCount == elements.count else { return nil }
+        self.dimensions = dimensions
+        self.elements = elements
+        self.elementTypeOID = elementTypeOID
+    }
+
+    private init(validatedDimensions dimensions: [Int],
+                 elements: [PostgresEncodable?],
+                 elementTypeOID: Int32) {
         self.dimensions = dimensions
         self.elements = elements
         self.elementTypeOID = elementTypeOID
@@ -34,7 +50,7 @@ public struct PostgresArray: PostgresEncodable {
 
     /// A one-dimensional array from a flat element list.
     public init(_ elements: [PostgresEncodable?], elementTypeOID: Int32) {
-        self.init(dimensions: [elements.count], elements: elements, elementTypeOID: elementTypeOID)
+        self.init(validatedDimensions: [elements.count], elements: elements, elementTypeOID: elementTypeOID)
     }
 
     /// Non-null elements; the element type OID is taken from the first element.
@@ -54,7 +70,7 @@ public struct PostgresArray: PostgresEncodable {
     public init<Element: PostgresEncodable>(_ rows: [[Element]]) {
         let width = rows.first?.count ?? 0
         precondition(rows.allSatisfy { $0.count == width }, "PostgresArray rows must be rectangular")
-        self.init(dimensions: [rows.count, width],
+        self.init(validatedDimensions: [rows.count, width],
                   elements: rows.flatMap { $0.map { $0 as PostgresEncodable? } },
                   elementTypeOID: rows.first?.first?.postgresTypeOID ?? 0)
     }
@@ -64,7 +80,7 @@ public struct PostgresArray: PostgresEncodable {
     public init<Element: PostgresEncodable>(_ rows: [[Element?]]) {
         let width = rows.first?.count ?? 0
         precondition(rows.allSatisfy { $0.count == width }, "PostgresArray rows must be rectangular")
-        self.init(dimensions: [rows.count, width],
+        self.init(validatedDimensions: [rows.count, width],
                   elements: rows.flatMap { $0.map { $0.map { $0 as PostgresEncodable } } },
                   elementTypeOID: rows.compactMap { $0.compactMap { $0 }.first }.first?.postgresTypeOID ?? 0)
     }
@@ -107,6 +123,8 @@ public struct PostgresArray: PostgresEncodable {
     /// binary form.
     public func postgresBinary() -> [UInt8]? {
         guard elementTypeOID != 0 else { return nil }
+        guard dimensions.count <= Int(Int32.max),
+              dimensions.allSatisfy({ $0 >= 0 && $0 <= Int(Int32.max) }) else { return nil }
         // A zero-length dimension (or none) means the array is empty: emit PostgreSQL's canonical
         // empty-array form (ndim = 0), not a descriptor for a dimension with no elements.
         if dimensions.isEmpty || dimensions.contains(0) {
@@ -121,6 +139,7 @@ public struct PostgresArray: PostgresEncodable {
                 continue
             }
             guard let bytes = element.postgresBinary() else { return nil }
+            guard bytes.count <= Int(Int32.max) else { return nil }
             body += bigEndianBytes(Int32(bytes.count))
             body += bytes
         }
@@ -135,6 +154,17 @@ public struct PostgresArray: PostgresEncodable {
         }
         out += body
         return out
+    }
+}
+
+extension PostgresArray: PostgresEncodingValidatable {
+    var postgresEncodingFailureReason: String? {
+        for (index, element) in elements.enumerated() {
+            guard let validatable = element as? any PostgresEncodingValidatable,
+                  let reason = validatable.postgresEncodingFailureReason else { continue }
+            return "array element \(index + 1): \(reason)"
+        }
+        return nil
     }
 }
 

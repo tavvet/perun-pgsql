@@ -24,6 +24,12 @@ public extension PostgresEncodable {
     func postgresBinary() -> [UInt8]? { nil }
 }
 
+/// Internal validation for encoders whose non-null Swift values can be unrepresentable.
+/// `postgresText == nil` normally means SQL NULL, so these values must be rejected before Bind.
+protocol PostgresEncodingValidatable {
+    var postgresEncodingFailureReason: String? { get }
+}
+
 /// Big-endian bytes of a fixed-width value (the PostgreSQL binary wire order).
 func bigEndianBytes<T: FixedWidthInteger>(_ value: T) -> [UInt8] {
     withUnsafeBytes(of: value.bigEndian) { Array($0) }

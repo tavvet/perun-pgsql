@@ -178,25 +178,25 @@ final class TypeTests: XCTestCase {
     }
 
     func testTimestampInfinityTextAndBinaryAgree() throws {
-        // Binary ±infinity are the Int64 extremes; text renders them literally. Both must map
-        // to Date's distant sentinels, never a finite date fabricated from the sentinel bits.
+        // Binary ±infinity are the Int64 extremes; text renders them literally. Both stay
+        // non-finite instead of colliding with Foundation's finite distant dates.
         let binaryPosInf = try Date.decode([0x7F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
                                            oid: PostgresOID.timestamptz, format: .binary)
         let binaryNegInf = try Date.decode([0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
                                            oid: PostgresOID.timestamptz, format: .binary)
-        XCTAssertEqual(binaryPosInf, .distantFuture)
-        XCTAssertEqual(binaryNegInf, .distantPast)
+        XCTAssertEqual(binaryPosInf.timeIntervalSince1970, .infinity)
+        XCTAssertEqual(binaryNegInf.timeIntervalSince1970, -.infinity)
 
-        XCTAssertEqual(try Date.decode(Array("infinity".utf8), oid: PostgresOID.timestamptz, format: .text),
-                       .distantFuture)
-        XCTAssertEqual(try Date.decode(Array("-infinity".utf8), oid: PostgresOID.timestamptz, format: .text),
-                       .distantPast)
+        XCTAssertEqual(try Date.decode(Array("infinity".utf8), oid: PostgresOID.timestamptz, format: .text)
+            .timeIntervalSince1970, .infinity)
+        XCTAssertEqual(try Date.decode(Array("-infinity".utf8), oid: PostgresOID.timestamptz, format: .text)
+            .timeIntervalSince1970, -.infinity)
 
         // date 'infinity' / '-infinity' are the Int32 extremes.
-        XCTAssertEqual(try Date.decode([0x7F, 0xFF, 0xFF, 0xFF], oid: PostgresOID.date, format: .binary),
-                       .distantFuture)
-        XCTAssertEqual(try Date.decode([0x80, 0x00, 0x00, 0x00], oid: PostgresOID.date, format: .binary),
-                       .distantPast)
+        XCTAssertEqual(try Date.decode([0x7F, 0xFF, 0xFF, 0xFF], oid: PostgresOID.date, format: .binary)
+            .timeIntervalSince1970, .infinity)
+        XCTAssertEqual(try Date.decode([0x80, 0x00, 0x00, 0x00], oid: PostgresOID.date, format: .binary)
+            .timeIntervalSince1970, -.infinity)
     }
 
     // MARK: numeric — binary base-10000 groups

@@ -40,6 +40,7 @@ final class ErrorClassificationTests: XCTestCase {
             .clientShutdown,
             .preparedStatementConnectionMismatch,
             .parameterTypeMismatch(parameter: 1, expected: PostgresOID.int8, actual: PostgresOID.float8),
+            .parameterEncodingFailed(parameter: 1, reason: "invalid Date"),
             .copyMismatch("wrong direction"),
             .timedOut,
         ]

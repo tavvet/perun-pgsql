@@ -213,6 +213,8 @@ public enum PerunError: Error, CustomStringConvertible, Sendable {
     /// A single value (a bind parameter or a COPY chunk) is too large to frame — the protocol's
     /// Int32 length field caps it just under 2 GiB. Split the data into smaller pieces.
     case valueTooLarge(bytes: Int)
+    /// A non-null Swift parameter could not be represented as its PostgreSQL type.
+    case parameterEncodingFailed(parameter: Int, reason: String)
     /// A prepared-statement handle was used on a different connection than the
     /// one that created it.
     case preparedStatementConnectionMismatch
@@ -264,6 +266,8 @@ public enum PerunError: Error, CustomStringConvertible, Sendable {
             return "too many parameters: \(count) (PostgreSQL allows at most 65535 per statement)"
         case let .valueTooLarge(bytes):
             return "value of \(bytes) bytes is too large to frame (the protocol length field caps it near 2 GiB)"
+        case let .parameterEncodingFailed(parameter, reason):
+            return "could not encode parameter \(parameter): \(reason)"
         case .preparedStatementConnectionMismatch:
             return "prepared statement belongs to a different connection"
         case let .copyMismatch(detail):
@@ -291,7 +295,7 @@ extension PerunError {
             return true
         case .server, .unexpectedNull, .columnNotFound, .decodingFailed, .tooManyParameters,
              .clientShutdown, .preparedStatementConnectionMismatch, .copyMismatch, .timedOut,
-             .parameterTypeMismatch, .valueTooLarge:
+             .parameterTypeMismatch, .valueTooLarge, .parameterEncodingFailed:
             return false
         }
     }

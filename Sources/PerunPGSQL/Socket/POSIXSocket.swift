@@ -92,8 +92,13 @@ enum SystemSocket {
             // socket itself never to raise SIGPIPE when the peer goes away.
             #if canImport(Darwin)
             var on: Int32 = 1
-            setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on,
-                       socklen_t(MemoryLayout<Int32>.size))
+            if setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on,
+                          socklen_t(MemoryLayout<Int32>.size)) != 0 {
+                lastReason = errnoString(errno)
+                close(fd)
+                candidate = info.pointee.ai_next
+                continue
+            }
             #endif
 
             do {
@@ -125,35 +130,48 @@ enum SystemSocket {
         }
 
         let flags = fcntl(fd, F_GETFL, 0)
-        _ = fcntl(fd, F_SETFL, flags | O_NONBLOCK)
-        defer { _ = fcntl(fd, F_SETFL, flags) }          // restore blocking mode for steady-state I/O
-
-        if connect(fd, address, length) == 0 { return true }   // connected immediately (e.g. localhost)
-        guard errno == EINPROGRESS else {
+        guard flags >= 0 else {
+            throw SocketError.connectionFailed(host: "", port: 0, reason: errnoString(errno))
+        }
+        guard fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0 else {
             throw SocketError.connectionFailed(host: "", port: 0, reason: errnoString(errno))
         }
 
-        var pfd = pollfd(fd: fd, events: Int16(truncatingIfNeeded: POLLOUT), revents: 0)
-        while true {
-            let remaining = deadline - monotonicMillis()
-            if remaining <= 0 { return false }                       // deadline reached: timed out
-            let wait = remaining > Int64(Int32.max) ? Int32.max : Int32(remaining)
-            let r = poll(&pfd, 1, wait)
-            if r < 0 {
-                if errno == EINTR { continue }                       // retry against the *remaining* time
-                return false
+        let result: Result<Bool, Error> = Result {
+            if connect(fd, address, length) == 0 { return true }   // connected immediately (e.g. localhost)
+            guard errno == EINPROGRESS else {
+                throw SocketError.connectionFailed(host: "", port: 0, reason: errnoString(errno))
             }
-            if r == 0 { return false }                               // poll hit the deadline
-            break                                                    // the socket is writable
+
+            var pfd = pollfd(fd: fd, events: Int16(truncatingIfNeeded: POLLOUT), revents: 0)
+            while true {
+                let remaining = deadline - monotonicMillis()
+                if remaining <= 0 { return false }                       // deadline reached: timed out
+                let wait = remaining > Int64(Int32.max) ? Int32.max : Int32(remaining)
+                let r = poll(&pfd, 1, wait)
+                if r < 0 {
+                    if errno == EINTR { continue }                       // retry against the *remaining* time
+                    throw SocketError.connectionFailed(host: "", port: 0, reason: errnoString(errno))
+                }
+                if r == 0 { return false }                               // poll hit the deadline
+                break                                                    // the socket is writable
+            }
+
+            var soError: Int32 = 0
+            var errorLength = socklen_t(MemoryLayout<Int32>.size)
+            guard getsockopt(fd, SOL_SOCKET, SO_ERROR, &soError, &errorLength) == 0 else {
+                throw SocketError.connectionFailed(host: "", port: 0, reason: errnoString(errno))
+            }
+            guard soError == 0 else {
+                throw SocketError.connectionFailed(host: "", port: 0, reason: errnoString(soError))
+            }
+            return true
         }
 
-        var soError: Int32 = 0
-        var errorLength = socklen_t(MemoryLayout<Int32>.size)
-        getsockopt(fd, SOL_SOCKET, SO_ERROR, &soError, &errorLength)
-        guard soError == 0 else {
-            throw SocketError.connectionFailed(host: "", port: 0, reason: errnoString(soError))
+        guard fcntl(fd, F_SETFL, flags) == 0 else {
+            throw SocketError.connectionFailed(host: "", port: 0, reason: errnoString(errno))
         }
-        return true
+        return try result.get()
     }
 
     /// Milliseconds from a monotonic clock, for deadline math (immune to wall-clock changes).
@@ -192,6 +210,7 @@ enum SystemSocket {
                     if errno == EINTR { continue }
                     throw SocketError.sendFailed(errno: errno)
                 }
+                guard n > 0 else { throw SocketError.sendFailed(errno: EPIPE) }
                 sent += n
             }
         }

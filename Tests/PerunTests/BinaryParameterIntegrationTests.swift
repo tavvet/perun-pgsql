@@ -52,6 +52,10 @@ final class BinaryParameterIntegrationTests: XCTestCase {
 
         let uuid = UUID()
         let date = Date(timeIntervalSince1970: 1_783_457_424.5)
+        let upperFiniteMicroseconds: Int64 = 9_223_371_331_200_000_000 - 1_000_000_000_000
+        let upperFinite = Date(
+            timeIntervalSinceReferenceDate: Double(upperFiniteMicroseconds) / 1_000_000 - 31_622_400
+        )
 
         for format in [PostgresFormat.text, .binary] {
             let row = try await pool.query("SELECT $1::uuid AS u, $2::timestamptz AS t",
@@ -60,6 +64,23 @@ final class BinaryParameterIntegrationTests: XCTestCase {
             XCTAssertEqual(try row.decode("u", as: UUID.self), uuid, "uuid via \(format)")
             XCTAssertEqual(try row.decode("t", as: Date.self).timeIntervalSince1970,
                            date.timeIntervalSince1970, accuracy: 0.000_001, "date via \(format)")
+
+            let infinityRow = try await pool.query(
+                """
+                SELECT $1::timestamptz AS future, $2::timestamptz AS past,
+                       $3::timestamptz AS upper_finite,
+                       $4::timestamptz AS distant_future, $5::timestamptz AS distant_past
+                """,
+                [Date(timeIntervalSince1970: .infinity), Date(timeIntervalSince1970: -.infinity),
+                 upperFinite, Date.distantFuture, Date.distantPast],
+                parameterFormat: format
+            ).rows[0]
+            XCTAssertEqual(try infinityRow.decode("future", as: Date.self).timeIntervalSince1970, .infinity)
+            XCTAssertEqual(try infinityRow.decode("past", as: Date.self).timeIntervalSince1970, -.infinity)
+            XCTAssertEqual(try infinityRow.decode("upper_finite", as: Date.self).timeIntervalSince1970,
+                           upperFinite.timeIntervalSince1970, accuracy: 0.01)
+            XCTAssertEqual(try infinityRow.decode("distant_future", as: Date.self), .distantFuture)
+            XCTAssertEqual(try infinityRow.decode("distant_past", as: Date.self), .distantPast)
         }
 
         await pool.shutdown()

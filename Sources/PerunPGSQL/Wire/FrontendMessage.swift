@@ -371,6 +371,12 @@ enum FrontendMessage {
                                        parameters: [(any PostgresEncodable)?],
                                        parameterFormat: PostgresFormat,
                                        resultFormat: PostgresFormat) throws {
+        for (index, parameter) in parameters.enumerated() {
+            guard let validatable = parameter as? any PostgresEncodingValidatable,
+                  let reason = validatable.postgresEncodingFailureReason else { continue }
+            throw PerunError.parameterEncodingFailed(parameter: index + 1, reason: reason)
+        }
+
         writer.writeCString(portal)
         writer.writeCString(statement)
 

@@ -56,7 +56,10 @@ final class TLSConnection: @unchecked Sendable {
         guard let method = TLS_client_method(), let ctx = SSL_CTX_new(method) else {
             throw PerunError.tlsHandshakeFailed("SSL_CTX_new failed: \(opensslErrors())")
         }
-        _ = perun_SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION)
+        guard perun_SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION) == 1 else {
+            SSL_CTX_free(ctx)
+            throw PerunError.tlsHandshakeFailed("could not require TLS 1.2 or newer: \(opensslErrors())")
+        }
 
         if verifyFull {
             SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, nil)
@@ -68,11 +71,20 @@ final class TLSConnection: @unchecked Sendable {
             }
         }
 
-        guard let ssl = SSL_new(ctx),
-              let rbio = BIO_new(BIO_s_mem()),
-              let wbio = BIO_new(BIO_s_mem()) else {
+        guard let ssl = SSL_new(ctx) else {
             SSL_CTX_free(ctx)
-            throw PerunError.tlsHandshakeFailed("SSL_new/BIO_new failed: \(opensslErrors())")
+            throw PerunError.tlsHandshakeFailed("SSL_new failed: \(opensslErrors())")
+        }
+        guard let rbio = BIO_new(BIO_s_mem()) else {
+            SSL_free(ssl)
+            SSL_CTX_free(ctx)
+            throw PerunError.tlsHandshakeFailed("BIO_new failed: \(opensslErrors())")
+        }
+        guard let wbio = BIO_new(BIO_s_mem()) else {
+            BIO_free(rbio)
+            SSL_free(ssl)
+            SSL_CTX_free(ctx)
+            throw PerunError.tlsHandshakeFailed("BIO_new failed: \(opensslErrors())")
         }
         // SSL takes ownership of both BIOs; SSL_free releases them.
         SSL_set_bio(ssl, rbio, wbio)
@@ -82,7 +94,12 @@ final class TLSConnection: @unchecked Sendable {
         // carries one — so send SNI only for DNS names. An IP host's identity is still bound below
         // through the IP-address verification path.
         if !isIPLiteral(hostname) {
-            _ = hostname.withCString { perun_SSL_set_tlsext_host_name(ssl, $0) }   // SNI
+            let sniConfigured = hostname.withCString { perun_SSL_set_tlsext_host_name(ssl, $0) == 1 }
+            guard sniConfigured else {
+                SSL_free(ssl)
+                SSL_CTX_free(ctx)
+                throw PerunError.tlsHandshakeFailed("SNI setup failed: \(opensslErrors())")
+            }
         }
         if verifyFull {
             // Bind identity verification to the handshake. SSL_set1_host matches DNS names
@@ -275,17 +292,23 @@ final class TLSConnection: @unchecked Sendable {
     private func drainOutgoing() throws {
         try socketWriteLock.withLock {
             while true {
-                var chunk: [UInt8] = []
-                engineLock.withLock {
+                let chunk: [UInt8]? = try engineLock.withLock {
+                    guard !closed else { throw PerunError.tlsIO("TLS connection is closed") }
                     let pending = Int(BIO_ctrl_pending(wbio))
-                    guard pending > 0 else { return }
+                    guard pending > 0 else { return nil }
                     let want = min(pending, 65_536)
-                    chunk = [UInt8](unsafeUninitializedCapacity: want) { raw, count in
+                    var read: Int32 = 0
+                    let chunk = [UInt8](unsafeUninitializedCapacity: want) { raw, count in
                         let n = BIO_read(wbio, raw.baseAddress, Int32(want))
+                        read = n
                         count = n > 0 ? Int(n) : 0
                     }
+                    guard read > 0 else {
+                        throw PerunError.tlsIO("BIO_read failed while draining TLS output: \(opensslErrors())")
+                    }
+                    return chunk
                 }
-                if chunk.isEmpty { return }
+                guard let chunk else { return }
                 do { try SystemSocket.sendAll(fd: fd, chunk) }
                 catch let error as SocketError { throw PerunError.tlsIO(error.description) }
             }
@@ -298,8 +321,11 @@ final class TLSConnection: @unchecked Sendable {
         do { chunk = try socketReadLock.withLock { try SystemSocket.receive(fd: fd, maxLength: 65_536) } }
         catch let error as SocketError { throw PerunError.tlsIO(error.description) }
         guard !chunk.isEmpty else { return false }           // clean EOF
-        engineLock.withLock {
-            _ = chunk.withUnsafeBytes { BIO_write(rbio, $0.baseAddress, Int32(chunk.count)) }
+        try engineLock.withLock {
+            guard !closed else { throw PerunError.tlsIO("TLS connection is closed") }
+            try Self.writeAllToMemoryBIO(chunk, bio: rbio) {
+                PerunError.tlsIO("BIO_write failed while feeding TLS input: \($0)")
+            }
         }
         return true
     }
@@ -309,11 +335,17 @@ final class TLSConnection: @unchecked Sendable {
             let pending = Int(BIO_ctrl_pending(bio))
             guard pending > 0 else { return }
             let want = min(pending, 65_536)
+            var read: Int32 = 0
             let chunk = [UInt8](unsafeUninitializedCapacity: want) { raw, count in
                 let n = BIO_read(bio, raw.baseAddress, Int32(want))
+                read = n
                 count = n > 0 ? Int(n) : 0
             }
-            if chunk.isEmpty { return }
+            guard read > 0 else {
+                throw PerunError.tlsHandshakeFailed(
+                    "BIO_read failed while draining TLS handshake output: \(opensslErrors())"
+                )
+            }
             do { try SystemSocket.sendAll(fd: fd, chunk) }
             catch let error as SocketError { throw PerunError.tlsHandshakeFailed(error.description) }
         }
@@ -324,8 +356,28 @@ final class TLSConnection: @unchecked Sendable {
         do { chunk = try SystemSocket.receive(fd: fd, maxLength: 65_536) }
         catch let error as SocketError { throw PerunError.tlsHandshakeFailed(error.description) }
         guard !chunk.isEmpty else { return false }
-        _ = chunk.withUnsafeBytes { BIO_write(bio, $0.baseAddress, Int32(chunk.count)) }
+        try writeAllToMemoryBIO(chunk, bio: bio) {
+            PerunError.tlsHandshakeFailed("BIO_write failed while feeding TLS handshake input: \($0)")
+        }
         return true
+    }
+
+    /// Memory BIO writes may make partial progress, just like socket writes.
+    private static func writeAllToMemoryBIO(
+        _ bytes: [UInt8],
+        bio: OpaquePointer,
+        failure: (String) -> PerunError
+    ) throws {
+        var offset = 0
+        try bytes.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            while offset < bytes.count {
+                let remaining = min(bytes.count - offset, Int(Int32.max))
+                let written = BIO_write(bio, base.advanced(by: offset), Int32(remaining))
+                guard written > 0 else { throw failure(opensslErrors()) }
+                offset += Int(written)
+            }
+        }
     }
 }
 

@@ -27,7 +27,12 @@ public struct PostgresTime: Sendable, Equatable {
         self.microseconds = microseconds
     }
 
-    public init(hour: Int, minute: Int, second: Int, microsecond: Int = 0) {
+    /// Build a valid PostgreSQL time. `24:00:00` is accepted; no other component may
+    /// accompany hour 24. Returns `nil` for an out-of-range component.
+    public init?(hour: Int, minute: Int, second: Int, microsecond: Int = 0) {
+        guard (0 ... 24).contains(hour), (0 ... 59).contains(minute),
+              (0 ... 59).contains(second), (0 ..< 1_000_000).contains(microsecond),
+              hour < 24 || (minute == 0 && second == 0 && microsecond == 0) else { return nil }
         self.microseconds = ((Int64(hour) * 60 + Int64(minute)) * 60 + Int64(second)) * 1_000_000
             + Int64(microsecond)
     }
@@ -169,24 +174,42 @@ extension PostgresTimeTz: PostgresEncodable {
 /// `1 year 2 mons 3 days 04:05:06.789`, `-1 days +02:03:04`, `00:00:01`, `2 mons`.
 func parsePostgresInterval(_ text: String) -> PostgresInterval? {
     var months: Int64 = 0, days: Int64 = 0, microseconds: Int64 = 0
+    func add(_ value: Int64, to total: inout Int64) -> Bool {
+        let sum = total.addingReportingOverflow(value)
+        guard !sum.overflow else { return false }
+        total = sum.partialValue
+        return true
+    }
+    func scaled(_ value: Int64, by multiplier: Int64) -> Int64? {
+        let product = value.multipliedReportingOverflow(by: multiplier)
+        return product.overflow ? nil : product.partialValue
+    }
     let tokens = text.split(separator: " ", omittingEmptySubsequences: true)
     var index = 0
     while index < tokens.count {
         let token = tokens[index]
         if token.contains(":") {                                   // the HH:MM:SS[.ffffff] time part
-            guard let micros = parseClockToMicroseconds(token) else { return nil }
-            microseconds += micros
+            guard let micros = parseClockToMicroseconds(token), add(micros, to: &microseconds) else { return nil }
             index += 1
             continue
         }
         guard index + 1 < tokens.count, let value = Int64(token) else { return nil }
         switch tokens[index + 1] {
-        case "year", "years":               months += value * 12
-        case "mon", "mons", "month", "months": months += value
-        case "day", "days":                 days += value
-        case "hour", "hours":               microseconds += value * 3_600_000_000
-        case "min", "mins", "minute", "minutes": microseconds += value * 60_000_000
-        case "sec", "secs", "second", "seconds": microseconds += value * 1_000_000
+        case "year", "years":
+            guard let component = scaled(value, by: 12), add(component, to: &months) else { return nil }
+        case "mon", "mons", "month", "months":
+            guard add(value, to: &months) else { return nil }
+        case "day", "days":
+            guard add(value, to: &days) else { return nil }
+        case "hour", "hours":
+            guard let component = scaled(value, by: 3_600_000_000),
+                  add(component, to: &microseconds) else { return nil }
+        case "min", "mins", "minute", "minutes":
+            guard let component = scaled(value, by: 60_000_000),
+                  add(component, to: &microseconds) else { return nil }
+        case "sec", "secs", "second", "seconds":
+            guard let component = scaled(value, by: 1_000_000),
+                  add(component, to: &microseconds) else { return nil }
         default:                            return nil
         }
         index += 2
@@ -196,7 +219,7 @@ func parsePostgresInterval(_ text: String) -> PostgresInterval? {
 }
 
 /// Parse `HH:MM:SS[.ffffff]` (optionally signed) into microseconds. Hours may exceed 24 in
-/// an interval; the fraction is padded/truncated to microseconds.
+/// an interval; the fraction may contain up to six digits and is padded to microseconds.
 private func parseClockToMicroseconds(_ token: Substring) -> Int64? {
     var body = token
     var negative = false
@@ -206,7 +229,7 @@ private func parseClockToMicroseconds(_ token: Substring) -> Int64? {
     // Minutes and seconds are 0–59 in a valid clock (an interval carries the excess in hours),
     // so bounding them here also caps their contribution below.
     let parts = body.split(separator: ":", omittingEmptySubsequences: false)
-    guard parts.count == 3, let hours = Int64(parts[0]),
+    guard parts.count == 3, let hours = Int64(parts[0]), hours >= 0,
           let minutes = Int64(parts[1]), (0 ... 59).contains(minutes) else { return nil }
 
     let secondParts = parts[2].split(separator: ".", maxSplits: 1, omittingEmptySubsequences: false)
@@ -214,8 +237,9 @@ private func parseClockToMicroseconds(_ token: Substring) -> Int64? {
 
     var subSecond: Int64 = 0
     if secondParts.count == 2 {
+        guard !secondParts[1].isEmpty, secondParts[1].count <= 6 else { return nil }
         var scale: Int64 = 100_000
-        for character in secondParts[1].prefix(6) {
+        for character in secondParts[1] {
             guard let digit = character.wholeNumberValue, (0 ... 9).contains(digit) else { return nil }
             subSecond += Int64(digit) * scale
             scale /= 10
@@ -229,7 +253,12 @@ private func parseClockToMicroseconds(_ token: Substring) -> Int64? {
     let (micros, addOverflow) = hourMicros.addingReportingOverflow(
         minutes * 60_000_000 + seconds * 1_000_000 + subSecond)
     guard !addOverflow else { return nil }
-    return negative ? -micros : micros
+    if negative {
+        let negated = Int64.zero.subtractingReportingOverflow(micros)
+        guard !negated.overflow else { return nil }
+        return negated.partialValue
+    }
+    return micros
 }
 
 /// Parse `HH:MM:SS[.ffffff]±HH[:MM[:SS]]`, e.g. `12:34:56.789+05:30`. The time part never

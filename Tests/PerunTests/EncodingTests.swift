@@ -86,6 +86,69 @@ final class EncodingTests: XCTestCase {
         XCTAssertEqual(viaBinary.timeIntervalSince1970, instant.timeIntervalSince1970, accuracy: 0.000_001)
         let viaText = try Date.decode(Array(instant.postgresText!.utf8), oid: PostgresOID.timestamptz, format: .text)
         XCTAssertEqual(viaText.timeIntervalSince1970, instant.timeIntervalSince1970, accuracy: 0.000_001)
+
+        for (date, text, binary) in [
+            (Date(timeIntervalSince1970: .infinity), "infinity", bigEndianBytes(Int64.max)),
+            (Date(timeIntervalSince1970: -.infinity), "-infinity", bigEndianBytes(Int64.min)),
+        ] {
+            XCTAssertEqual(date.postgresText, text)
+            XCTAssertEqual(date.postgresBinary(), binary)
+        }
+
+        for finite in [Date.distantPast, Date.distantFuture] {
+            XCTAssertNotEqual(finite.postgresText, "infinity")
+            XCTAssertNotEqual(finite.postgresText, "-infinity")
+            XCTAssertNotEqual(finite.postgresBinary(), bigEndianBytes(Int64.max))
+            XCTAssertNotEqual(finite.postgresBinary(), bigEndianBytes(Int64.min))
+            XCTAssertEqual(try Date.decode(Array(finite.postgresText!.utf8),
+                                           oid: PostgresOID.timestamptz, format: .text), finite)
+            XCTAssertEqual(try Date.decode(finite.postgresBinary()!,
+                                           oid: PostgresOID.timestamptz, format: .binary), finite)
+        }
+
+        let finiteDateAtNegativeInfinitySentinel = Date(
+            timeIntervalSinceReferenceDate: Double(Int64.min) / 1_000_000 - 31_622_400
+        )
+        let belowPostgresMinimum = Date(
+            timeIntervalSinceReferenceDate: Double(-211_813_488_000_000_000 - 86_400_000_000)
+                / 1_000_000 - 31_622_400
+        )
+        for invalid in [Date(timeIntervalSince1970: .nan),
+                        Date(timeIntervalSince1970: .greatestFiniteMagnitude),
+                        finiteDateAtNegativeInfinitySentinel,
+                        belowPostgresMinimum] {
+            XCTAssertNil(invalid.postgresText)
+            XCTAssertNil(invalid.postgresBinary())
+            for format in [PostgresFormat.text, .binary] {
+                XCTAssertThrowsError(try FrontendMessage.bind(
+                    portal: "", statement: "", parameters: [invalid], parameterFormat: format
+                )) { error in
+                    guard case let PerunError.parameterEncodingFailed(parameter, _) = error else {
+                        return XCTFail("expected parameterEncodingFailed, got \(error)")
+                    }
+                    XCTAssertEqual(parameter, 1)
+                }
+            }
+        }
+
+        // This is inside PostgreSQL's finite upper range, but converting it to
+        // Unix-epoch microseconds would overflow Int64. Both formats must still work.
+        let upperFiniteMicroseconds: Int64 = 9_223_371_331_200_000_000 - 1_000_000_000_000
+        let upperFinite = Date(
+            timeIntervalSinceReferenceDate: Double(upperFiniteMicroseconds) / 1_000_000 - 31_622_400
+        )
+        XCTAssertNotNil(upperFinite.postgresText)
+        XCTAssertNotNil(upperFinite.postgresBinary())
+        for format in [PostgresFormat.text, .binary] {
+            XCTAssertNoThrow(try FrontendMessage.bind(
+                portal: "", statement: "", parameters: [upperFinite], parameterFormat: format
+            ))
+        }
+
+        let invalidArray = PostgresArray([Date(timeIntervalSince1970: .nan)])
+        XCTAssertThrowsError(try FrontendMessage.bind(
+            portal: "", statement: "", parameters: [invalidArray], parameterFormat: .text
+        ))
     }
 
     func testDateTextEncodingUsesPostgresBCEra() throws {
@@ -199,8 +262,16 @@ final class EncodingTests: XCTestCase {
         XCTAssertEqual(PostgresArray(withNull).postgresText, #"{{"1",NULL},{"3","4"}}"#)
         // Three dimensions through the explicit shape initializer.
         let elements: [PostgresEncodable?] = [1, 2, 3, 4]
-        let cube = PostgresArray(dimensions: [2, 1, 2], elements: elements, elementTypeOID: PostgresOID.int8)
+        let cube = PostgresArray(dimensions: [2, 1, 2], elements: elements, elementTypeOID: PostgresOID.int8)!
         XCTAssertEqual(cube.postgresText, #"{{{"1","2"}},{{"3","4"}}}"#)
+        XCTAssertNil(PostgresArray(dimensions: [-1, -1], elements: [1], elementTypeOID: PostgresOID.int8))
+        XCTAssertNil(PostgresArray(dimensions: [], elements: [1], elementTypeOID: PostgresOID.int8))
+        XCTAssertNil(PostgresArray(dimensions: [Int.max, 2], elements: [], elementTypeOID: PostgresOID.int8))
+        XCTAssertNil(PostgresArray(
+            dimensions: [Int(Int32.max), Int(Int32.max), Int(Int32.max)],
+            elements: [],
+            elementTypeOID: PostgresOID.int8
+        ))
     }
 
     func testMultiDimensionalArrayBinaryEncoding() {
