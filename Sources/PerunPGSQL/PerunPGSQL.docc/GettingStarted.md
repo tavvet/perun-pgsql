@@ -86,4 +86,4 @@ await pool.shutdown()
 - <doc:ErrorsAndRecovery> — the error model, the reusability contract, cancellation, and timeouts.
 
 The `Examples/` directory holds small runnable programs; run one with
-`swift run Examples basic-query` (it reads `PGHOST` / `PGUSER` / … from the environment).
+`swift run PerunPGSQLExamples basic-query` (it reads `PGHOST` / `PGUSER` / … from the environment).

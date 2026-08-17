@@ -100,7 +100,7 @@ with:
 - **Errors and recovery** — the error model, the reusability contract, cancellation, timeouts.
 - **Architecture** — how the driver is put together.
 
-Runnable, compile-checked examples live in [`Examples/`](Examples): `swift run Examples <scenario>`
+Runnable, compile-checked examples live in [`Examples/`](Examples): `swift run PerunPGSQLExamples <scenario>`
 (e.g. `basic-query`, `transactions`, `streaming`, `copy`, `notifications`, `custom-type`).
 
 ## Architecture
@@ -143,9 +143,9 @@ Sources/
     PostgresConnection.swift   the connection actor
     PostgresClient.swift       the pool
     PerunPGSQL.docc/           the documentation guides
-  perun-demo/          a small runnable program
-Examples/              runnable, compile-checked examples (swift run Examples <scenario>)
-Tests/PerunTests/      crypto vectors (RFC), SCRAM (RFC 7677), wire & type codecs, live integration
+  PerunPGSQLDemo/      a small runnable program (`swift run perun-pgsql-demo`)
+Examples/              runnable, compile-checked examples (`swift run PerunPGSQLExamples <scenario>`)
+Tests/PerunPGSQLTests/ crypto vectors (RFC), SCRAM (RFC 7677), wire & type codecs, live integration
 Scripts/build-docs.sh  builds the DocC documentation
 ```
 
@@ -155,7 +155,7 @@ With OpenSSL on the `pkg-config` path (see [Requirements](#requirements)):
 
 ```bash
 swift test                      # unit tests (crypto vectors, SCRAM, wire, type codecs) — no server
-swift run Examples basic-query  # a runnable example against a live PostgreSQL
+swift run PerunPGSQLExamples basic-query  # a runnable example against a live PostgreSQL
 ```
 
 Integration tests run against a live server when `PERUN_PGSQL_INTEGRATION=1`; they and the

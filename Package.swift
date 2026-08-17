@@ -17,7 +17,7 @@ let package = Package(
     ],
     products: [
         .library(name: "PerunPGSQL", targets: ["PerunPGSQL"]),
-        .executable(name: "perun-demo", targets: ["perun-demo"]),
+        .executable(name: "perun-pgsql-demo", targets: ["PerunPGSQLDemo"]),
     ],
     dependencies: packageDependencies,
     targets: [
@@ -40,21 +40,21 @@ let package = Package(
 
         // A tiny runnable program that connects and runs queries.
         .executableTarget(
-            name: "perun-demo",
+            name: "PerunPGSQLDemo",
             dependencies: ["PerunPGSQL"]
         ),
 
         // Runnable, compile-checked examples that back the documentation. `swift build` compiles
         // them, so a doc example can't drift from the real API.
         .executableTarget(
-            name: "Examples",
+            name: "PerunPGSQLExamples",
             dependencies: ["PerunPGSQL"],
             path: "Examples"
         ),
 
         // Unit tests for the crypto primitives, wire codecs and type decoders.
         .testTarget(
-            name: "PerunTests",
+            name: "PerunPGSQLTests",
             dependencies: ["PerunPGSQL"]
         ),
     ]

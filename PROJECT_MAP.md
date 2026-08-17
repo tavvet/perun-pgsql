@@ -21,7 +21,8 @@
 - LISTEN/NOTIFY, NoticeResponse handler и CancelRequest.
 
 Публичная библиотека: `PerunPGSQL`.
-Демо-таргет: `perun-demo`.
+Вспомогательные таргеты: `PerunPGSQLDemo`, `PerunPGSQLExamples`, `PerunPGSQLTests`.
+Executable product демо: `perun-pgsql-demo`.
 
 ## Package Layout
 
@@ -67,10 +68,10 @@ Sources/
       FoundationTypes.swift
       TemporalTypes.swift
       NetworkTypes.swift
-  perun-demo/
+  PerunPGSQLDemo/
     Demo.swift
 Tests/
-  PerunTests/
+  PerunPGSQLTests/
     CryptoTests.swift
     SCRAMTests.swift
     WireTests.swift
@@ -104,7 +105,7 @@ Core design:
 - Wire bytes are encoded/decoded by local `ByteWriter`/`ByteReader`.
 - The driver returns `QueryResult`, `PostgresRow`, and `PostgresCell`.
 
-### `perun-demo`
+### `PerunPGSQLDemo` (`perun-pgsql-demo`)
 
 End-to-end executable. It demonstrates:
 
@@ -1092,7 +1093,7 @@ Observed:
 Demo against PostgreSQL:
 
 ```bash
-swift run perun-demo
+swift run perun-pgsql-demo
 ```
 
 The demo reads:
